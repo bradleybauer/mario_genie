@@ -88,3 +88,9 @@ Each `.npz` chunk holds:
 - Real-time internal state metadata arrays: `coins`, `flag_get`, `life`, `score`, `stage`, `time`, `world`, `x_pos`, `y_pos`, and `status` (encoded as `0: small`, `1: tall`, `2: fireball`).
 
 Each `.npz` file contains an identical `.meta.json` equivalent indicating sequences contained alongside sequence length metrics. A global `run_stats.json` is generated mapping global action meanings and configuration defaults.
+
+### Note on Cross-Episode Sequences
+The data collection script writes out fixed-length sequences (e.g. 16 frames). Because environments auto-reset upon death or level completion, **a single sequence can seamlessly cross episode boundaries.** This means a sequence may start in one world/stage and jump to another midway through.
+Downstream models utilizing 3D convolutions (like the MAGVIT-2 video tokenizer) will perceive these boundaries as sudden "scene cuts". While standard models typcially learn to compress these jump cuts properly, if you require strictly continuous patches for training, make sure to evaluate the `dones` flag arrays to mask or split the dataset accordingly.
+
+*(Note: The current `MarioVideoDataset` implementation in the training script automatically handles this. It evaluates the `dones` array during data loading and entirely drops any sequences that contain a boundary break prior to the final frame. This ensures perfectly stable datasets for 3D continuous training by sacrificing a small amount of data volume).*

@@ -19,8 +19,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mario_world_model_phase1.actions import get_action_meanings
+from mario_world_model_phase1.config import SEQUENCE_LENGTH
 from mario_world_model_phase1.envs import RandomLevelMarioEnv, make_shimmed_env
-from mario_world_model_phase1.preprocess import pad_to_square_256
+from mario_world_model_phase1.preprocess import preprocess_frame
 from mario_world_model_phase1.storage import ChunkWriter
 
 
@@ -178,7 +179,7 @@ class HumanActionPolicy:
 
 
 def to_tchw(frame_hwc: np.ndarray) -> np.ndarray:
-    padded = pad_to_square_256(frame_hwc)
+    padded = preprocess_frame(frame_hwc)
     return np.transpose(padded, (2, 0, 1)).astype(np.uint8, copy=False)
 
 
@@ -473,7 +474,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", type=int, default=1)
     parser.add_argument("--level-mode", type=str, default="random", choices=["random", "fixed"])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--sequence-length", type=int, default=16)
     parser.add_argument("--sequences-per-chunk", type=int, default=256)
     parser.add_argument("--num-envs", type=int, default=8)
     parser.add_argument("--total-steps", type=int, default=20000)
@@ -499,7 +499,7 @@ def main():
         world=args.world,
         stage=args.stage,
         seed=args.seed,
-        sequence_length=args.sequence_length,
+        sequence_length=SEQUENCE_LENGTH,
         sequences_per_chunk=args.sequences_per_chunk,
         num_envs=args.num_envs,
         total_steps=args.total_steps,
