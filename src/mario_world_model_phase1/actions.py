@@ -4,6 +4,8 @@ _BUTTONS = ["A", "B", "left", "right", "down"]
 COMPLEX_MOVEMENT = [["NOOP"]]
 for r in range(1, len(_BUTTONS) + 1):
     for combo in itertools.combinations(_BUTTONS, r):
+        if "left" in combo and "right" in combo:
+            continue
         COMPLEX_MOVEMENT.append(list(combo))
 print(f"Defined {len(COMPLEX_MOVEMENT)} actions in COMPLEX_MOVEMENT action space.")
 
