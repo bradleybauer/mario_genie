@@ -49,6 +49,19 @@ python scripts/collect_phase1_vector.py \
     --sequences-per-chunk 512 \
     --output-dir data/phase1/human_play
 ```
+
+### Analyzing Data
+
+Verify the quality and diversity of your dataset using the analysis script. This tool reports action distribution, level coverage, and causal events (deaths/flag captures).
+
+```bash
+python scripts/analyze_phase1_data.py --data-dir data/phase1/human_play
+```
+
+Key metrics to watch:
+1. **Action Distribution**: Ensure `NOOP` isn't dominating (aim for <20%) and that `Right`, `Run`, and `Jump` are well-represented.
+2. **Level Coverage**: Check that the dataset covers multiple levels (not just 1-1) and that max x-positions indicate deep traversal, not just start-area loitering.
+3. **Causal Events**: You want non-zero deaths and flag captures so the model learns consequences and goals.
 *Keyboard keys: Arrow keys (or WASD) to move, `o` to jump (A), `p` to sprint (B).*
 
 **Example: Collecting data via Vectorized Heuristic Bot**

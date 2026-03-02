@@ -7,6 +7,7 @@ for r in range(1, len(_BUTTONS) + 1):
         if "left" in combo and "right" in combo:
             continue
         COMPLEX_MOVEMENT.append(list(combo))
+COMPLEX_MOVEMENT += [["up"]] # up is a special case for climbing vines, so we add it as a separate action
 print(f"Defined {len(COMPLEX_MOVEMENT)} actions in COMPLEX_MOVEMENT action space.")
 
 ACTION_MEANINGS = list(COMPLEX_MOVEMENT)
