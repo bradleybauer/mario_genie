@@ -4,9 +4,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
 from typing import Optional
-import queue
-import threading
-
+import multiprocessing as mp
+from multiprocessing.shared_memory import SharedMemory
 import numpy as np
 
 
@@ -21,15 +20,70 @@ class ChunkMeta:
     total_actions: int
 
 
+def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -> None:
+    while True:
+        item = write_queue.get()
+        if item is None:
+            break
+
+        (
+            chunk_index,
+            f_name, f_shape, f_dtype,
+            a_name, a_shape, a_dtype,
+            d_name, d_shape, d_dtype,
+        ) = item
+
+        shm_f = SharedMemory(name=f_name)
+        shm_a = SharedMemory(name=a_name)
+        shm_d = SharedMemory(name=d_name)
+
+        try:
+            frames_btchw = np.ndarray(f_shape, dtype=f_dtype, buffer=shm_f.buf)
+            actions_bt = np.ndarray(a_shape, dtype=a_dtype, buffer=shm_a.buf)
+            dones_bt = np.ndarray(d_shape, dtype=d_dtype, buffer=shm_d.buf)
+
+            out_path = output_dir / f"chunk_{chunk_index:06d}.npz"
+
+            if compress:
+                np.savez_compressed(
+                    out_path,
+                    frames=frames_btchw,
+                    actions=actions_bt,
+                    dones=dones_bt,
+                )
+            else:
+                np.savez(
+                    out_path,
+                    frames=frames_btchw,
+                    actions=actions_bt,
+                    dones=dones_bt,
+                )
+
+            meta = ChunkMeta(
+                chunk_index=chunk_index,
+                num_sequences=int(frames_btchw.shape[0]),
+                sequence_length=int(frames_btchw.shape[1]),
+                frame_shape_btchw=tuple(int(x) for x in frames_btchw.shape),
+                action_shape_bt=tuple(int(x) for x in actions_bt.shape),
+                total_frames=int(frames_btchw.shape[0] * frames_btchw.shape[1]),
+                total_actions=int(actions_bt.size),
+            )
+
+            with (output_dir / f"chunk_{chunk_index:06d}.meta.json").open("w", encoding="utf-8") as f:
+                json.dump(asdict(meta), f, indent=2)
+
+        finally:
+            shm_f.close()
+            shm_f.unlink()
+            shm_a.close()
+            shm_a.unlink()
+            shm_d.close()
+            shm_d.unlink()
+
+
 class ChunkWriter:
     """
     Writes fixed-length sequence chunks to compressed .npz files.
-
-    Output per chunk:
-      - frames: uint8, shape (B, T, C, H, W)
-      - actions: uint8/int16, shape (B, T)
-      - dones: bool, shape (B, T)
-      - info_json: json metadata sidecar for inspectability
     """
 
     def __init__(
@@ -51,43 +105,88 @@ class ChunkWriter:
         self.async_write = bool(async_write)
         self.max_pending_writes = int(max_pending_writes)
 
-        self._frames_buffer: list[np.ndarray] = []
-        self._actions_buffer: list[np.ndarray] = []
-        self._dones_buffer: list[np.ndarray] = []
-        self._chunk_index = 0
+        # Autodetect next available chunk index to prevent overwriting
+        existing_chunks = list(self.output_dir.glob("chunk_*.npz"))
+        if existing_chunks:
+            highest_chunk = max(int(p.stem.split("_")[1]) for p in existing_chunks)
+            self._chunk_index = highest_chunk + 1
+        else:
+            self._chunk_index = 0
 
-        self._write_queue: Optional[queue.Queue] = None
-        self._writer_thread: Optional[threading.Thread] = None
-        self._writer_error: Optional[Exception] = None
+        self._current_seq_idx = 0
+
+        self._shm_f: Optional[SharedMemory] = None
+        self._shm_a: Optional[SharedMemory] = None
+        self._shm_d: Optional[SharedMemory] = None
+        self._frames_buf: Optional[np.ndarray] = None
+        self._actions_buf: Optional[np.ndarray] = None
+        self._dones_buf: Optional[np.ndarray] = None
+
+        self._write_queue: Optional[mp.Queue] = None
+        self._writer_process: Optional[mp.Process] = None
 
         if self.async_write:
-            self._write_queue = queue.Queue(maxsize=self.max_pending_writes)
-            self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
-            self._writer_thread.start()
+            self._write_queue = mp.Queue(maxsize=self.max_pending_writes)
+            self._writer_process = mp.Process(
+                target=_writer_loop_proc,
+                args=(self._write_queue, self.output_dir, self.compress),
+                daemon=True,
+            )
+            self._writer_process.start()
 
-    def _check_writer_error(self) -> None:
-        if self._writer_error is not None:
-            err = self._writer_error
-            self._writer_error = None
-            raise RuntimeError("Background chunk writer failed") from err
+    def _init_buffers(self, f_shape: tuple, f_dtype: np.dtype, a_shape: tuple, a_dtype: np.dtype, d_shape: tuple, d_dtype: np.dtype) -> None:
+        full_f_shape = (self.sequences_per_chunk,) + f_shape
+        full_a_shape = (self.sequences_per_chunk,) + a_shape
+        full_d_shape = (self.sequences_per_chunk,) + d_shape
 
-    def _write_chunk(self, chunk_index: int, frames_btchw: np.ndarray, actions_bt: np.ndarray, dones_bt: np.ndarray) -> Path:
+        bytes_f = np.prod(full_f_shape) * np.dtype(f_dtype).itemsize
+        bytes_a = np.prod(full_a_shape) * np.dtype(a_dtype).itemsize
+        bytes_d = np.prod(full_d_shape) * np.dtype(d_dtype).itemsize
+
+        self._shm_f = SharedMemory(create=True, size=int(bytes_f))
+        self._shm_a = SharedMemory(create=True, size=int(bytes_a))
+        self._shm_d = SharedMemory(create=True, size=int(bytes_d))
+
+        self._frames_buf = np.ndarray(full_f_shape, dtype=f_dtype, buffer=self._shm_f.buf)
+        self._actions_buf = np.ndarray(full_a_shape, dtype=a_dtype, buffer=self._shm_a.buf)
+        self._dones_buf = np.ndarray(full_d_shape, dtype=d_dtype, buffer=self._shm_d.buf)
+
+    def add_sequence(self, frames_tchw: np.ndarray, actions_t: np.ndarray, dones_t: np.ndarray) -> Optional[Path]:
+        if frames_tchw.shape[0] != self.sequence_length:
+            raise ValueError("frames sequence length mismatch")
+        if actions_t.shape[0] != self.sequence_length:
+            raise ValueError("actions sequence length mismatch")
+        if dones_t.shape[0] != self.sequence_length:
+            raise ValueError("dones sequence length mismatch")
+
+        if self._frames_buf is None:
+            self._init_buffers(
+                frames_tchw.shape, frames_tchw.dtype,
+                actions_t.shape, actions_t.dtype,
+                dones_t.shape, dones_t.dtype,
+            )
+
+        assert self._frames_buf is not None
+        assert self._actions_buf is not None
+        assert self._dones_buf is not None
+
+        idx = self._current_seq_idx
+        self._frames_buf[idx] = frames_tchw
+        self._actions_buf[idx] = actions_t
+        self._dones_buf[idx] = dones_t
+
+        self._current_seq_idx += 1
+
+        if self._current_seq_idx >= self.sequences_per_chunk:
+            return self.flush()
+        return None
+
+    def _write_chunk_sync(self, chunk_index: int, frames_btchw: np.ndarray, actions_bt: np.ndarray, dones_bt: np.ndarray) -> Path:
         out_path = self.output_dir / f"chunk_{chunk_index:06d}.npz"
-
         if self.compress:
-            np.savez_compressed(
-                out_path,
-                frames=frames_btchw,
-                actions=actions_bt,
-                dones=dones_bt,
-            )
+            np.savez_compressed(out_path, frames=frames_btchw, actions=actions_bt, dones=dones_bt)
         else:
-            np.savez(
-                out_path,
-                frames=frames_btchw,
-                actions=actions_bt,
-                dones=dones_bt,
-            )
+            np.savez(out_path, frames=frames_btchw, actions=actions_bt, dones=dones_bt)
 
         meta = ChunkMeta(
             chunk_index=chunk_index,
@@ -104,72 +203,83 @@ class ChunkWriter:
 
         return out_path
 
-    def _writer_loop(self) -> None:
-        assert self._write_queue is not None
-        while True:
-            item = self._write_queue.get()
-            if item is None:
-                self._write_queue.task_done()
-                break
-
-            chunk_index, frames_btchw, actions_bt, dones_bt = item
-            try:
-                self._write_chunk(chunk_index, frames_btchw, actions_bt, dones_bt)
-            except Exception as exc:
-                self._writer_error = exc
-            finally:
-                self._write_queue.task_done()
-
-    def add_sequence(self, frames_tchw: np.ndarray, actions_t: np.ndarray, dones_t: np.ndarray) -> Optional[Path]:
-        self._check_writer_error()
-
-        if frames_tchw.shape[0] != self.sequence_length:
-            raise ValueError("frames sequence length mismatch")
-        if actions_t.shape[0] != self.sequence_length:
-            raise ValueError("actions sequence length mismatch")
-        if dones_t.shape[0] != self.sequence_length:
-            raise ValueError("dones sequence length mismatch")
-
-        self._frames_buffer.append(frames_tchw)
-        self._actions_buffer.append(actions_t)
-        self._dones_buffer.append(dones_t)
-
-        if len(self._frames_buffer) >= self.sequences_per_chunk:
-            return self.flush()
-        return None
-
     def flush(self) -> Optional[Path]:
-        self._check_writer_error()
-
-        if not self._frames_buffer:
+        if self._current_seq_idx == 0 or self._frames_buf is None:
             return None
 
-        frames_btchw = np.stack(self._frames_buffer, axis=0).astype(np.uint8, copy=False)
-        actions_bt = np.stack(self._actions_buffer, axis=0)
-        dones_bt = np.stack(self._dones_buffer, axis=0)
+        # Slice the used part
+        frames_part = self._frames_buf[:self._current_seq_idx].astype(np.uint8, copy=False)
+        actions_part = self._actions_buf[:self._current_seq_idx]
+        dones_part = self._dones_buf[:self._current_seq_idx]
 
         out_path = self.output_dir / f"chunk_{self._chunk_index:06d}.npz"
-
         chunk_index = self._chunk_index
+
         if self.async_write:
             assert self._write_queue is not None
-            self._write_queue.put((chunk_index, frames_btchw, actions_bt, dones_bt))
+            assert self._shm_f is not None and self._shm_a is not None and self._shm_d is not None
+
+            if self._current_seq_idx == self.sequences_per_chunk:
+                self._write_queue.put((
+                    chunk_index,
+                    self._shm_f.name, self._frames_buf.shape, self._frames_buf.dtype.str,
+                    self._shm_a.name, self._actions_buf.shape, self._actions_buf.dtype.str,
+                    self._shm_d.name, self._dones_buf.shape, self._dones_buf.dtype.str,
+                ))
+                from multiprocessing.resource_tracker import unregister
+                unregister(self._shm_f._name, 'shared_memory')
+                unregister(self._shm_a._name, 'shared_memory')
+                unregister(self._shm_d._name, 'shared_memory')
+                
+                self._shm_f.close()
+                self._shm_a.close()
+                self._shm_d.close()
+                self._shm_f = self._shm_a = self._shm_d = None
+                self._frames_buf = self._actions_buf = self._dones_buf = None
+            else:
+                self._write_chunk_sync(chunk_index, frames_part.copy(), actions_part.copy(), dones_part.copy())
+                self._shm_f.close()
+                self._shm_f.unlink()
+                self._shm_a.close()
+                self._shm_a.unlink()
+                self._shm_d.close()
+                self._shm_d.unlink()
+                self._shm_f = self._shm_a = self._shm_d = None
+                self._frames_buf = self._actions_buf = self._dones_buf = None
         else:
-            self._write_chunk(chunk_index, frames_btchw, actions_bt, dones_bt)
+            self._write_chunk_sync(chunk_index, frames_part, actions_part, dones_part)
+            if self._shm_f is not None:
+                self._shm_f.close()
+                self._shm_f.unlink()
+                self._shm_a.close()
+                self._shm_a.unlink()
+                self._shm_d.close()
+                self._shm_d.unlink()
+                self._shm_f = self._shm_a = self._shm_d = None
+                self._frames_buf = self._actions_buf = self._dones_buf = None
 
         self._chunk_index += 1
-        self._frames_buffer.clear()
-        self._actions_buffer.clear()
-        self._dones_buffer.clear()
+        self._current_seq_idx = 0
 
         return out_path
 
     def close(self) -> None:
-        self._check_writer_error()
         self.flush()
 
-        if self.async_write and self._write_queue is not None and self._writer_thread is not None:
+        if self.async_write and self._write_queue is not None and self._writer_process is not None:
             self._write_queue.put(None)
-            self._writer_thread.join()
+            self._writer_process.join()
 
-        self._check_writer_error()
+    def __del__(self):
+        try:
+            if getattr(self, '_shm_f', None) is not None:
+                self._shm_f.close()
+                self._shm_f.unlink()
+            if getattr(self, '_shm_a', None) is not None:
+                self._shm_a.close()
+                self._shm_a.unlink()
+            if getattr(self, '_shm_d', None) is not None:
+                self._shm_d.close()
+                self._shm_d.unlink()
+        except Exception:
+            pass

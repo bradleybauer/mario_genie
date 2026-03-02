@@ -108,9 +108,8 @@ class VectorActionPolicy:
 
 
 class HumanActionPolicy:
-    def __init__(self, action_meanings: list[list[str]], fps: int = 75, fps_jitter: int = 15, seed: int = 0):
+    def __init__(self, action_meanings: list[list[str]], fps: int = 75, seed: int = 0):
         self.fps = int(fps)
-        self.fps_jitter = max(0, int(fps_jitter))
         self.rng = random.Random(seed)
         pygame.init()
         self.screen = pygame.display.set_mode((512, 480))
@@ -171,8 +170,6 @@ class HumanActionPolicy:
         keys = pygame.key.get_pressed()
         action = self._keys_to_action(keys)
         target_fps = self.fps
-        if self.fps_jitter > 0:
-            target_fps = self.fps + self.rng.randint(-self.fps_jitter, self.fps_jitter)
         self.clock.tick(max(1, target_fps))
         return action
 
@@ -219,7 +216,6 @@ def run_collection(
     total_steps: int,
     vector_mode: str,
     human_fps: int,
-    human_fps_jitter: int,
     level_mode: str,
     compress_chunks: bool,
     async_write: bool,
@@ -245,7 +241,6 @@ def run_collection(
             sequences_per_chunk=sequences_per_chunk,
             total_steps=total_steps,
             human_fps=human_fps,
-            human_fps_jitter=human_fps_jitter,
             action_meanings=action_meanings,
             level_mode=level_mode,
             compress_chunks=compress_chunks,
@@ -346,7 +341,6 @@ def run_human_collection(
     sequences_per_chunk: int,
     total_steps: int,
     human_fps: int,
-    human_fps_jitter: int,
     action_meanings: list[list[str]],
     level_mode: str,
     compress_chunks: bool,
@@ -365,7 +359,7 @@ def run_human_collection(
         async_write=async_write,
         max_pending_writes=max_pending_writes,
     )
-    policy = HumanActionPolicy(action_meanings=action_meanings, fps=human_fps, fps_jitter=human_fps_jitter, seed=seed)
+    policy = HumanActionPolicy(action_meanings=action_meanings, fps=human_fps, seed=seed)
 
     obs, _ = env.reset(seed=seed)
 
@@ -446,9 +440,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-steps", type=int, default=20000)
     parser.add_argument("--vector-mode", type=str, default="sync", choices=["sync", "async"])
     parser.add_argument("--human-fps", type=int, default=75)
-    parser.add_argument("--human-fps-jitter", type=int, default=15)
     parser.add_argument("--compress-chunks", action="store_true", help="Compress chunks with np.savez_compressed")
-    parser.add_argument("--no-compress-chunks", action="store_true", help="Write uncompressed .npz chunks for faster throughput")
     parser.add_argument("--async-write", action="store_true", help="Write chunk files in a background thread")
     parser.add_argument("--max-pending-writes", type=int, default=8)
     return parser.parse_args()
@@ -458,14 +450,9 @@ def main():
     args = parse_args()
     started = time.time()
 
-    if args.no_compress_chunks:
-        compress_chunks = False
-    elif args.compress_chunks:
+    compress_chunks = False
+    if args.compress_chunks:
         compress_chunks = True
-    else:
-        compress_chunks = False if args.mode == "human" else True
-
-    async_write = args.async_write or (args.mode == "human")
 
     run_collection(
         output_dir=args.output_dir,
@@ -479,10 +466,9 @@ def main():
         total_steps=args.total_steps,
         vector_mode=args.vector_mode,
         human_fps=args.human_fps,
-        human_fps_jitter=args.human_fps_jitter,
         level_mode=args.level_mode,
         compress_chunks=compress_chunks,
-        async_write=async_write,
+        async_write=args.async_write,
         max_pending_writes=args.max_pending_writes,
     )
 
