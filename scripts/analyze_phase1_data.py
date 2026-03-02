@@ -54,6 +54,7 @@ def analyze_dataset(data_dir: Path):
     # so we'll store min, max, and a histogram/binned count.
     # Level ID -> [min_x, max_x, sum_x, count, set_of_100px_bins]
     level_x_stats = {} 
+    level_x_pos = {} # For plotting distributions per stage
 
     # 3. Causal Diversity (Deaths)
     # We will track life changes.
@@ -167,6 +168,10 @@ def analyze_dataset(data_dir: Path):
                             st['max'] = max(st['max'], int(l_max))
                             st['screens'].update(screens)
                             st['count'] += int(xs_in_level.size)
+                        
+                        if (w, s) not in level_x_pos:
+                            level_x_pos[(w, s)] = []
+                        level_x_pos[(w, s)].append(xs_in_level)
 
                 # 3. Events per Level
                 # We need to attribute deaths/flags to specific levels.
@@ -316,6 +321,26 @@ def analyze_dataset(data_dir: Path):
     print(f"Episode terminations (Dones): {total_dones}")
     
     print("="*40)
+
+    # 5. Plot X-Position Distribution per stage
+    if level_x_pos:
+        print("\nGenerating X-position distribution plots...")
+        num_stages = len(level_x_pos)
+        fig, axes = plt.subplots(num_stages, 1, figsize=(10, 3 * num_stages))
+        if num_stages == 1:
+            axes = [axes]
+        
+        for ax, (w, s) in zip(axes, sorted(level_x_pos.keys())):
+            all_xs = np.concatenate(level_x_pos[(w, s)])
+            ax.hist(all_xs, bins=50, color='skyblue', edgecolor='black')
+            ax.set_title(f'Level {w}-{s} - X Position Distribution')
+            ax.set_xlabel('X Position')
+            ax.set_ylabel('Frequency')
+        
+        plt.tight_layout()
+        plot_path = data_dir / "x_pos_distribution.png"
+        plt.savefig(plot_path)
+        print(f"Saved X-position distribution plot to: {plot_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
