@@ -266,17 +266,21 @@ def run_collection(
     )
     policy = VectorActionPolicy(mode=mode, num_envs=num_envs, action_meanings=action_meanings, seed=seed)
 
-    obs, _ = env.reset(seed=seed)
+    obs, info = env.reset(seed=seed)
+
+    INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
+    STATUS_MAP = {"small": 0, "tall": 1, "fireball": 2}
 
     seq_frames = [[] for _ in range(num_envs)]
     seq_actions = [[] for _ in range(num_envs)]
     seq_dones = [[] for _ in range(num_envs)]
+    seq_info = {k: [[] for _ in range(num_envs)] for k in INFO_KEYS + ["status"]}
 
     total_sequences = 0
 
     for step_idx in range(total_steps):
         actions = policy.sample()
-        next_obs, _, terminated, truncated, _ = env.step(actions)
+        next_obs, _, terminated, truncated, next_info = env.step(actions)
 
         done_flags = np.logical_or(terminated, truncated)
 
@@ -284,12 +288,31 @@ def run_collection(
             seq_frames[env_idx].append(to_tchw(obs[env_idx]))
             seq_actions[env_idx].append(int(actions[env_idx]))
             seq_dones[env_idx].append(bool(done_flags[env_idx]))
+            
+            for k in INFO_KEYS:
+                val = info.get(k)
+                if val is not None:
+                    seq_info[k][env_idx].append(int(val[env_idx]))
+                else:
+                    seq_info[k][env_idx].append(0)
+
+            status_val = info.get("status")
+            if status_val is not None:
+                seq_info["status"][env_idx].append(STATUS_MAP.get(status_val[env_idx], 0))
+            else:
+                seq_info["status"][env_idx].append(0)
 
             if len(seq_frames[env_idx]) == sequence_length:
                 frames_tchw = np.stack(seq_frames[env_idx], axis=0)
                 actions_t = np.asarray(seq_actions[env_idx], dtype=np.uint8)
                 dones_t = np.asarray(seq_dones[env_idx], dtype=bool)
-                out = writer.add_sequence(frames_tchw, actions_t, dones_t)
+                
+                kwargs_t = {}
+                for k in INFO_KEYS + ["status"]:
+                    kwargs_t[k] = np.asarray(seq_info[k][env_idx], dtype=np.int32)
+                    seq_info[k][env_idx].clear()
+
+                out = writer.add_sequence(frames_tchw, actions_t, dones_t, **kwargs_t)
                 total_sequences += 1
                 seq_frames[env_idx].clear()
                 seq_actions[env_idx].clear()
@@ -298,6 +321,7 @@ def run_collection(
                     print(f"[chunk] wrote {out}")
 
         obs = next_obs
+        info = next_info
 
         if (step_idx + 1) % 500 == 0:
             print(f"[step {step_idx + 1}/{total_steps}] sequences={total_sequences}")
@@ -361,11 +385,15 @@ def run_human_collection(
     )
     policy = HumanActionPolicy(action_meanings=action_meanings, fps=human_fps, seed=seed)
 
-    obs, _ = env.reset(seed=seed)
+    obs, info = env.reset(seed=seed)
+
+    INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
+    STATUS_MAP = {"small": 0, "tall": 1, "fireball": 2}
 
     seq_frames: list[np.ndarray] = []
     seq_actions: list[int] = []
     seq_dones: list[bool] = []
+    seq_info = {k: [] for k in INFO_KEYS + ["status"]}
 
     total_sequences = 0
 
@@ -373,18 +401,28 @@ def run_human_collection(
         for step_idx in range(total_steps):
             policy.draw_frame(obs)
             action = policy.sample()
-            next_obs, _, terminated, truncated, _ = env.step(action)
+            next_obs, _, terminated, truncated, next_info = env.step(action)
             done = bool(terminated or truncated)
 
             seq_frames.append(to_tchw(obs))
             seq_actions.append(int(action))
             seq_dones.append(done)
 
+            for k in INFO_KEYS:
+                seq_info[k].append(int(info.get(k, 0)))
+            seq_info["status"].append(STATUS_MAP.get(info.get("status", "small"), 0))
+
             if len(seq_frames) == sequence_length:
                 frames_tchw = np.stack(seq_frames, axis=0)
                 actions_t = np.asarray(seq_actions, dtype=np.uint8)
                 dones_t = np.asarray(seq_dones, dtype=bool)
-                out = writer.add_sequence(frames_tchw, actions_t, dones_t)
+                
+                kwargs_t = {}
+                for k in INFO_KEYS + ["status"]:
+                    kwargs_t[k] = np.asarray(seq_info[k], dtype=np.int32)
+                    seq_info[k].clear()
+                
+                out = writer.add_sequence(frames_tchw, actions_t, dones_t, **kwargs_t)
                 total_sequences += 1
                 seq_frames.clear()
                 seq_actions.clear()
@@ -393,8 +431,9 @@ def run_human_collection(
                     print(f"[chunk] wrote {out}")
 
             obs = next_obs
+            info = next_info
             if done:
-                obs, _ = env.reset()
+                obs, info = env.reset()
 
             if (step_idx + 1) % 500 == 0:
                 print(f"[step {step_idx + 1}/{total_steps}] sequences={total_sequences}")
