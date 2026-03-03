@@ -67,6 +67,18 @@ class MarioVideoDataset(Dataset):
         
         return frames
 
+class SingleSampleDataset(Dataset):
+    """Wraps a dataset to always return the same single sample. Useful for overfit sanity checks."""
+    def __init__(self, dataset, index=0, length=1000):
+        self.sample = dataset[index]
+        self.length = length
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        return self.sample
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True, help="Path to chunk files")
@@ -75,6 +87,7 @@ def train():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=50)
+    parser.add_argument("--overfit-one", action="store_true", help="Train on a single sample (overfit sanity check)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -82,8 +95,13 @@ def train():
     print(f"Using device: {device}")
 
     dataset = MarioVideoDataset(args.data_dir, seq_len=SEQUENCE_LENGTH)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
+
+    if args.overfit_one:
+        dataset = SingleSampleDataset(dataset, index=0, length=1000)
+        print(">> Overfit mode: training on a single sample.")
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
     tokenizer = VideoTokenizer(
         image_size=IMAGE_SIZE,
