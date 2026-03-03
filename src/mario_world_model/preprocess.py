@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PIL import Image
 import numpy as np
-from mario_world_model_phase1.config import IMAGE_SIZE
+from mario_world_model.config import IMAGE_SIZE
 
 TARGET_HW = (IMAGE_SIZE, IMAGE_SIZE)
 

@@ -18,7 +18,7 @@ from torch.optim import AdamW
 from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
 
-from mario_world_model_phase1.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
+from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
 
 class MarioVideoDataset(Dataset):
     def __init__(self, data_dir, seq_len=4):

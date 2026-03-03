@@ -8,7 +8,7 @@ from typing import Optional
 import gymnasium as gym
 from shimmy import GymV21CompatibilityV0
 
-from mario_world_model_phase1.actions import apply_action_space
+from mario_world_model.actions import apply_action_space
 
 
 def _load_super_mario_bros_env_class():

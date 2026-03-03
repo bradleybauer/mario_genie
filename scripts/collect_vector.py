@@ -18,11 +18,11 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model_phase1.actions import get_action_meanings
-from mario_world_model_phase1.config import SEQUENCE_LENGTH
-from mario_world_model_phase1.envs import RandomLevelMarioEnv, make_shimmed_env
-from mario_world_model_phase1.preprocess import preprocess_frame
-from mario_world_model_phase1.storage import ChunkWriter
+from mario_world_model.actions import get_action_meanings
+from mario_world_model.config import SEQUENCE_LENGTH
+from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env
+from mario_world_model.preprocess import preprocess_frame
+from mario_world_model.storage import ChunkWriter
 
 
 @dataclass
@@ -114,7 +114,7 @@ class HumanActionPolicy:
         self.rng = random.Random(seed)
         pygame.init()
         self.screen = pygame.display.set_mode((512, 480))
-        pygame.display.set_caption("Mario Phase1 Human Recorder")
+        pygame.display.set_caption("Mario Data Human Recorder")
         self.clock = pygame.time.Clock()
         self._action_to_index = {frozenset(token.lower() for token in action): idx for idx, action in enumerate(action_meanings)}
         self._noop_index = self._action_to_index.get(frozenset({"noop"}), 0)
@@ -467,8 +467,8 @@ def run_human_collection(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 1 Mario vectorized data collection")
-    parser.add_argument("--output-dir", type=Path, default=Path("data/phase1/vector"))
+    parser = argparse.ArgumentParser(description="Mario vectorized data collection")
+    parser.add_argument("--output-dir", type=Path, default=Path("data/vector"))
     parser.add_argument("--mode", type=str, default="random", choices=["random", "heuristic", "human"])
     parser.add_argument("--world", type=int, default=1)
     parser.add_argument("--stage", type=int, default=1)

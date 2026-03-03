@@ -5,7 +5,7 @@ import numpy as np
 from torchvision.utils import save_image
 from magvit2_pytorch import VideoTokenizer
 
-from mario_world_model_phase1.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS
+from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS
 
 def validate():
     parser = argparse.ArgumentParser()

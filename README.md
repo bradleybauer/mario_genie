@@ -1,6 +1,6 @@
-# Mario World Model Phase 1: Data Generation
+# Mario World Model: Data Generation
 
-This project implements the Phase 1 step for an Action-Conditioned Mario World Model. It focuses on large-scale dataset generation, providing the engine, environments, and chunking storage components required to record gameplay experiences from Super Mario Bros. The collection captures frame observations, actions taken, environment signals, and side information (like coins, scores, and status) into sequenced files for downstream model training.
+This project implements an Action-Conditioned Mario World Model. It focuses on large-scale dataset generation, providing the engine, environments, and chunking storage components required to record gameplay experiences from Super Mario Bros. The collection captures frame observations, actions taken, environment signals, and side information (like coins, scores, and status) into sequenced files for downstream model training.
 
 ## Features
 
@@ -18,7 +18,7 @@ This project implements the Phase 1 step for an Action-Conditioned Mario World M
 
 ```text
 ├── data/
-│   └── phase1/human_play/              # Default output directory for collected chunks
+│   └── human_play/              # Default output directory for collected chunks
 ├── remote/
 │   ├── config.sh                       # Single source of truth for host, port, and user
 │   ├── connect.sh                      # Open SSH tunnel to remote instance
@@ -26,9 +26,9 @@ This project implements the Phase 1 step for an Action-Conditioned Mario World M
 │   ├── send_data.sh                    # Sync local data/ to remote instance
 │   └── get_results.sh                  # Retrieve training results from remote instance
 ├── scripts/
-│   └── collect_phase1_vector.py        # Main execution entrypoint for data collection
+│   └── collect_vector.py        # Main execution entrypoint for data collection
 └── src/
-    └── mario_world_model_phase1/
+    └── mario_world_model_
         ├── actions.py                  # Joypad action space definitions (COMPLEX_MOVEMENT)
         ├── envs.py                     # Gym & Shimmy wrappers, RandomLevelMarioEnv
         ├── preprocess.py               # Frame padding logic (pad_to_square_256)
@@ -81,17 +81,17 @@ conda activate mario
 
 ### Collecting Data
 
-Data is captured utilizing the script deployed in `scripts/collect_phase1_vector.py`. 
+Data is captured utilizing the script deployed in `scripts/collect_vector.py`. 
 
 **Example: Collecting data via Human Play**
 Play the game yourself utilizing a single environment.
 ```bash
-python scripts/collect_phase1_vector.py \
+python scripts/collect_vector.py \
     --mode human \
     --num-envs 1 \
     --total-steps 20000 \
     --sequences-per-chunk 512 \
-    --output-dir data/phase1/human_play
+    --output-dir data/human_play
 ```
 
 ### Analyzing Data
@@ -99,7 +99,7 @@ python scripts/collect_phase1_vector.py \
 Verify the quality and diversity of your dataset using the analysis script. This tool reports action distribution, level coverage, and causal events (deaths/flag captures).
 
 ```bash
-python scripts/analyze_phase1_data.py --data-dir data/phase1/human_play
+python scripts/analyze_data.py --data-dir data/human_play
 ```
 
 Key metrics to watch:
@@ -111,7 +111,7 @@ Key metrics to watch:
 **Example: Collecting data via Vectorized Heuristic Bot**
 Run 16 environments asynchronously capturing data using the heuristic policy. Writes compressed chunk files in the background to avoid stalling ticks.
 ```bash
-python scripts/collect_phase1_vector.py \
+python scripts/collect_vector.py \
     --mode heuristic \
     --level-mode random \
     --num-envs 16 \
@@ -119,7 +119,7 @@ python scripts/collect_phase1_vector.py \
     --sequences-per-chunk 512 \
     --async-write \
     --compress-chunks \
-    --output-dir data/phase1/heuristic_play
+    --output-dir data/heuristic_play
 ```
 
 ## Data Format

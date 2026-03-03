@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-scripts/analyze_phase1_data.py
+scripts/analyze_data.py
 
 Analyzes collected Mario gameplay data for:
 1. Action Distribution (Diversity)
@@ -8,7 +8,7 @@ Analyzes collected Mario gameplay data for:
 3. Causal Diversity (Deaths/Failures)
 
 Usage:
-    python scripts/analyze_phase1_data.py --data-dir data/phase1/human_play
+    python scripts/analyze_data.py --data-dir data/human_play
 """
 
 import argparse
@@ -26,9 +26,9 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 try:
-    from mario_world_model_phase1.actions import get_action_meanings
+    from mario_world_model.actions import get_action_meanings
 except ImportError:
-    print("Warning: Could not import mario_world_model_phase1.actions. Using default mappings.")
+    print("Warning: Could not import mario_world_model.actions. Using default mappings.")
     get_action_meanings = None
 
 def analyze_dataset(data_dir: Path):
@@ -72,7 +72,7 @@ def analyze_dataset(data_dir: Path):
         for idx, meaning_list in enumerate(raw_meanings):
             ACTION_NAMES[idx] = "+".join(meaning_list) if meaning_list else "NOOP"
     else:
-        raise RuntimeError("Action meanings not available. Please ensure mario_world_model_phase1 is installed and accessible.")
+        raise RuntimeError("Action meanings not available. Please ensure mario_world_model is installed and accessible.")
 
     print(f"Found {len(chunk_files)} chunks. Processing...")
 
@@ -221,10 +221,10 @@ def analyze_dataset(data_dir: Path):
                 # We need to being careful across sequence boundaries because sequences might not be contiguous in time 
                 # (collected from parallel envs then shuffled? No, `ChunkWriter` receives `add_sequence` from one env at a time).
                 # But `ChunkWriter` just stacks them.
-                # In `collect_phase1_vector.py`, `seq_frames` accumulates `sequence_length` frames then adds to writer.
+                # In `collect_vector.py`, `seq_frames` accumulates `sequence_length` frames then adds to writer.
                 # So inside one row of (B, T), the frames are contiguous.
                 # But row `i` and row `i+1` in the chunk? 
-                # `collect_phase1_vector` calls `writer.add_sequence`. 
+                # `collect_vector` calls `writer.add_sequence`. 
                 # The writer accumulates them. They come from potentially different envs if running parallel.
                 # So we can only trust continuity WITHIN a sequence (axis 1).
                 
@@ -344,7 +344,7 @@ def analyze_dataset(data_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=Path("data/phase1/human_play"))
+    parser.add_argument("--data-dir", type=Path, default=Path("data/human_play"))
     args = parser.parse_args()
     
     if not args.data_dir.exists():
