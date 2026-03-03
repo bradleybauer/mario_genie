@@ -1,6 +1,9 @@
 import argparse
 import glob
+import json
 import os
+import time
+from datetime import datetime
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
@@ -82,15 +85,31 @@ class SingleSampleDataset(Dataset):
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True, help="Path to chunk files")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--overfit-one", action="store_true", help="Train on a single sample (overfit sanity check)")
+    parser.add_argument("--codebook-size", type=int, default=CODEBOOK_SIZE)
+    parser.add_argument("--init-dim", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
     args = parser.parse_args()
 
+    # Seeding
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Run directory
+    if args.run_name:
+        args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
@@ -105,8 +124,8 @@ def train():
 
     tokenizer = VideoTokenizer(
         image_size=IMAGE_SIZE,
-        init_dim=32,
-        codebook_size=CODEBOOK_SIZE,
+        init_dim=args.init_dim,
+        codebook_size=args.codebook_size,
         layers=TOKENIZER_LAYERS,
         use_gan=False,
         perceptual_loss_weight=0.0
@@ -114,11 +133,30 @@ def train():
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
+    # Save config for reproducibility
+    config = vars(args).copy()
+    config["image_size"] = IMAGE_SIZE
+    config["sequence_length"] = SEQUENCE_LENGTH
+    config["layers"] = list(TOKENIZER_LAYERS)
+    config["git_hash"] = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or None
+    config["timestamp"] = datetime.now().isoformat()
+    config["num_parameters"] = sum(p.numel() for p in tokenizer.parameters())
+    config_path = os.path.join(args.output_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Config saved to {config_path}")
+
+    metrics_log = []
+    metrics_path = os.path.join(args.output_dir, "metrics.json")
+    train_start = time.time()
+
+    metrics_interval = max(1, len(dataloader) // 10)
+
     global_step = 0
     for epoch in range(args.epochs):
         tokenizer.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for batch in pbar:
+        for step_in_epoch, batch in enumerate(pbar):
             batch = batch.to(device)
             
             optimizer.zero_grad()
@@ -126,14 +164,30 @@ def train():
             loss.backward()
             optimizer.step()
             
+            log_this_step = (step_in_epoch % metrics_interval == 0)
+            
+            if log_this_step:
+                step_metrics = {
+                    "step": global_step,
+                    "epoch": epoch,
+                    "loss": loss.item(),
+                    "recon_loss": loss_breakdown.recon_loss.item(),
+                    "elapsed_s": round(time.time() - train_start, 2),
+                }
+                metrics_log.append(step_metrics)
+            
             pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{loss_breakdown.recon_loss.item():.4f}"})
             
             if global_step % args.val_interval == 0:
                 tokenizer.eval()
                 with torch.no_grad():
                     # Generate a reconstruction sample
-                    quantized = tokenizer.encode(batch)
-                    recon_video = tokenizer.decode(quantized)
+                    codes = tokenizer.tokenize(batch)        # discrete codebook indices
+                    recon_video = tokenizer.decode_from_code_indices(codes)
+                    
+                    if log_this_step:
+                        codebook_usage = codes.unique().numel()
+                        step_metrics["codebook_usage"] = codebook_usage
                     
                     # Take first sequence from batch, slice along time
                     # batch[0] shape: [C, T, H, W]
@@ -143,10 +197,17 @@ def train():
                     # Cat side by side
                     comparison = torch.cat([original_frames, recon_frames], dim=3) # [T, C, H, W*2]
                     save_image(comparison, os.path.join(args.output_dir, f"step_{global_step:06d}.png"), nrow=1)
+                
+                # Write metrics to disk at each validation step
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics_log, f, indent=2)
                 tokenizer.train()
             
             global_step += 1
             
+        # Write metrics + save checkpoint at end of each epoch
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics_log, f, indent=2)
         torch.save(tokenizer.state_dict(), os.path.join(args.output_dir, "magvit2_latest.pt"))
 
 if __name__ == "__main__":
