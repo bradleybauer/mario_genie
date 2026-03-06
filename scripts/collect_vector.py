@@ -8,7 +8,11 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Optional
 
+import select
+
+import evdev
 import gymnasium as gym
 import numpy as np
 import pygame
@@ -18,10 +22,24 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.actions import get_action_meanings
+from mario_world_model.actions import get_action_meanings, get_num_actions
 from mario_world_model.config import SEQUENCE_LENGTH
+from mario_world_model.coverage import (
+    compute_action_balance,
+    compute_progression_balance,
+    print_action_report,
+    print_progression_guidance,
+    print_progression_report,
+    scan_action_coverage,
+    scan_progression_coverage,
+)
 from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env
 from mario_world_model.preprocess import preprocess_frame
+from mario_world_model.rollouts import (
+    EpisodeTracker,
+    RolloutIndex,
+    RolloutWriter,
+)
 from mario_world_model.storage import ChunkWriter
 
 
@@ -55,6 +73,9 @@ class VectorActionPolicy:
 
         self._heuristic_candidates = self._build_heuristic_candidates()
 
+        # Action balance weights (None → use default policy)
+        self._action_weights: Optional[list[float]] = None
+
     def _build_heuristic_candidates(self) -> list[int]:
         preferred = [
             frozenset({"right"}),
@@ -74,15 +95,42 @@ class VectorActionPolicy:
             out.append(self._noop_index)
         return out
 
+    def update_action_weights(self, weights: dict[int, float]) -> None:
+        """Set per-action sampling weights for action-balanced collection.
+
+        The *weights* dict maps action indices to non-negative floats.
+        When active, heuristic sampling blends its built-in distribution
+        with the balance weights, and random sampling uses weighted choice.
+        """
+        raw = [max(0.0, weights.get(a, 0.0)) for a in range(self.num_actions)]
+        total = sum(raw)
+        if total == 0:
+            self._action_weights = None
+        else:
+            self._action_weights = [w / total for w in raw]
+
     def _sample_random(self, idx: int) -> int:
         if self._t[idx] >= self._sticky_until[idx]:
-            self._sticky_actions[idx] = self.rng.randrange(self.num_actions)
+            if self._action_weights is not None:
+                self._sticky_actions[idx] = self.rng.choices(
+                    range(self.num_actions), weights=self._action_weights, k=1
+                )[0]
+            else:
+                self._sticky_actions[idx] = self.rng.randrange(self.num_actions)
             hold_for = self.rng.randint(3, 12)
             self._sticky_until[idx] = self._t[idx] + hold_for
         self._t[idx] += 1
         return self._sticky_actions[idx]
 
     def _sample_heuristic(self) -> int:
+        # If action balance weights are active, blend with heuristic
+        if self._action_weights is not None:
+            # 50% heuristic, 50% balance-weighted
+            if self.rng.random() < 0.5:
+                return self.rng.choices(
+                    range(self.num_actions), weights=self._action_weights, k=1
+                )[0]
+
         p = self.rng.random()
         if p < 0.55 and len(self._heuristic_candidates) >= 1:
             return self._heuristic_candidates[0]
@@ -119,6 +167,62 @@ class HumanActionPolicy:
         self._action_to_index = {frozenset(token.lower() for token in action): idx for idx, action in enumerate(action_meanings)}
         self._noop_index = self._action_to_index.get(frozenset({"noop"}), 0)
 
+        # Initialize gamepad via evdev (works in WSL without joydev module)
+        self._evdev_device: evdev.InputDevice | None = None
+        self._evdev_axes = {"ABS_X": 128, "ABS_Y": 128}  # centered defaults
+        self._evdev_buttons: set[int] = set()  # currently held button codes
+        self._init_evdev_gamepad()
+
+    def _init_evdev_gamepad(self) -> None:
+        """Try to find a gamepad via evdev (reads /dev/input/event* directly)."""
+        try:
+            for path in evdev.list_devices():
+                dev = evdev.InputDevice(path)
+                caps = dev.capabilities(verbose=False)
+                # A gamepad should have EV_KEY and EV_ABS
+                has_abs = evdev.ecodes.EV_ABS in caps
+                has_key = evdev.ecodes.EV_KEY in caps
+                if has_abs and has_key:
+                    self._evdev_device = dev
+                    # Read axis ranges for normalization
+                    for abs_code, abs_info in caps.get(evdev.ecodes.EV_ABS, []):
+                        name = evdev.ecodes.ABS.get(abs_code, f"ABS_{abs_code}")
+                        if isinstance(name, list):
+                            name = name[0]
+                        # Store the midpoint as the default/centered value
+                        mid = (abs_info.min + abs_info.max) // 2
+                        self._evdev_axes[name] = mid
+                        self._evdev_axis_range = (abs_info.min, abs_info.max)
+                    print(f"Initialized evdev gamepad: {dev.name} ({dev.path})")
+                    return
+        except Exception as exc:
+            print(f"evdev gamepad probe failed: {exc}")
+        print("No gamepad found via evdev. Falling back to keyboard.")
+        print("  Hint: ensure /dev/input/event* is readable (sudo chmod 666 /dev/input/event*)")
+
+    def _poll_evdev(self) -> None:
+        """Non-blocking read of all pending evdev events to update axis/button state."""
+        dev = self._evdev_device
+        if dev is None:
+            return
+        try:
+            while select.select([dev.fd], [], [], 0)[0]:
+                for event in dev.read():
+                    if event.type == evdev.ecodes.EV_ABS:
+                        name = evdev.ecodes.ABS.get(event.code, f"ABS_{event.code}")
+                        if isinstance(name, list):
+                            name = name[0]
+                        self._evdev_axes[name] = event.value
+                    elif event.type == evdev.ecodes.EV_KEY:
+                        if event.value >= 1:  # pressed or held
+                            self._evdev_buttons.add(event.code)
+                        else:  # released
+                            self._evdev_buttons.discard(event.code)
+        except (OSError, IOError):
+            # Device disconnected
+            print("Gamepad disconnected!")
+            self._evdev_device = None
+
     def draw_frame(self, frame_hwc: np.ndarray) -> None:
         surface = pygame.surfarray.make_surface(np.transpose(frame_hwc, (1, 0, 2)))
         surface = pygame.transform.scale(surface, self.screen.get_size())
@@ -138,6 +242,25 @@ class HumanActionPolicy:
         down = keys[pygame.K_DOWN] or keys[pygame.K_s]
         jump = keys[pygame.K_o]
         sprint = keys[pygame.K_p]
+
+        # Poll evdev gamepad (non-blocking)
+        self._poll_evdev()
+        if self._evdev_device is not None:
+            # Axis input: normalize to [-1, 1] range
+            ax_min, ax_max = getattr(self, '_evdev_axis_range', (0, 255))
+            ax_mid = (ax_min + ax_max) / 2.0
+            ax_half = max((ax_max - ax_min) / 2.0, 1)
+            x_val = (self._evdev_axes.get("ABS_X", ax_mid) - ax_mid) / ax_half
+            y_val = (self._evdev_axes.get("ABS_Y", ax_mid) - ax_mid) / ax_half
+            right = right or x_val > 0.5
+            left = left or x_val < -0.5
+            down = down or y_val > 0.5
+
+            # Button input: BTN_TRIGGER(0x120)=btn0, BTN_THUMB(0x121)=btn1, etc.
+            # Map: button 1 (BTN_THUMB) -> jump, button 0 (BTN_TRIGGER) -> sprint
+            # If these are backwards on your controller, swap the codes!
+            jump = jump or (evdev.ecodes.BTN_THUMB in self._evdev_buttons)
+            sprint = sprint or (evdev.ecodes.BTN_TRIGGER in self._evdev_buttons)
 
         if right and left:
             left = False
@@ -205,6 +328,84 @@ def build_vector_env(
     return gym.vector.SyncVectorEnv(env_fns)
 
 
+# ---------------------------------------------------------------------------
+# Rebalance helpers (shared between vector and human modes)
+# ---------------------------------------------------------------------------
+
+def _build_replay_pool(
+    output_dir: Path,
+) -> list[tuple[tuple[int, int], list[int], int, float]]:
+    """Scan progression coverage + rollouts, return weighted replay pool.
+
+    Returns a list of ``(level, actions, target_step, weight)`` tuples that
+    can be fed directly to ``RandomLevelMarioEnv.update_progression_balance()``.
+    """
+    prog_cov = scan_progression_coverage(str(output_dir))
+    ri = RolloutIndex(output_dir)
+    reachable = ri.reachable_bins()
+    prog_rpt = compute_progression_balance(prog_cov, reachable)
+    print_progression_guidance(prog_rpt, n=5)
+
+    pool: list[tuple[tuple[int, int], list[int], int, float]] = []
+    for (w, s, b), weight in prog_rpt.weights.items():
+        if weight <= 0:
+            continue
+        if b == 0:
+            # Bin 0 = level start — zero-step replay (just selects the level)
+            pool.append(((w, s), [], 0, weight))
+            continue
+        all_replays = ri.find_all_replay_actions(w, s, b)
+        if not all_replays:
+            continue
+        # Split the bin's weight equally across candidate rollouts
+        per_rollout_weight = weight / len(all_replays)
+        for actions_list, target_step in all_replays:
+            pool.append(((w, s), actions_list, target_step, per_rollout_weight))
+
+    return pool
+
+
+def _do_progression_rebalance_vector(
+    env: gym.vector.VectorEnv,
+    output_dir: Path,
+    num_envs: int,
+) -> None:
+    """Build a replay pool and push it to every sub-env."""
+    pool = _build_replay_pool(output_dir)
+    if not pool:
+        print("[progression] No reachable mid-level bins yet — skipping replay pool update.")
+        return
+    for sub_env in env.envs:  # type: ignore[attr-defined]
+        if hasattr(sub_env, "update_progression_balance"):
+            sub_env.update_progression_balance(pool, replay_probability=1.0)
+    print(f"[progression] Updated replay pool ({len(pool)} candidates) on {num_envs} envs")
+
+
+def _do_progression_rebalance_human(
+    env: RandomLevelMarioEnv,
+    output_dir: Path,
+) -> None:
+    """Build a replay pool and push it to the single env."""
+    pool = _build_replay_pool(output_dir)
+    if not pool:
+        print("[progression] No reachable mid-level bins yet — skipping replay pool update.")
+        return
+    env.update_progression_balance(pool, replay_probability=1.0)
+    print(f"[progression] Updated replay pool ({len(pool)} candidates)")
+
+
+def _do_action_rebalance(
+    policy: VectorActionPolicy,
+    output_dir: Path,
+    num_actions: int,
+) -> None:
+    """Scan action coverage and update the policy's action weights."""
+    act_cov = scan_action_coverage(str(output_dir))
+    act_rpt = compute_action_balance(act_cov, num_actions)
+    policy.update_action_weights(act_rpt.weights)
+    print(f"[actions] Rebalanced action weights ({act_rpt.total_frames} total frames)")
+
+
 def run_collection(
     output_dir: Path,
     mode: str,
@@ -221,14 +422,29 @@ def run_collection(
     compress_chunks: bool,
     async_write: bool,
     max_pending_writes: int,
+    balance: bool = False,
+    rebalance_interval: int = 5,
+    balance_actions: bool = False,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --balance-actions implies --balance
+    if balance_actions:
+        balance = True
+
+    if balance and level_mode != "random":
+        print("[balance] Warning: --balance requires --level-mode random. Disabling.")
+        balance = False
+        balance_actions = False
+
     print(
-        f"[config] mode={mode} level_mode={level_mode} world={world} stage={stage} num_envs={num_envs}"
+        f"[config] mode={mode} level_mode={level_mode} world={world} stage={stage} "
+        f"num_envs={num_envs} balance={balance} "
+        f"balance_actions={balance_actions}"
     )
 
     action_meanings = get_action_meanings()
+    num_actions = get_num_actions()
 
     if mode == "human":
         if num_envs != 1:
@@ -247,6 +463,9 @@ def run_collection(
             compress_chunks=compress_chunks,
             async_write=async_write,
             max_pending_writes=max_pending_writes,
+            balance=balance,
+            rebalance_interval=rebalance_interval,
+            balance_actions=balance_actions,
         )
 
     env = build_vector_env(
@@ -267,7 +486,35 @@ def run_collection(
     )
     policy = VectorActionPolicy(mode=mode, num_envs=num_envs, action_meanings=action_meanings, seed=seed)
 
+    # --- Episode tracking (for progression balance) ---
+    tracker: EpisodeTracker | None = None
+    rollout_writer: RolloutWriter | None = None
+    if balance:
+        tracker = EpisodeTracker(num_envs)
+        rollout_writer = RolloutWriter(output_dir)
+
+    # --- Initial rebalance at startup ---
+    # If rollouts/data exist from a previous session, configure the replay pool
+    # and action weights BEFORE the first reset so they take effect immediately.
+    if balance:
+        _do_progression_rebalance_vector(env, output_dir, num_envs)
+    if balance_actions:
+        _do_action_rebalance(policy, output_dir, num_actions)
+
     obs, info = env.reset(seed=seed)
+
+    # Seed the episode tracker with initial info
+    if tracker is not None:
+        for env_idx in range(num_envs):
+            w_val = info.get("world")
+            s_val = info.get("stage")
+            l_val = info.get("life")
+            tracker.set_initial_info(
+                env_idx,
+                world=int(w_val[env_idx]) if w_val is not None else 1,
+                stage=int(s_val[env_idx]) if s_val is not None else 1,
+                life=int(l_val[env_idx]) if l_val is not None else 2,
+            )
 
     INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
     STATUS_MAP = {"small": 0, "tall": 1, "fireball": 2}
@@ -278,6 +525,7 @@ def run_collection(
     seq_info = {k: [[] for _ in range(num_envs)] for k in INFO_KEYS + ["status"]}
 
     total_sequences = 0
+    chunks_since_rebalance = 0
 
     for step_idx in range(total_steps):
         actions = policy.sample()
@@ -303,6 +551,43 @@ def run_collection(
             else:
                 seq_info["status"][env_idx].append(0)
 
+            # --- Episode tracking ---
+            if tracker is not None:
+                x_val = info.get("x_pos")
+                w_val = info.get("world")
+                s_val = info.get("stage")
+                l_val = info.get("life")
+                tracker.record_step(
+                    env_idx,
+                    action=int(actions[env_idx]),
+                    x_pos=int(x_val[env_idx]) if x_val is not None else 0,
+                    world=int(w_val[env_idx]) if w_val is not None else 1,
+                    stage=int(s_val[env_idx]) if s_val is not None else 1,
+                    life=int(l_val[env_idx]) if l_val is not None else 2,
+                )
+                if done_flags[env_idx]:
+                    fg_val = next_info.get("flag_get")
+                    nl_val = next_info.get("life")
+                    rollout = tracker.finish_episode(
+                        env_idx,
+                        cur_life=int(nl_val[env_idx]) if nl_val is not None else 2,
+                        flag_get=int(fg_val[env_idx]) if fg_val is not None else 0,
+                        terminated=bool(terminated[env_idx]),
+                        truncated=bool(truncated[env_idx]),
+                    )
+                    if rollout is not None and rollout_writer is not None:
+                        rollout_writer.write(rollout)
+                    # Re-seed tracker with new episode info (auto-reset provides new info)
+                    nw_val = next_info.get("world")
+                    ns_val = next_info.get("stage")
+                    nnl_val = next_info.get("life")
+                    tracker.set_initial_info(
+                        env_idx,
+                        world=int(nw_val[env_idx]) if nw_val is not None else 1,
+                        stage=int(ns_val[env_idx]) if ns_val is not None else 1,
+                        life=int(nnl_val[env_idx]) if nnl_val is not None else 2,
+                    )
+
             if len(seq_frames[env_idx]) == sequence_length:
                 frames_tchw = np.stack(seq_frames[env_idx], axis=0)
                 actions_t = np.asarray(seq_actions[env_idx], dtype=np.uint8)
@@ -320,6 +605,20 @@ def run_collection(
                 seq_dones[env_idx].clear()
                 if out is not None:
                     print(f"[chunk] wrote {out}")
+                    chunks_since_rebalance += 1
+
+                    # Periodic rebalancing
+                    if balance and chunks_since_rebalance >= rebalance_interval:
+                        chunks_since_rebalance = 0
+                        _do_progression_rebalance_vector(
+                            env, output_dir, num_envs,
+                        )
+
+                        # Action rebalancing
+                        if balance_actions:
+                            _do_action_rebalance(
+                                policy, output_dir, num_actions,
+                            )
 
         obs = next_obs
         info = next_info
@@ -333,6 +632,8 @@ def run_collection(
             print(f"[chunk] wrote {final}")
     finally:
         writer.close()
+        if rollout_writer is not None:
+            rollout_writer.close()
         env.close()
 
     stats = VectorRunStats(
@@ -371,7 +672,12 @@ def run_human_collection(
     compress_chunks: bool,
     async_write: bool,
     max_pending_writes: int,
+    balance: bool = False,
+    rebalance_interval: int = 5,
+    balance_actions: bool = False,
 ):
+    num_actions = get_num_actions()
+
     if level_mode == "random":
         env = RandomLevelMarioEnv(seed=seed)
     else:
@@ -386,7 +692,29 @@ def run_human_collection(
     )
     policy = HumanActionPolicy(action_meanings=action_meanings, fps=human_fps, seed=seed)
 
+    # --- Episode tracking ---
+    tracker: EpisodeTracker | None = None
+    rollout_writer: RolloutWriter | None = None
+    if balance:
+        tracker = EpisodeTracker(1)
+        rollout_writer = RolloutWriter(output_dir)
+
+    # --- Initial progression rebalance at startup ---
+    # If rollouts already exist from a previous session, configure the replay
+    # pool BEFORE the first reset so replays work from the very first episode.
+    if balance and hasattr(env, 'update_progression_balance'):
+        _do_progression_rebalance_human(env, output_dir)  # type: ignore[arg-type]
+
     obs, info = env.reset(seed=seed)
+
+    # Seed the episode tracker
+    if tracker is not None:
+        tracker.set_initial_info(
+            0,
+            world=int(info.get("world", 1)),
+            stage=int(info.get("stage", 1)),
+            life=int(info.get("life", 2)),
+        )
 
     INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
     STATUS_MAP = {"small": 0, "tall": 1, "fireball": 2}
@@ -397,6 +725,7 @@ def run_human_collection(
     seq_info = {k: [] for k in INFO_KEYS + ["status"]}
 
     total_sequences = 0
+    chunks_since_rebalance = 0
 
     try:
         for step_idx in range(total_steps):
@@ -412,6 +741,27 @@ def run_human_collection(
             for k in INFO_KEYS:
                 seq_info[k].append(int(info.get(k, 0)))
             seq_info["status"].append(STATUS_MAP.get(info.get("status", "small"), 0))
+
+            # --- Episode tracking ---
+            if tracker is not None:
+                tracker.record_step(
+                    0,
+                    action=int(action),
+                    x_pos=int(info.get("x_pos", 0)),
+                    world=int(info.get("world", 1)),
+                    stage=int(info.get("stage", 1)),
+                    life=int(info.get("life", 2)),
+                )
+                if done:
+                    rollout = tracker.finish_episode(
+                        0,
+                        cur_life=int(next_info.get("life", 2)),
+                        flag_get=int(next_info.get("flag_get", 0)),
+                        terminated=bool(terminated),
+                        truncated=bool(truncated),
+                    )
+                    if rollout is not None and rollout_writer is not None:
+                        rollout_writer.write(rollout)
 
             if len(seq_frames) == sequence_length:
                 frames_tchw = np.stack(seq_frames, axis=0)
@@ -430,11 +780,44 @@ def run_human_collection(
                 seq_dones.clear()
                 if out is not None:
                     print(f"[chunk] wrote {out}")
+                    chunks_since_rebalance += 1
+
+                    # Periodic rebalancing for human mode
+                    if balance and chunks_since_rebalance >= rebalance_interval:
+                        chunks_since_rebalance = 0
+                        if hasattr(env, 'update_progression_balance'):
+                            _do_progression_rebalance_human(env, output_dir)  # type: ignore[arg-type]
+
+                        if balance_actions:
+                            # For human mode we just print guidance (can't override human input)
+                            act_cov = scan_action_coverage(str(output_dir))
+                            act_rpt = compute_action_balance(act_cov, num_actions)
+                            print(f"[actions] Action balance ({act_rpt.total_frames} frames):")
+                            needed = sorted(act_rpt.actions, key=lambda a: a.deficit, reverse=True)[:5]
+                            for ai in needed:
+                                if ai.deficit == 0:
+                                    break
+                                name = "+".join(action_meanings[ai.action_index]) if ai.action_index < len(action_meanings) else str(ai.action_index)
+                                print(f"  Try more: {name} (deficit {ai.deficit})")
 
             obs = next_obs
             info = next_info
             if done:
                 obs, info = env.reset()
+                if tracker is not None:
+                    tracker.set_initial_info(
+                        0,
+                        world=int(info.get("world", 1)),
+                        stage=int(info.get("stage", 1)),
+                        life=int(info.get("life", 2)),
+                    )
+                if balance and hasattr(env, '_current_level') and env._current_level:
+                    w, s = env._current_level
+                    replayed = info.get("replayed_steps", 0)
+                    if replayed:
+                        print(f"[balance] World {w}-{s} (replayed {replayed} steps → x={info.get('replayed_to_x', '?')})")
+                    else:
+                        print(f"[balance] Next level: World {w}-{s}")
 
             if (step_idx + 1) % 500 == 0:
                 print(f"[step {step_idx + 1}/{total_steps}] sequences={total_sequences}")
@@ -442,6 +825,8 @@ def run_human_collection(
     finally:
         policy.close()
         writer.close()
+        if rollout_writer is not None:
+            rollout_writer.close()
         env.close()
 
     stats = VectorRunStats(
@@ -482,6 +867,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compress-chunks", action="store_true", help="Compress chunks with np.savez_compressed")
     parser.add_argument("--async-write", action="store_true", help="Write chunk files in a background thread")
     parser.add_argument("--max-pending-writes", type=int, default=8)
+    parser.add_argument("--balance", action="store_true", help="Enable progression-aware balanced collection via action replay")
+    parser.add_argument("--rebalance-interval", type=int, default=5, help="Re-scan data and update weights every N chunks (default: 5)")
+    parser.add_argument("--balance-actions", action="store_true", help="Balance action distribution via dynamic policy weights (implies --balance)")
     return parser.parse_args()
 
 
@@ -509,6 +897,9 @@ def main():
         compress_chunks=compress_chunks,
         async_write=args.async_write,
         max_pending_writes=args.max_pending_writes,
+        balance=args.balance,
+        rebalance_interval=args.rebalance_interval,
+        balance_actions=args.balance_actions,
     )
 
     elapsed = time.time() - started

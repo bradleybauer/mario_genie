@@ -2,7 +2,7 @@
 # Retrieve training results from remote server
 source "$(dirname "$0")/config.sh"
 
-REMOTE_RESULTS="$REMOTE_DIR/results/"
+REMOTE_RESULTS="$REMOTE_DIR/checkpoints/"
 LOCAL_RESULTS="./results/"
 
 mkdir -p "$LOCAL_RESULTS"

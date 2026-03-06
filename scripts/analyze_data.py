@@ -215,40 +215,10 @@ def analyze_dataset(data_dir: Path):
                         level_x_stats[(final_w, final_s)]['flags'] += 1
                         total_flag_get += 1
 
-                # 3. Deaths (Global Counter - kept for legacy print)
-                # (We already updated total_deaths above)
-
-                # We need to being careful across sequence boundaries because sequences might not be contiguous in time 
-                # (collected from parallel envs then shuffled? No, `ChunkWriter` receives `add_sequence` from one env at a time).
-                # But `ChunkWriter` just stacks them.
-                # In `collect_vector.py`, `seq_frames` accumulates `sequence_length` frames then adds to writer.
-                # So inside one row of (B, T), the frames are contiguous.
-                # But row `i` and row `i+1` in the chunk? 
-                # `collect_vector` calls `writer.add_sequence`. 
-                # The writer accumulates them. They come from potentially different envs if running parallel.
-                # So we can only trust continuity WITHIN a sequence (axis 1).
-                
-                # Calculate difference along time axis
-                # life shape: (B, T)
-                # diff along axis 1
-                life_diff = life[:, 1:] - life[:, :-1]
-                # Deaths: life went down (diff < 0)
-                # Note: valid ranges of life are usually 1-3. 
-                # We assume if life drops, it's a death.
-                num_deaths = np.sum(life_diff < 0)
-                total_deaths += num_deaths
-                
-                # Flag Get
-                # Since flag_get is a boolean/int 0-1, we can sum it? 
-                # Or checks transition 0 -> 1?
-                # Usually flag_get is 1 when the flag represents acquired. 
-                # It might stay 1 for the rest of the level end animation.
-                # We 'collected' the flag if it was 0 then became 1, OR if we just see a 1 frame.
-                # Let's count frames where flag_get is true? 
-                # Or count sequences where flag_get > 0.
-                
-                # Let's just sum frames with flag_get > 0 to see how much "win state" data we have
-                total_flag_get += np.sum(flag_get > 0)
+                # NOTE: Deaths and flag-gets are already accumulated in the
+                # per-level loop above (the block that updates level_x_stats
+                # and total_deaths / total_flag_get).  Do NOT double-count
+                # them here.
                 
                 total_dones += np.sum(dones)
 

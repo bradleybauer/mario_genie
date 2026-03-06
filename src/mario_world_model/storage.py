@@ -18,6 +18,87 @@ class ChunkMeta:
     action_shape_bt: tuple[int, int]
     total_frames: int
     total_actions: int
+    level_summary: dict[str, int] | None = None
+    action_summary: dict[str, int] | None = None
+    progression_summary: dict[str, int] | None = None
+
+
+def _compute_level_summary(arrays: dict[str, np.ndarray]) -> dict[str, int] | None:
+    """Compute a per-level sequence count from the world/stage arrays in a chunk.
+
+    Returns ``None`` if the arrays don't contain ``world`` and ``stage``.
+    """
+    if "world" not in arrays or "stage" not in arrays:
+        return None
+    world = arrays["world"]  # (B, T)
+    stage = arrays["stage"]  # (B, T)
+    from collections import Counter
+    counts: dict[str, int] = Counter()
+    for i in range(world.shape[0]):
+        codes = world[i].astype(np.int32) * 100 + stage[i].astype(np.int32)
+        values, cnts = np.unique(codes, return_counts=True)
+        winner = values[np.argmax(cnts)]
+        w, s = int(winner // 100), int(winner % 100)
+        counts[f"{w}-{s}"] += 1
+    return dict(counts)
+
+
+def _compute_action_summary(arrays: dict[str, np.ndarray]) -> dict[str, int] | None:
+    """Compute per-action frame counts from the ``actions`` array in a chunk.
+
+    Returns a dict like ``{"0": 140, "3": 87, ...}`` mapping the *string*
+    representation of each action index to its total count across all
+    sequences/timesteps, or ``None`` if no ``actions`` key is present.
+    """
+    if "actions" not in arrays:
+        return None
+    actions = arrays["actions"].flatten()  # (B*T,)
+    unique, counts = np.unique(actions, return_counts=True)
+    return {str(int(u)): int(c) for u, c in zip(unique, counts)}
+
+
+def _compute_progression_summary(
+    arrays: dict[str, np.ndarray],
+    bin_size: int = 256,
+) -> dict[str, int] | None:
+    """Compute per-(level, x-bin) frame counts.
+
+    Returns a dict like ``{"1-1-0": 50, "1-1-3": 12, ...}`` where the key
+    is ``"W-S-B"`` (world, stage, screen-bin) and the value is the number of
+    frames falling in that bin.  Returns ``None`` if the necessary arrays are
+    absent.
+    """
+    if "world" not in arrays or "stage" not in arrays or "x_pos" not in arrays:
+        return None
+    from collections import Counter
+    world = arrays["world"].flatten()
+    stage = arrays["stage"].flatten()
+    x_pos = arrays["x_pos"].flatten()
+    bins = (x_pos // bin_size).astype(np.int32)
+    codes = world.astype(np.int64) * 1_000_000 + stage.astype(np.int64) * 1_000 + bins.astype(np.int64)
+    unique, counts = np.unique(codes, return_counts=True)
+    result: dict[str, int] = {}
+    for code, cnt in zip(unique, counts):
+        w = int(code // 1_000_000)
+        s = int((code % 1_000_000) // 1_000)
+        b = int(code % 1_000)
+        result[f"{w}-{s}-{b}"] = int(cnt)
+    return result
+
+
+def _compute_chunk_summaries(
+    arrays: dict[str, np.ndarray],
+) -> tuple[
+    dict[str, int] | None,
+    dict[str, int] | None,
+    dict[str, int] | None,
+]:
+    """Return ``(level_summary, action_summary, progression_summary)``."""
+    return (
+        _compute_level_summary(arrays),
+        _compute_action_summary(arrays),
+        _compute_progression_summary(arrays),
+    )
 
 
 def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -> None:
@@ -70,6 +151,9 @@ def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -
                     **kwargs_arrays,
                 )
 
+            level_summ, action_summ, prog_summ = _compute_chunk_summaries(
+                {"actions": actions_bt, **kwargs_arrays}
+            )
             meta = ChunkMeta(
                 chunk_index=chunk_index,
                 num_sequences=int(frames_btchw.shape[0]),
@@ -78,6 +162,9 @@ def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -
                 action_shape_bt=tuple(int(x) for x in actions_bt.shape),
                 total_frames=int(frames_btchw.shape[0] * frames_btchw.shape[1]),
                 total_actions=int(actions_bt.size),
+                level_summary=level_summ,
+                action_summary=action_summ,
+                progression_summary=prog_summ,
             )
 
             with (output_dir / f"chunk_{chunk_index:06d}.meta.json").open("w", encoding="utf-8") as f:
@@ -220,6 +307,9 @@ class ChunkWriter:
         else:
             np.savez(out_path, frames=frames_btchw, actions=actions_bt, dones=dones_bt, **kwargs_arrays)
 
+        level_summ, action_summ, prog_summ = _compute_chunk_summaries(
+            {"actions": actions_bt, **kwargs_arrays}
+        )
         meta = ChunkMeta(
             chunk_index=chunk_index,
             num_sequences=int(frames_btchw.shape[0]),
@@ -228,6 +318,9 @@ class ChunkWriter:
             action_shape_bt=tuple(int(x) for x in actions_bt.shape),
             total_frames=int(frames_btchw.shape[0] * frames_btchw.shape[1]),
             total_actions=int(actions_bt.size),
+            level_summary=level_summ,
+            action_summary=action_summ,
+            progression_summary=prog_summ,
         )
 
         with (self.output_dir / f"chunk_{chunk_index:06d}.meta.json").open("w", encoding="utf-8") as f:

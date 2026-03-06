@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import re
 import sys
 
 import matplotlib.pyplot as plt
@@ -14,65 +16,55 @@ def load_metrics(path):
         return json.load(f)
 
 
-def plot_metrics(metrics, output_path=None):
-    steps = [m["step"] for m in metrics]
-    loss = [m["loss"] for m in metrics]
-    recon = [m["recon_loss"] for m in metrics]
-
-    # Codebook usage is only logged at validation steps
-    cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
-    cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
-
-    has_cb = len(cb_steps) > 0
-    nrows = 3 if has_cb else 2
+def plot_metrics(all_metrics, labels, max_codes, output_path=None):
+    has_cb = any("codebook_usage" in m for metrics in all_metrics for m in metrics)
+    nrows = 2 if has_cb else 1
 
     fig, axes = plt.subplots(nrows, 1, figsize=(10, 4 * nrows), sharex=True)
+    if nrows == 1:
+        axes = [axes]
 
-    # --- Loss ---
-    ax = axes[0]
-    ax.plot(steps, loss, label="Total loss", alpha=0.7, linewidth=0.8)
-    ax.plot(steps, recon, label="Recon loss", alpha=0.7, linewidth=0.8)
-    ax.set_ylabel("Loss")
-    ax.set_yscale("log")
-    ax.legend()
-    ax.set_title("Training Loss")
-    ax.grid(True, alpha=0.3)
+    # --- Recon Loss ---
+    ax_loss = axes[0]
+    for metrics, label in zip(all_metrics, labels):
+        steps = [m["step"] for m in metrics]
+        recon = [m["recon_loss"] for m in metrics]
+        ax_loss.plot(steps, recon, label=label, alpha=0.7, linewidth=0.8)
 
-    # --- Loss delta (rate of improvement) ---
-    ax = axes[1]
-    recon_arr = np.array(recon)
-    window = max(1, len(recon_arr) // 50)
-    if len(recon_arr) > window:
-        kernel = np.ones(window) / window
-        smoothed = np.convolve(recon_arr, kernel, mode="valid")
-        delta = -np.diff(smoothed)  # positive = improving
-        delta_steps = steps[window:window + len(delta)]
-        ax.plot(delta_steps, delta, linewidth=0.8, alpha=0.7, color="tab:orange")
-        ax.axhline(0, color="grey", linewidth=0.5, linestyle="--")
-        ax.set_ylabel("Δ Recon loss (smoothed)")
-        ax.set_title("Rate of Improvement (positive = improving)")
-        ax.grid(True, alpha=0.3)
+    ax_loss.set_ylabel("Loss")
+    ax_loss.set_yscale("log")
+    ax_loss.legend()
+    ax_loss.set_title("Reconstruction Loss")
+    ax_loss.grid(True, alpha=0.3)
 
     # --- Codebook usage ---
     if has_cb:
-        ax = axes[2]
-        ax.plot(cb_steps, cb_usage, marker="o", markersize=3, color="tab:purple")
-        ax.set_ylabel("Unique codes used")
-        ax.set_title("Codebook Usage")
-        ax.grid(True, alpha=0.3)
+        ax_cb = axes[1]
+        for metrics, label, max_c in zip(all_metrics, labels, max_codes):
+            cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
+            cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
+            if cb_steps:
+                line = ax_cb.plot(cb_steps, cb_usage, marker="o", markersize=3, label=label)[0]
+                if max_c is not None:
+                    ax_cb.axhline(max_c, color=line.get_color(), linestyle="--", alpha=0.5, label=f"Max ({max_c})")
+        ax_cb.set_ylabel("Unique codes used")
+        ax_cb.set_title("Codebook Usage")
+        ax_cb.grid(True, alpha=0.3)
+        ax_cb.legend()
 
     axes[-1].set_xlabel("Step")
 
     # Mark epoch boundaries
-    epoch_starts = {}
-    for m in metrics:
-        e = m["epoch"]
-        if e not in epoch_starts:
-            epoch_starts[e] = m["step"]
-    for ax in axes:
-        for e, s in epoch_starts.items():
-            if e > 0:
-                ax.axvline(s, color="grey", linestyle="--", alpha=0.3, linewidth=0.7)
+    for metrics in all_metrics:
+        epoch_starts = {}
+        for m in metrics:
+            e = m["epoch"]
+            if e not in epoch_starts:
+                epoch_starts[e] = m["step"]
+        for ax in axes:
+            for e, s in epoch_starts.items():
+                if e > 0:
+                    ax.axvline(s, color="grey", linestyle="--", alpha=0.1, linewidth=0.7)
 
     fig.tight_layout()
 
@@ -85,19 +77,35 @@ def plot_metrics(metrics, output_path=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("metrics_json", nargs="?", default="checkpoints/magvit2/metrics.json",
-                        help="Path to metrics.json (default: checkpoints/magvit2/metrics.json)")
+    parser.add_argument("metrics_json", nargs="*", default=["checkpoints/magvit2/metrics.json"],
+                        help="Paths to metrics.json (default: checkpoints/magvit2/metrics.json)")
+    parser.add_argument("-l", "--labels", nargs="*", default=None,
+                        help="Labels for each metrics file")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Save plot to file instead of showing (e.g. metrics.png)")
     args = parser.parse_args()
 
-    metrics = load_metrics(args.metrics_json)
-    if not metrics:
+    default_labels = []
+    max_codes = []
+    for path in args.metrics_json:
+        parent_dir = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        default_labels.append(parent_dir)
+        match = re.search(r'\d+', parent_dir)
+        max_codes.append(int(match.group()) if match else None)
+
+    all_metrics = []
+    labels = args.labels if args.labels and len(args.labels) == len(args.metrics_json) else default_labels
+
+    for path in args.metrics_json:
+        metrics = load_metrics(path)
+        all_metrics.append(metrics)
+
+    if not all_metrics or not any(all_metrics):
         print("No metrics found.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded {len(metrics)} entries, steps {metrics[0]['step']}–{metrics[-1]['step']}")
-    plot_metrics(metrics, output_path=args.output)
+    print(f"Loaded {len(all_metrics)} metrics files.")
+    plot_metrics(all_metrics, labels, max_codes, output_path=args.output)
 
 
 if __name__ == "__main__":

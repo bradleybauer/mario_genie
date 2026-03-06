@@ -1,0 +1,4 @@
+python scripts/collect_vector.py --mode human --num-envs 1 --total-steps 200000 --sequences-per-chunk 512 --max-pending-writes 16 --async-write --output-dir data/human_play --compress-chunks
+
+
+python scripts/train_magvit.py --data-dir "data/human_play" --codebook-size "8192" --run-name "InitialTokenizerTrain" --batch-size 32 --epochs 10
