@@ -27,9 +27,7 @@ from mario_world_model.config import SEQUENCE_LENGTH
 from mario_world_model.coverage import (
     compute_action_balance,
     compute_progression_balance,
-    print_action_report,
     print_progression_guidance,
-    print_progression_report,
     scan_action_coverage,
     scan_progression_coverage,
 )
@@ -176,14 +174,25 @@ class HumanActionPolicy:
     def _init_evdev_gamepad(self) -> None:
         """Try to find a gamepad via evdev (reads /dev/input/event* directly)."""
         try:
-            for path in evdev.list_devices():
-                dev = evdev.InputDevice(path)
+            paths = evdev.list_devices()
+            if not paths:
+                print("No evdev input devices found. Falling back to keyboard.")
+                return
+            for path in paths:
+                try:
+                    dev = evdev.InputDevice(path)
+                except PermissionError:
+                    print(f"Permission denied: {path}")
+                    print(f"  Fix: sudo chmod 666 {path}")
+                    print(f"  Permanent: sudo usermod -aG input $(whoami)  (then restart WSL)")
+                    continue
                 caps = dev.capabilities(verbose=False)
                 # A gamepad should have EV_KEY and EV_ABS
                 has_abs = evdev.ecodes.EV_ABS in caps
                 has_key = evdev.ecodes.EV_KEY in caps
                 if has_abs and has_key:
                     self._evdev_device = dev
+                    self._evdev_axis_ranges: dict[str, tuple[int, int]] = {}
                     # Read axis ranges for normalization
                     for abs_code, abs_info in caps.get(evdev.ecodes.EV_ABS, []):
                         name = evdev.ecodes.ABS.get(abs_code, f"ABS_{abs_code}")
@@ -192,8 +201,12 @@ class HumanActionPolicy:
                         # Store the midpoint as the default/centered value
                         mid = (abs_info.min + abs_info.max) // 2
                         self._evdev_axes[name] = mid
-                        self._evdev_axis_range = (abs_info.min, abs_info.max)
+                        self._evdev_axis_ranges[name] = (abs_info.min, abs_info.max)
+                        # Keep legacy single-range for ABS_X/ABS_Y
+                        if name in ("ABS_X", "ABS_Y"):
+                            self._evdev_axis_range = (abs_info.min, abs_info.max)
                     print(f"Initialized evdev gamepad: {dev.name} ({dev.path})")
+                    print(f"  Axes: {list(self._evdev_axis_ranges.keys())}")
                     return
         except Exception as exc:
             print(f"evdev gamepad probe failed: {exc}")
@@ -246,15 +259,28 @@ class HumanActionPolicy:
         # Poll evdev gamepad (non-blocking)
         self._poll_evdev()
         if self._evdev_device is not None:
-            # Axis input: normalize to [-1, 1] range
-            ax_min, ax_max = getattr(self, '_evdev_axis_range', (0, 255))
-            ax_mid = (ax_min + ax_max) / 2.0
-            ax_half = max((ax_max - ax_min) / 2.0, 1)
-            x_val = (self._evdev_axes.get("ABS_X", ax_mid) - ax_mid) / ax_half
-            y_val = (self._evdev_axes.get("ABS_Y", ax_mid) - ax_mid) / ax_half
+            axis_ranges = getattr(self, '_evdev_axis_ranges', {})
+
+            def _axis_norm(axis_name: str) -> float:
+                """Normalize an axis value to [-1, 1]."""
+                ax_min, ax_max = axis_ranges.get(axis_name, (0, 255))
+                ax_mid = (ax_min + ax_max) / 2.0
+                ax_half = max((ax_max - ax_min) / 2.0, 1)
+                return (self._evdev_axes.get(axis_name, ax_mid) - ax_mid) / ax_half
+
+            # Analog stick (ABS_X / ABS_Y)
+            x_val = _axis_norm("ABS_X")
+            y_val = _axis_norm("ABS_Y")
             right = right or x_val > 0.5
             left = left or x_val < -0.5
             down = down or y_val > 0.5
+
+            # HAT / d-pad axes (ABS_HAT0X / ABS_HAT0Y) — common on budget USB gamepads
+            hat_x = _axis_norm("ABS_HAT0X")
+            hat_y = _axis_norm("ABS_HAT0Y")
+            right = right or hat_x > 0.5
+            left = left or hat_x < -0.5
+            down = down or hat_y > 0.5
 
             # Button input: BTN_TRIGGER(0x120)=btn0, BTN_THUMB(0x121)=btn1, etc.
             # Map: button 1 (BTN_THUMB) -> jump, button 0 (BTN_TRIGGER) -> sprint

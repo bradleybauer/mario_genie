@@ -49,9 +49,10 @@ def _try_batch(
         model.zero_grad(set_to_none=True)
         del dummy, loss
         _clear_gpu(device)
+        print(f"[auto-batch]   batch_size={batch_size:>4d}  ✓ fits")
         return True
     except torch.cuda.OutOfMemoryError:
-        print("[auto-batch-sizer] OOM at batch_size =", batch_size)
+        print(f"[auto-batch]   batch_size={batch_size:>4d}  ✗ OOM")
         model.zero_grad(set_to_none=True)
         _clear_gpu(device)
         return False
@@ -100,6 +101,7 @@ def find_max_batch_size(
     was_training = model.training
 
     # ── Phase 1: exponential growth to find an upper bound ───────────
+    print(f"[auto-batch] Phase 1/2: exponential probing (floor={floor}, ceiling={ceiling}) …")
     hi = floor
     while hi <= ceiling:
         if _try_batch(model, hi, image_size, seq_len, device):
@@ -107,6 +109,10 @@ def find_max_batch_size(
         else:
             break
     # hi is now the first power-of-2 that OOM'd (or > ceiling)
+
+    # If hi exceeded ceiling without OOM, ceiling itself was tested and fits.
+    ceiling_fits = hi > ceiling
+
     upper = min(hi, ceiling)
     lower = max(floor, upper // 2)
 
@@ -118,15 +124,25 @@ def find_max_batch_size(
         return floor
 
     # ── Phase 2: binary search between lower (fits) and upper (OOMs) ─
-    while upper - lower > 1:
-        mid = (lower + upper) // 2
-        if _try_batch(model, mid, image_size, seq_len, device):
-            lower = mid
-        else:
-            upper = mid
+    # Skip if ceiling already fits — no OOM boundary to refine.
+    print(f"[auto-batch] Phase 2/2: binary search (lower={lower}, upper={upper}) …")
+    if ceiling_fits:
+        raw_max = ceiling
+    else:
+        while upper - lower > 1:
+            mid = (lower + upper) // 2
+            if _try_batch(model, mid, image_size, seq_len, device):
+                lower = mid
+            else:
+                upper = mid
+        raw_max = lower
 
-    raw_max = lower
-    safe = max(floor, int(raw_max * safety_fraction))
+    # If we never hit OOM (raw_max == ceiling), the safety margin is
+    # unnecessary — there's no OOM edge to back off from.
+    if raw_max >= ceiling:
+        safe = ceiling
+    else:
+        safe = max(floor, int(raw_max * safety_fraction))
 
     # Round down to the nearest power of 2 for DataLoader efficiency
     safe_pow2 = 2 ** int(math.log2(safe)) if safe >= 2 else safe
