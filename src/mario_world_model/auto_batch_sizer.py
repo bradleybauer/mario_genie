@@ -6,7 +6,7 @@ the validation forward pass (which also allocates memory) doesn't OOM.
 
 Usage
 -----
->>> from mario_world_model.auto_batch import find_max_batch_size
+>>> from mario_world_model.auto_batch_sizer import find_max_batch_size
 >>> bs = find_max_batch_size(model, image_size=128, seq_len=16, device="cuda")
 >>> print(f"Using batch size {bs}")
 """

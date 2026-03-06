@@ -4,7 +4,6 @@ This project implements an Action-Conditioned Mario World Model. It focuses on l
 
 ## Features
 
-- **Dynamic Environment Wrapping**: Seamless integration with the legacy `gym_super_mario_bros` via `Gymnasium` and `shimmy` wrappers.
 - **Randomized and Fixed Levels**: Ability to target specific game levels (e.g. World 1, Stage 1) or randomly sample across all 32 standard levels utilizing `RandomLevelMarioEnv`.
 - **Complex Action Space**: Automatically synthesizes the `COMPLEX_MOVEMENT` discrete action space containing combinatorially valid Joypad inputs.
 - **Optimized Storage**: Asynchronous, chunked sequence writing into compressed or uncompressed NumPy arrays (`.npz`) using a dedicated `ChunkWriter`. Parallel metadata capture into `.meta.json` pairs.
@@ -28,7 +27,8 @@ This project implements an Action-Conditioned Mario World Model. It focuses on l
 │   ├── connect.sh                      # Open SSH tunnel to remote instance
 │   ├── setup_remote.sh                 # Sync code, install deps, create conda env
 │   ├── send_data.sh                    # Sync local data/ to remote instance
-│   └── get_results.sh                  # Retrieve training results from remote instance
+│   ├── get_results.sh                  # Retrieve training results from remote instance
+│   └── sync_code.sh                    # Sync code
 ├── scripts/
 │   ├── collect_vector.py        # Main execution entrypoint for data collection
 │   └── balance_report.py        # Dataset balance inspection tool
@@ -125,8 +125,6 @@ python scripts/collect_vector.py \
     --num-envs 16 \
     --total-steps 200000 \
     --sequences-per-chunk 512 \
-    --async-write \
-    --compress-chunks \
     --output-dir data/heuristic_play
 ```
 

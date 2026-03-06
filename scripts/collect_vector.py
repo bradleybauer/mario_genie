@@ -419,8 +419,6 @@ def run_collection(
     vector_mode: str,
     human_fps: int,
     level_mode: str,
-    compress_chunks: bool,
-    async_write: bool,
     max_pending_writes: int,
     balance: bool = False,
     rebalance_interval: int = 5,
@@ -460,8 +458,6 @@ def run_collection(
             human_fps=human_fps,
             action_meanings=action_meanings,
             level_mode=level_mode,
-            compress_chunks=compress_chunks,
-            async_write=async_write,
             max_pending_writes=max_pending_writes,
             balance=balance,
             rebalance_interval=rebalance_interval,
@@ -480,8 +476,8 @@ def run_collection(
         output_dir=output_dir,
         sequence_length=sequence_length,
         sequences_per_chunk=sequences_per_chunk,
-        compress=compress_chunks,
-        async_write=async_write,
+        compress=True,
+        async_write=True,
         max_pending_writes=max_pending_writes,
     )
     policy = VectorActionPolicy(mode=mode, num_envs=num_envs, action_meanings=action_meanings, seed=seed)
@@ -669,8 +665,6 @@ def run_human_collection(
     human_fps: int,
     action_meanings: list[list[str]],
     level_mode: str,
-    compress_chunks: bool,
-    async_write: bool,
     max_pending_writes: int,
     balance: bool = False,
     rebalance_interval: int = 5,
@@ -686,8 +680,8 @@ def run_human_collection(
         output_dir=output_dir,
         sequence_length=sequence_length,
         sequences_per_chunk=sequences_per_chunk,
-        compress=compress_chunks,
-        async_write=async_write,
+        compress=True,
+        async_write=True,
         max_pending_writes=max_pending_writes,
     )
     policy = HumanActionPolicy(action_meanings=action_meanings, fps=human_fps, seed=seed)
@@ -864,8 +858,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-steps", type=int, default=20000)
     parser.add_argument("--vector-mode", type=str, default="sync", choices=["sync", "async"])
     parser.add_argument("--human-fps", type=int, default=75)
-    parser.add_argument("--compress-chunks", action="store_true", help="Compress chunks with np.savez_compressed")
-    parser.add_argument("--async-write", action="store_true", help="Write chunk files in a background thread")
     parser.add_argument("--max-pending-writes", type=int, default=8)
     parser.add_argument("--balance", action="store_true", help="Enable progression-aware balanced collection via action replay")
     parser.add_argument("--rebalance-interval", type=int, default=5, help="Re-scan data and update weights every N chunks (default: 5)")
@@ -876,10 +868,6 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     started = time.time()
-
-    compress_chunks = False
-    if args.compress_chunks:
-        compress_chunks = True
 
     run_collection(
         output_dir=args.output_dir,
@@ -894,8 +882,6 @@ def main():
         vector_mode=args.vector_mode,
         human_fps=args.human_fps,
         level_mode=args.level_mode,
-        compress_chunks=compress_chunks,
-        async_write=args.async_write,
         max_pending_writes=args.max_pending_writes,
         balance=args.balance,
         rebalance_interval=args.rebalance_interval,

@@ -22,7 +22,7 @@ from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
 
 from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
-from mario_world_model.auto_batch import find_max_batch_size
+from mario_world_model.auto_batch_sizer import find_max_batch_size
 
 class MarioVideoDataset(Dataset):
     def __init__(self, data_dir, seq_len=4):

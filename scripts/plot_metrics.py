@@ -18,28 +18,38 @@ def load_metrics(path):
 
 def plot_metrics(all_metrics, labels, max_codes, output_path=None):
     has_cb = any("codebook_usage" in m for metrics in all_metrics for m in metrics)
-    nrows = 2 if has_cb else 1
+    nrows = 3 if has_cb else 2
 
     fig, axes = plt.subplots(nrows, 1, figsize=(10, 4 * nrows), sharex=True)
-    if nrows == 1:
-        axes = [axes]
 
-    # --- Recon Loss ---
-    ax_loss = axes[0]
+    # --- Recon Loss (linear) ---
+    ax_loss_lin = axes[0]
     for metrics, label in zip(all_metrics, labels):
         steps = [m["step"] for m in metrics]
         recon = [m["recon_loss"] for m in metrics]
-        ax_loss.plot(steps, recon, label=label, alpha=0.7, linewidth=0.8)
+        ax_loss_lin.plot(steps, recon, label=label, alpha=0.7, linewidth=0.8)
 
-    ax_loss.set_ylabel("Loss")
-    ax_loss.set_yscale("log")
-    ax_loss.legend()
-    ax_loss.set_title("Reconstruction Loss")
-    ax_loss.grid(True, alpha=0.3)
+    ax_loss_lin.set_ylabel("Loss")
+    ax_loss_lin.legend()
+    ax_loss_lin.set_title("Reconstruction Loss (Linear)")
+    ax_loss_lin.grid(True, alpha=0.3)
+
+    # --- Recon Loss (log) ---
+    ax_loss_log = axes[1]
+    for metrics, label in zip(all_metrics, labels):
+        steps = [m["step"] for m in metrics]
+        recon = [m["recon_loss"] for m in metrics]
+        ax_loss_log.plot(steps, recon, label=label, alpha=0.7, linewidth=0.8)
+
+    ax_loss_log.set_ylabel("Loss")
+    ax_loss_log.set_yscale("log")
+    ax_loss_log.legend()
+    ax_loss_log.set_title("Reconstruction Loss (Log)")
+    ax_loss_log.grid(True, alpha=0.3)
 
     # --- Codebook usage ---
     if has_cb:
-        ax_cb = axes[1]
+        ax_cb = axes[2]
         for metrics, label, max_c in zip(all_metrics, labels, max_codes):
             cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
             cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
