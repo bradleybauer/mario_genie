@@ -288,4 +288,12 @@ The naïve DataLoader path has compounding overhead: (1) each `__getitem__` re-o
 
 **Throughput note:** At large batch sizes (e.g. bs=40), iterations-per-second drops significantly compared to bs=2, but **samples-per-second increases** (e.g. 80 samp/s at bs=40 vs 60 samp/s at bs=2). Lower it/s with larger batches reflects longer GPU forward/backward passes, not a data loading bottleneck.
 
+### Batch Size and Architecture Sweeps
+
+When using `--auto-batch-size` across architectures of different sizes, each configuration ends up with a different physical batch size (e.g. dim32 → bs=32, dim128 → bs=8). This is generally acceptable for comparing reconstruction quality because:
+
+Reconstruction loss is a simple, well-behaved objective. It's not like contrastive learning or GAN training where batch size meaningfully changes the loss landscape. MSE/L1 reconstruction has the same expected gradient regardless of batch size — only variance changes.
+
+Combined with convergence-based stopping (`--max-patience`, `--threshold`), all architectures train until they plateau, so the noisier gradients from smaller batches are compensated by more optimizer steps per epoch. Gradient accumulation would be necessary if using batch-sensitive objectives or if batch sizes varied by 10x+.
+
 

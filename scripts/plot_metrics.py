@@ -18,24 +18,14 @@ def load_metrics(path):
 
 def plot_metrics(all_metrics, labels, max_codes, output_path=None):
     has_cb = any("codebook_usage" in m for metrics in all_metrics for m in metrics)
-    nrows = 3 if has_cb else 2
+    nrows = 2 if has_cb else 1
 
     fig, axes = plt.subplots(nrows, 1, figsize=(10, 4 * nrows), sharex=True)
-
-    # --- Recon Loss (linear) ---
-    ax_loss_lin = axes[0]
-    for metrics, label in zip(all_metrics, labels):
-        steps = [m["step"] for m in metrics]
-        recon = [m["recon_loss"] for m in metrics]
-        ax_loss_lin.plot(steps, recon, label=label, alpha=0.7, linewidth=0.8)
-
-    ax_loss_lin.set_ylabel("Loss")
-    ax_loss_lin.legend()
-    ax_loss_lin.set_title("Reconstruction Loss (Linear)")
-    ax_loss_lin.grid(True, alpha=0.3)
+    if nrows == 1:
+        axes = [axes]
 
     # --- Recon Loss (log) ---
-    ax_loss_log = axes[1]
+    ax_loss_log = axes[0]
     for metrics, label in zip(all_metrics, labels):
         steps = [m["step"] for m in metrics]
         recon = [m["recon_loss"] for m in metrics]
@@ -49,7 +39,7 @@ def plot_metrics(all_metrics, labels, max_codes, output_path=None):
 
     # --- Codebook usage ---
     if has_cb:
-        ax_cb = axes[2]
+        ax_cb = axes[1]
         for metrics, label, max_c in zip(all_metrics, labels, max_codes):
             cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
             cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
@@ -63,18 +53,6 @@ def plot_metrics(all_metrics, labels, max_codes, output_path=None):
         ax_cb.legend()
 
     axes[-1].set_xlabel("Step")
-
-    # Mark epoch boundaries
-    for metrics in all_metrics:
-        epoch_starts = {}
-        for m in metrics:
-            e = m["epoch"]
-            if e not in epoch_starts:
-                epoch_starts[e] = m["step"]
-        for ax in axes:
-            for e, s in epoch_starts.items():
-                if e > 0:
-                    ax.axvline(s, color="grey", linestyle="--", alpha=0.1, linewidth=0.7)
 
     fig.tight_layout()
 

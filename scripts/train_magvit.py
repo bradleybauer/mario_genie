@@ -162,6 +162,11 @@ def train():
         help="Probe GPU to find the largest batch size that fits in VRAM. "
              "Overrides --batch-size.",
     )
+    parser.add_argument(
+        "--max-batch-size", type=int, default=0,
+        help="Cap batch size (0 = no cap). Use with --auto-batch-size to "
+             "limit large batches for faster convergence.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=200)
@@ -300,13 +305,16 @@ def train():
     # ── Auto batch-size ──────────────────────────────────────────────
     if args.auto_batch_size and device.type == "cuda":
         print("\n[auto-batch] Probing GPU for maximum batch size …")
+        ceiling = num_unique_samples
+        if args.max_batch_size > 0:
+            ceiling = min(ceiling, args.max_batch_size)
         args.batch_size = find_max_batch_size(
             tokenizer,
             image_size=IMAGE_SIZE,
             seq_len=SEQUENCE_LENGTH,
             device=device,
             floor=1,
-            ceiling=num_unique_samples,
+            ceiling=ceiling,
         )
         # Rebuild DataLoader with the discovered batch size
         if gpu_cache is None:
@@ -335,7 +343,7 @@ def train():
 
     # ── LR schedule: time-based cosine annealing ─────────────────────
     max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
-    eta_min = args.lr / 4
+    eta_min = args.lr / 2
 
     # Save config for reproducibility
     config = vars(args).copy()
@@ -425,6 +433,7 @@ def train():
         optimizer.zero_grad()
         loss, loss_breakdown = tokenizer(batch, return_loss=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -486,6 +495,19 @@ def train():
 
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_log, f, indent=2)
+
+    # Always record the final state so sweep readers see the terminal smoothed_recon
+    final_metrics = {
+        "step": global_step,
+        "loss": loss.item(),
+        "recon_loss": recon,
+        "smoothed_recon_loss": smoothed_recon,
+        "best_smoothed_recon": best_smoothed_recon,
+        "lr": optimizer.param_groups[0]['lr'],
+        "elapsed_s": round(time.time() - train_start, 2),
+    }
+    if not metrics_log or metrics_log[-1]["step"] != global_step:
+        metrics_log.append(final_metrics)
 
     with open(metrics_path, 'w') as f:
         json.dump(metrics_log, f, indent=2)

@@ -163,12 +163,15 @@ def get_total_samples(data_dir: str, seq_len: int = 16) -> int:
 
 
 def read_best_recon(metrics_path: str) -> float:
-    """Read the minimum eval recon_loss from a training run's metrics.json."""
+    """Read the minimum smoothed recon_loss from a training run's metrics.json."""
     try:
         with open(metrics_path) as f:
             metrics = json.load(f)
         # Prefer eval_recon_loss (computed in eval mode at val steps)
         recon_values = [m["eval_recon_loss"] for m in metrics if "eval_recon_loss" in m]
+        if not recon_values:
+            # Use smoothed_recon_loss to match the threshold the trainer uses to stop
+            recon_values = [m["smoothed_recon_loss"] for m in metrics if "smoothed_recon_loss" in m]
         if not recon_values:
             recon_values = [m["recon_loss"] for m in metrics if "recon_loss" in m]
         if recon_values:
@@ -192,8 +195,7 @@ def build_train_cmd(
     lr: float,
     patience: float,
     val_interval: int,
-    batch_size: int,
-    auto_batch: bool,
+    max_batch_size: int,
     seed: int,
     num_workers: int,
     threshold: float = 0.0,
@@ -215,12 +217,10 @@ def build_train_cmd(
         "--seed", str(seed),
         "--num-workers", str(num_workers),
         "--output-dir", output_dir,
+        "--auto-batch-size",
+        "--max-batch-size", str(max_batch_size),
     ]
-    if auto_batch:
-        cmd.append("--auto-batch-size")
-    else:
-        cmd.extend(["--batch-size", str(batch_size)])
-    if dataset_size <= batch_size:
+    if dataset_size <= max_batch_size:
         cmd.append("--no-shuffle")
     return cmd
 
@@ -311,17 +311,6 @@ def binary_search_max_size(
     trial = run_trial(model, 2, dry_run=dry_run, resume=resume, **train_kwargs)
     result.trials.append(asdict(trial))
 
-    if dry_run:
-        # In dry-run mode, simulate the full binary search to show all commands
-        low, high = 2, total_samples
-        while high - low > 1:
-            mid = (low + high) // 2
-            trial = run_trial(model, mid, dry_run=True, resume=resume, **train_kwargs)
-            result.trials.append(asdict(trial))
-            high = mid  # arbitrary direction for dry-run illustration
-        result.total_time_s = 0.0
-        return result
-
     if not trial.passed:
         print(f"  {model.name}: FAILED on size=2 — skipping entirely.")
         result.total_time_s = time.time() - t0
@@ -384,11 +373,10 @@ def main():
                         help="Minutes without improvement before early stop (default: 12)")
     parser.add_argument("--max-minutes", type=float, default=120,
                         help="Wall-clock minute budget per trial (default: 120)")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1.5e-4)
     parser.add_argument("--val-interval", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--auto-batch", action="store_true",
-                        help="Use auto batch size detection")
+    parser.add_argument("--max-batch-size", type=int, default=16,
+                        help="Cap auto-detected batch size (default: 16)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=64)
     parser.add_argument("--max-samples", type=int, default=0,
@@ -438,8 +426,7 @@ def main():
         lr=args.lr,
         patience=args.max_patience * 60,
         val_interval=args.val_interval,
-        batch_size=args.batch_size,
-        auto_batch=args.auto_batch,
+        max_batch_size=args.max_batch_size,
         seed=args.seed,
         num_workers=args.num_workers,
         threshold=args.threshold,
