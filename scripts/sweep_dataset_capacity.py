@@ -188,9 +188,9 @@ def build_train_cmd(
     *,
     data_dir: str,
     output_dir: str,
-    max_steps: int,
+    max_minutes: float,
     lr: float,
-    patience: int,
+    patience: float,
     val_interval: int,
     batch_size: int,
     auto_batch: bool,
@@ -207,8 +207,7 @@ def build_train_cmd(
         "--init-dim", str(model.init_dim),
         "--codebook-size", str(model.codebook_size),
         "--layers", model.layers,
-        "--epochs", "9999",
-        "--max-steps", str(max_steps),
+        "--max-minutes", str(max_minutes),
         "--lr", str(lr),
         "--threshold", str(threshold),
         "--max-patience", str(patience),
@@ -381,17 +380,17 @@ def main():
     parser.add_argument("--output-dir", default="checkpoints/capacity_sweep")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")
-    parser.add_argument("--max-patience", type=int, default=5,
-                        help="Patience for plateau-based convergence (default: 5)")
-    parser.add_argument("--max-steps", type=int, default=5000,
-                        help="Gradient step budget per trial (default: 5000)")
+    parser.add_argument("--max-patience", type=float, default=120,
+                        help="Seconds without improvement before early stop (default: 120)")
+    parser.add_argument("--max-minutes", type=float, default=120,
+                        help="Wall-clock minute budget per trial (default: 120)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--val-interval", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--auto-batch", action="store_true",
                         help="Use auto batch size detection")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=48)
+    parser.add_argument("--num-workers", type=int, default=64)
     parser.add_argument("--max-samples", type=int, default=0,
                         help="Override upper bound for dataset size "
                              "(0 = auto-detect from data)")
@@ -435,7 +434,7 @@ def main():
     train_kwargs = dict(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
-        max_steps=args.max_steps,
+        max_minutes=args.max_minutes,
         lr=args.lr,
         patience=args.max_patience,
         val_interval=args.val_interval,

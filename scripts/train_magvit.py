@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+from collections import defaultdict
 import glob
 import json
 import math
@@ -8,7 +9,7 @@ import time
 from datetime import datetime
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset, RandomSampler
 import sys
 from pathlib import Path
 
@@ -20,7 +21,7 @@ if str(SRC_DIR) not in sys.path:
 
 from torchvision.utils import save_image
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+
 from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
 
@@ -59,13 +60,13 @@ def _index_chunk(chunk_idx, filepath, seq_len):
         return []
 
 class MarioVideoDataset(Dataset):
-    def __init__(self, data_dir, seq_len=4):
+    def __init__(self, data_dir, seq_len=4, preload=True, subset_n=0, seed=42):
         self.chunk_files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
         self.seq_len = seq_len
         self.samples = []
         
         print(f"Indexing {len(self.chunk_files)} chunks (lazy loading)...")
-        with concurrent.futures.ThreadPoolExecutor() as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
                 pool.submit(_index_chunk, idx, f, seq_len): idx
                 for idx, f in enumerate(self.chunk_files)
@@ -73,10 +74,71 @@ class MarioVideoDataset(Dataset):
             for future in concurrent.futures.as_completed(futures):
                 self.samples.extend(future.result())
 
+        if subset_n > 0 and subset_n < len(self.samples):
+            total = len(self.samples)
+            rng = np.random.RandomState(seed)
+            indices = rng.choice(total, size=subset_n, replace=False)
+            self.samples = [self.samples[i] for i in indices]
+            print(f"Subset: kept {subset_n} of {total} samples")
+
+        self.preloaded = False
+        if preload and len(self.samples) > 0:
+            self._preload_all()
+
+    def _preload_all(self):
+        """Load all samples into a single pinned CPU tensor (parallel I/O)."""
+        # Probe shape from first sample
+        chunk_idx, seq_idx, t_start = self.samples[0]
+        npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
+        probe = npz['frames'][seq_idx, t_start:t_start+self.seq_len]
+        T, C, H, W = probe.shape
+
+        n = len(self.samples)
+        total_mb = n * C * T * H * W * 4 / 2**20  # float32
+        print(f"Pre-loading {n} samples into pinned CPU tensor ({total_mb:.0f} MB)...")
+        self.data = torch.empty(n, C, T, H, W, dtype=torch.float32, pin_memory=True)
+
+        print(f"Grouping samples by chunk for efficient loading...")
+        # Group samples by chunk to open each file only once
+        chunk_groups = defaultdict(list)
+        for sample_idx, (chunk_idx, seq_idx, t_start) in enumerate(self.samples):
+            chunk_groups[chunk_idx].append((sample_idx, seq_idx, t_start))
+
+        def _load_chunk(chunk_idx, entries):
+            """Load one chunk file and write samples into the shared tensor."""
+            npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
+            frames_arr = npz['frames']
+            for sample_idx, seq_idx, t_start in entries:
+                frames = np.array(frames_arr[seq_idx, t_start:t_start+self.seq_len])
+                # [T, C, H, W] -> [C, T, H, W], float32, /255
+                t = torch.from_numpy(frames).float().div_(255.0).permute(1, 0, 2, 3)
+                self.data[sample_idx] = t
+            return len(entries)
+
+        num_threads = min(4, len(chunk_groups))
+        print(f"Parallel loading with {num_threads} threads...")
+        loaded = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            futures = {
+                pool.submit(_load_chunk, ci, entries): ci
+                for ci, entries in chunk_groups.items()
+            }
+            with tqdm(total=n, desc="Pre-loading samples", unit="samp") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    count = future.result()
+                    loaded += count
+                    pbar.update(count)
+
+        self.preloaded = True
+        print(f"Pre-load complete. Tensor shape: {list(self.data.shape)}")
+
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        if self.preloaded:
+            return self.data[idx]
+
         chunk_idx, seq_idx, t_start = self.samples[idx]
         
         # Load only the slice we need via memory-mapped access
@@ -89,19 +151,6 @@ class MarioVideoDataset(Dataset):
         
         return frames
 
-class NSampleDataset(Dataset):
-    """Wraps a dataset to uniformly sample from N fixed indices. Useful for overfit sanity checks."""
-    def __init__(self, dataset, indices, length=1000):
-        self.dataset = dataset
-        self.indices = list(indices)
-        self.length = length
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return self.dataset[self.indices[idx % len(self.indices)]]
-
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, required=True, help="Path to chunk files")
@@ -111,16 +160,19 @@ def train():
         help="Probe GPU to find the largest batch size that fits in VRAM. "
              "Overrides --batch-size.",
     )
-    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=200)
+    parser.add_argument("--image-interval-secs", type=float, default=300,
+                        help="Minimum seconds between saving reconstruction images (default: 300)")
     parser.add_argument("--overfit-n", type=int, default=0, help="Train on N random samples (overfit sanity check)")
     parser.add_argument("--codebook-size", type=int, default=CODEBOOK_SIZE)
     parser.add_argument("--init-dim", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
     parser.add_argument("--num-workers", type=int, default=16, help="Number of DataLoader workers")
+    parser.add_argument("--no-preload", action="store_true",
+                        help="Disable pre-loading all data into RAM (use lazy per-sample loading)")
     parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
     parser.add_argument(
         "--layers", type=str, default=None,
@@ -131,11 +183,11 @@ def train():
         ),
     )
     parser.add_argument(
-        "--max-patience", type=int, default=None,
+        "--max-patience", type=float, default=None,
         help=(
-            "Early stopping: halt training after this many consecutive "
-            "validation checks with no recon_loss improvement (>=1e-6). "
-            "Disabled by default (train for full --epochs)."
+            "Early stopping: halt training after this many seconds "
+            "with no recon_loss improvement (>=1e-6). "
+            "Disabled by default."
         ),
     )
     parser.add_argument(
@@ -146,21 +198,11 @@ def train():
         ),
     )
     parser.add_argument(
-        "--max-steps", type=int, default=0,
+        "--max-minutes", type=float, default=0,
         help=(
-            "Stop training after this many gradient steps (0 = no limit, "
-            "use --epochs only). The first epoch always completes fully; "
-            "the step budget is checked between epochs. "
-            "Also used as the total duration of the cosine-annealing LR schedule."
-        ),
-    )
-    parser.add_argument(
-        "--warmup-steps", type=int, default=50,
-        help=(
-            "Number of linear warmup steps at the start of training. "
-            "LR ramps from 0 to 2x --lr over this many steps, then cosine-"
-            "anneals to 1e-6 over the remaining --max-steps minus warmup. "
-            "Requires --max-steps > 0. (default=100; 0 = no warmup)"
+            "Stop training after this many minutes of wall-clock time "
+            "(0 = no limit, rely on --max-patience / --threshold to stop). "
+            "Also sets the cosine-annealing LR schedule duration."
         ),
     )
     args = parser.parse_args()
@@ -196,27 +238,53 @@ def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    dataset = MarioVideoDataset(args.data_dir, seq_len=SEQUENCE_LENGTH)
+    dataset = MarioVideoDataset(
+        args.data_dir, seq_len=SEQUENCE_LENGTH,
+        preload=not args.no_preload,
+        subset_n=args.overfit_n,
+        seed=args.seed,
+    )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
 
     num_unique_samples = len(dataset)
+    gpu_cache = None
     if args.overfit_n > 0:
-        indices = np.random.choice(len(dataset), size=args.overfit_n, replace=False)
-        num_unique_samples = len(indices)
-        steps_per_epoch = max(1000, len(indices) * 100, args.batch_size * 100)
-        dataset = NSampleDataset(dataset, indices=indices, length=steps_per_epoch)
-        print(f">> Overfit mode: training on {args.overfit_n} samples ({steps_per_epoch} virtual samples/epoch).")
+        num_unique_samples = len(dataset)
+        # Try to cache on GPU; fall back to DataLoader
+        sample = dataset[0]
+        bytes_per_sample = sample.nelement() * sample.element_size()
+        total_bytes = bytes_per_sample * num_unique_samples
+        if device.type == "cuda":
+            gpu_free = torch.cuda.mem_get_info(device)[0]
+            budget = gpu_free // 4
+        else:
+            budget = 0
+        if total_bytes <= budget:
+            print(f">> Overfit mode: caching {num_unique_samples} samples on GPU ({total_bytes / 2**20:.0f} MB).")
+            gpu_cache = torch.stack([dataset[i] for i in range(num_unique_samples)]).to(device)
+        else:
+            print(f">> Overfit mode: {num_unique_samples} samples ({total_bytes / 2**20:.0f} MB) too large for GPU cache, using DataLoader.")
 
-    num_w = args.num_workers
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=not args.no_shuffle,
-        num_workers=num_w,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_w > 0,
-        prefetch_factor=2 if num_w > 0 else None,
+    # When data is preloaded into pinned RAM, workers add IPC overhead with no benefit
+    preloaded = getattr(dataset, 'preloaded', False) or (
+        isinstance(dataset, Subset) and getattr(dataset.dataset, 'preloaded', False)
     )
+    num_w = 0 if preloaded else args.num_workers
+    if gpu_cache is None:
+        sampler_len = 10**7
+        sampler = RandomSampler(dataset, replacement=True, num_samples=sampler_len) if not args.no_shuffle else None
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=num_w,
+            pin_memory=not preloaded and torch.cuda.is_available(),
+            persistent_workers=num_w > 0,
+            prefetch_factor=2 if num_w > 0 else None,
+        )
+    else:
+        dataloader = None
 
     tokenizer = VideoTokenizer(
         image_size=IMAGE_SIZE,
@@ -239,15 +307,19 @@ def train():
             ceiling=num_unique_samples,
         )
         # Rebuild DataLoader with the discovered batch size
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=not args.no_shuffle,
-            num_workers=num_w,
-            pin_memory=True,
-            persistent_workers=num_w > 0,
-            prefetch_factor=2 if num_w > 0 else None,
-        )
+        if gpu_cache is None:
+            sampler_len = 10**7
+            sampler = RandomSampler(dataset, replacement=True, num_samples=sampler_len) if not args.no_shuffle else None
+            dataloader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                shuffle=False,
+                num_workers=num_w,
+                pin_memory=not preloaded,
+                persistent_workers=num_w > 0,
+                prefetch_factor=2 if num_w > 0 else None,
+            )
         print(f"[auto-batch] ✓ Selected batch size: {args.batch_size}\n")
     elif args.auto_batch_size:
         print("[auto-batch] Skipped — no CUDA device. Using --batch-size", args.batch_size)
@@ -259,29 +331,9 @@ def train():
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
-    # ── LR schedule: linear warmup + cosine annealing ────────────────
-    if args.max_steps > 0:
-        warmup = args.warmup_steps
-        cosine_steps = max((args.max_steps//2) - warmup, 1)
-
-        warmup_scheduler = LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=warmup,
-        )
-        cosine_scheduler = CosineAnnealingLR(
-            optimizer,
-            T_max=cosine_steps,
-            eta_min=args.lr / 4,
-        )
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup],
-        )
-    else:
-        scheduler = None
+    # ── LR schedule: time-based cosine annealing ─────────────────────
+    max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
+    eta_min = args.lr / 4
 
     # Save config for reproducibility
     config = vars(args).copy()
@@ -301,104 +353,136 @@ def train():
     metrics_path = os.path.join(args.output_dir, "metrics.json")
     train_start = time.time()
 
-    # Patience-based early stopping state
     best_recon_loss = float('inf')
-    patience_counter = 0
-    patience_exhausted = False
+    last_improvement_time = time.time()
+    last_image_time = 0.0
 
-    global_step = 0
-    for epoch in range(args.epochs):
-        if patience_exhausted:
+    tokenizer.train()
+
+    # Get the preloaded CPU tensor if available (bypass DataLoader for speed)
+    cpu_cache = None
+    if gpu_cache is None and preloaded:
+        raw = dataset.data if hasattr(dataset, 'data') else None
+        if raw is None and isinstance(dataset, Subset) and hasattr(dataset.dataset, 'data'):
+            raw = dataset.dataset.data
+        cpu_cache = raw
+
+    def batch_iter():
+        """Yields batches: GPU cache > pinned CPU tensor > DataLoader."""
+        bs = args.batch_size
+        if gpu_cache is not None:
+            n = gpu_cache.shape[0]
+            while True:
+                idx = torch.randint(n, (bs,), device=device)
+                yield gpu_cache[idx]
+        elif cpu_cache is not None:
+            n = cpu_cache.shape[0]
+            while True:
+                idx = torch.randint(n, (bs,))
+                yield cpu_cache[idx]
+        else:
+            yield from dataloader
+
+    pbar = tqdm(batch_iter(), desc="Training")
+
+    for global_step, batch in enumerate(pbar):
+        elapsed = time.time() - train_start
+        if max_seconds > 0 and elapsed >= max_seconds:
+            print(f"\n[max-time] Reached {elapsed/60:.1f} min. Stopping.")
             break
-        if epoch > 0 and args.max_steps > 0 and global_step >= args.max_steps:
-            print(f"\n[max-steps] Reached {global_step} steps (limit {args.max_steps}). Stopping.")
-            break
-        tokenizer.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        for batch in pbar:
-            batch = batch.to(device)
-            
-            optimizer.zero_grad()
-            loss, loss_breakdown = tokenizer(batch, return_loss=True)
-            loss.backward()
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-            
-            current_lr = optimizer.param_groups[0]['lr']
-            
-            pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{loss_breakdown.recon_loss.item():.4f}", 'lr': f"{current_lr:.2e}"})
-            
-            if global_step % args.val_interval == 0:
+
+        # Time-based cosine LR
+        if max_seconds > 0:
+            progress = min(elapsed / max_seconds, 1.0)
+            new_lr = eta_min + 0.5 * (args.lr - eta_min) * (1 + math.cos(math.pi * progress))
+            for pg in optimizer.param_groups:
+                pg['lr'] = new_lr
+
+        if gpu_cache is None:
+            batch = batch.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+        loss, loss_breakdown = tokenizer(batch, return_loss=True)
+        loss.backward()
+        optimizer.step()
+
+        current_lr = optimizer.param_groups[0]['lr']
+        recon = loss_breakdown.recon_loss.item()
+        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{recon:.4f}", 'lr': f"{current_lr:.2e}"})
+
+        if global_step % args.val_interval == 0:
+            step_metrics = {
+                "step": global_step,
+                "loss": loss.item(),
+                "recon_loss": recon,
+                "lr": current_lr,
+                "elapsed_s": round(time.time() - train_start, 2),
+            }
+            metrics_log.append(step_metrics)
+
+            # Expensive eval-mode image generation on a wall-clock schedule
+            now = time.time()
+            if now - last_image_time >= args.image_interval_secs:
+                last_image_time = now
                 tokenizer.eval()
                 with torch.no_grad():
-                    # Generate a reconstruction sample
-                    codes = tokenizer.tokenize(batch)        # discrete codebook indices
+                    codes = tokenizer.tokenize(batch)
                     recon_video = tokenizer.decode_from_code_indices(codes)
-                    
-                    codebook_usage = codes.unique().numel()
-                    step_metrics = {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "loss": loss.item(),
-                        "recon_loss": loss_breakdown.recon_loss.item(),
-                        "lr": current_lr,
-                        "elapsed_s": round(time.time() - train_start, 2),
-                    }
-                    metrics_log.append(step_metrics)
-                    step_metrics["codebook_usage"] = codebook_usage
-                    
-                    # Take first sequence from batch, slice along time
-                    # batch[0] shape: [C, T, H, W]
-                    original_frames = batch[0].permute(1, 0, 2, 3) # [T, C, H, W]
-                    recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1) # [T, C, H, W]
-                    
-                    # Cat side by side
-                    comparison = torch.cat([original_frames, recon_frames], dim=3) # [T, C, H, W*2]
+
+                    step_metrics["codebook_usage"] = codes.unique().numel()
+
+                    original_frames = batch[0].permute(1, 0, 2, 3)
+                    recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
+                    comparison = torch.cat([original_frames, recon_frames], dim=3)
                     save_image(comparison, os.path.join(args.output_dir, f"step_{global_step:06d}.png"), nrow=1)
 
-                    # Eval-mode recon loss for checkpoint & early stopping decisions
                     _, eval_breakdown = tokenizer(batch, return_loss=True)
                     eval_recon = eval_breakdown.recon_loss.item()
-                    step_metrics["eval_recon_loss"] = eval_recon
-
-                # Save checkpoint only when eval recon loss improves
-                if eval_recon < best_recon_loss - 1e-6:
-                    best_recon_loss = eval_recon
-                    patience_counter = 0
-                    torch.save(tokenizer.state_dict(),
-                               os.path.join(args.output_dir, "magvit2_latest.pt"))
-                else:
-                    patience_counter += 1
-
-                # Threshold early exit
-                if args.threshold > 0 and eval_recon < args.threshold:
-                    print(f"\n[threshold] eval_recon={eval_recon:.6f} < "
-                          f"threshold={args.threshold:.6f}. Stopping.")
-                    torch.save(tokenizer.state_dict(),
-                               os.path.join(args.output_dir, "magvit2_latest.pt"))
-                    patience_exhausted = True
-
-                # Patience-based early stopping
-                elif args.max_patience is not None and patience_counter >= args.max_patience:
-                    print(f"\n[early-stop] Patience exhausted after {args.max_patience} "
-                          f"val checks with no improvement. "
-                          f"Best recon_loss={best_recon_loss:.6f}")
-                    patience_exhausted = True
-
-                # Write metrics to disk at each validation step
-                with open(metrics_path, 'w') as f:
-                    json.dump(metrics_log, f, indent=2)
                 tokenizer.train()
+            else:
+                eval_recon = recon  # use train-mode recon for checkpoint decisions
 
-            if patience_exhausted:
+            step_metrics["eval_recon_loss"] = eval_recon
+
+            if eval_recon < best_recon_loss - 1e-6:
+                best_recon_loss = eval_recon
+                last_improvement_time = time.time()
+                torch.save(tokenizer.state_dict(),
+                           os.path.join(args.output_dir, "magvit2_latest.pt"))
+
+            if args.threshold > 0 and eval_recon < args.threshold:
+                print(f"\n[threshold] eval_recon={eval_recon:.6f} < "
+                      f"threshold={args.threshold:.6f}. Stopping.")
+                torch.save(tokenizer.state_dict(),
+                           os.path.join(args.output_dir, "magvit2_latest.pt"))
                 break
-            
-            global_step += 1
-            
-        # Write metrics at end of each epoch
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics_log, f, indent=2)
+
+            elif args.max_patience is not None and (time.time() - last_improvement_time) >= args.max_patience:
+                print(f"\n[early-stop] No improvement for {time.time() - last_improvement_time:.0f}s "
+                      f"(patience={args.max_patience:.0f}s). "
+                      f"Best recon_loss={best_recon_loss:.6f}")
+                break
+
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics_log, f, indent=2)
+
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics_log, f, indent=2)
+
+    # ── Final reconstruction using best weights ──────────────────────
+    best_ckpt = os.path.join(args.output_dir, "magvit2_latest.pt")
+    if os.path.exists(best_ckpt):
+        tokenizer.load_state_dict(torch.load(best_ckpt, map_location=device))
+        tokenizer.eval()
+        with torch.no_grad():
+            # Use last batch from training loop
+            codes = tokenizer.tokenize(batch)
+            recon_video = tokenizer.decode_from_code_indices(codes)
+            original_frames = batch[0].permute(1, 0, 2, 3)
+            recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
+            comparison = torch.cat([original_frames, recon_frames], dim=3)
+            save_image(comparison, os.path.join(args.output_dir, "final_reconstruction.png"), nrow=1)
+        print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
 
 if __name__ == "__main__":
     train()

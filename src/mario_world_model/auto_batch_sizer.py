@@ -144,16 +144,15 @@ def find_max_batch_size(
     else:
         safe = max(floor, int(raw_max * safety_fraction))
 
-    # Round down to the nearest power of 2 for DataLoader efficiency
-    safe_pow2 = 2 ** int(math.log2(safe)) if safe >= 2 else safe
+    safe_round = (safe // 8) * 8 if safe >= 8 else safe
 
     vram_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
     print(
         f"[auto-batch] GPU {torch.cuda.get_device_name(device)} "
         f"({vram_gb:.1f} GB)  raw_max={raw_max}  safe={safe}  "
-        f"using={safe_pow2}  (safety={safety_fraction:.0%})"
+        f"using={safe_round}  (safety={safety_fraction:.0%})"
     )
 
     _clear_gpu(device)
     model.train(was_training)
-    return safe_pow2
+    return safe_round
