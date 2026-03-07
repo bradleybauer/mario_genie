@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
-from typing import Optional
+from typing import Optional, cast
 import multiprocessing as mp
 from multiprocessing.shared_memory import SharedMemory
 import numpy as np
@@ -18,29 +18,20 @@ class ChunkMeta:
     action_shape_bt: tuple[int, int]
     total_frames: int
     total_actions: int
-    level_summary: dict[str, int] | None = None
     action_summary: dict[str, int] | None = None
-    progression_summary: dict[str, int] | None = None
+    exact_progression_summary: dict[str, int] | None = None
 
 
-def _compute_level_summary(arrays: dict[str, np.ndarray]) -> dict[str, int] | None:
-    """Compute a per-level sequence count from the world/stage arrays in a chunk.
+def _as_frame_shape_btchw(shape: tuple[int, ...]) -> tuple[int, int, int, int, int]:
+    if len(shape) != 5:
+        raise ValueError(f"expected frame shape of rank 5, got {shape}")
+    return cast(tuple[int, int, int, int, int], tuple(int(x) for x in shape))
 
-    Returns ``None`` if the arrays don't contain ``world`` and ``stage``.
-    """
-    if "world" not in arrays or "stage" not in arrays:
-        return None
-    world = arrays["world"]  # (B, T)
-    stage = arrays["stage"]  # (B, T)
-    from collections import Counter
-    counts: dict[str, int] = Counter()
-    for i in range(world.shape[0]):
-        codes = world[i].astype(np.int32) * 100 + stage[i].astype(np.int32)
-        values, cnts = np.unique(codes, return_counts=True)
-        winner = values[np.argmax(cnts)]
-        w, s = int(winner // 100), int(winner % 100)
-        counts[f"{w}-{s}"] += 1
-    return dict(counts)
+
+def _as_action_shape_bt(shape: tuple[int, ...]) -> tuple[int, int]:
+    if len(shape) != 2:
+        raise ValueError(f"expected action shape of rank 2, got {shape}")
+    return cast(tuple[int, int], tuple(int(x) for x in shape))
 
 
 def _compute_action_summary(arrays: dict[str, np.ndarray]) -> dict[str, int] | None:
@@ -57,51 +48,44 @@ def _compute_action_summary(arrays: dict[str, np.ndarray]) -> dict[str, int] | N
     return {str(int(u)): int(c) for u, c in zip(unique, counts)}
 
 
-def _compute_progression_summary(
+def _compute_exact_progression_summary(
     arrays: dict[str, np.ndarray],
-    bin_size: int = 256,
 ) -> dict[str, int] | None:
-    """Compute per-(level, x-bin) frame counts.
+    """Compute exact per-(level, x-position) frame counts.
 
-    Returns a dict like ``{"1-1-0": 50, "1-1-3": 12, ...}`` where the key
-    is ``"W-S-B"`` (world, stage, screen-bin) and the value is the number of
-    frames falling in that bin.  Returns ``None`` if the necessary arrays are
-    absent.
+    Returns a dict like ``{"1:1:0": 50, "1:1:17": 12, ...}`` where the key
+    is ``"W:S:X"`` (world, stage, exact x-position) and the value is the
+    number of frames observed at that exact coordinate. Returns ``None`` if the
+    necessary arrays are absent.
     """
     if "world" not in arrays or "stage" not in arrays or "x_pos" not in arrays:
         return None
-    from collections import Counter
     world = arrays["world"].flatten()
     stage = arrays["stage"].flatten()
-    x_pos = arrays["x_pos"].flatten()
-    bins = (x_pos // bin_size).astype(np.int32)
-    codes = world.astype(np.int64) * 1_000_000 + stage.astype(np.int64) * 1_000 + bins.astype(np.int64)
-    unique, counts = np.unique(codes, return_counts=True)
+    x_pos = arrays["x_pos"].astype(np.int32, copy=False).flatten()
+    coords = np.stack((world.astype(np.int32), stage.astype(np.int32), x_pos), axis=1)
+    unique, counts = np.unique(coords, axis=0, return_counts=True)
     result: dict[str, int] = {}
-    for code, cnt in zip(unique, counts):
-        w = int(code // 1_000_000)
-        s = int((code % 1_000_000) // 1_000)
-        b = int(code % 1_000)
-        result[f"{w}-{s}-{b}"] = int(cnt)
+    for (w, s, x), cnt in zip(unique, counts):
+        result[f"{w}:{s}:{x}"] = int(cnt)
     return result
 
 
 def _compute_chunk_summaries(
     arrays: dict[str, np.ndarray],
-) -> tuple[
-    dict[str, int] | None,
-    dict[str, int] | None,
-    dict[str, int] | None,
-]:
-    """Return ``(level_summary, action_summary, progression_summary)``."""
+) -> tuple[dict[str, int] | None, dict[str, int] | None]:
+    """Return ``(action_summary, exact_progression_summary)``."""
     return (
-        _compute_level_summary(arrays),
         _compute_action_summary(arrays),
-        _compute_progression_summary(arrays),
+        _compute_exact_progression_summary(arrays),
     )
 
 
-def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -> None:
+def _writer_loop_proc(
+    write_queue: mp.Queue,
+    output_dir: Path,
+    compress: bool,
+) -> None:
     while True:
         item = write_queue.get()
         if item is None:
@@ -151,20 +135,17 @@ def _writer_loop_proc(write_queue: mp.Queue, output_dir: Path, compress: bool) -
                     **kwargs_arrays,
                 )
 
-            level_summ, action_summ, prog_summ = _compute_chunk_summaries(
-                {"actions": actions_bt, **kwargs_arrays}
-            )
+            action_summ, exact_prog_summ = _compute_chunk_summaries({"actions": actions_bt, **kwargs_arrays})
             meta = ChunkMeta(
                 chunk_index=chunk_index,
                 num_sequences=int(frames_btchw.shape[0]),
                 sequence_length=int(frames_btchw.shape[1]),
-                frame_shape_btchw=tuple(int(x) for x in frames_btchw.shape),
-                action_shape_bt=tuple(int(x) for x in actions_bt.shape),
+                frame_shape_btchw=_as_frame_shape_btchw(tuple(frames_btchw.shape)),
+                action_shape_bt=_as_action_shape_bt(tuple(actions_bt.shape)),
                 total_frames=int(frames_btchw.shape[0] * frames_btchw.shape[1]),
                 total_actions=int(actions_bt.size),
-                level_summary=level_summ,
                 action_summary=action_summ,
-                progression_summary=prog_summ,
+                exact_progression_summary=exact_prog_summ,
             )
 
             with (output_dir / f"chunk_{chunk_index:06d}.meta.json").open("w", encoding="utf-8") as f:
@@ -233,7 +214,11 @@ class ChunkWriter:
             self._write_queue = mp.Queue(maxsize=self.max_pending_writes)
             self._writer_process = mp.Process(
                 target=_writer_loop_proc,
-                args=(self._write_queue, self.output_dir, self.compress),
+                args=(
+                    self._write_queue,
+                    self.output_dir,
+                    self.compress,
+                ),
                 daemon=True,
             )
             self._writer_process.start()
@@ -307,20 +292,17 @@ class ChunkWriter:
         else:
             np.savez(out_path, frames=frames_btchw, actions=actions_bt, dones=dones_bt, **kwargs_arrays)
 
-        level_summ, action_summ, prog_summ = _compute_chunk_summaries(
-            {"actions": actions_bt, **kwargs_arrays}
-        )
+        action_summ, exact_prog_summ = _compute_chunk_summaries({"actions": actions_bt, **kwargs_arrays})
         meta = ChunkMeta(
             chunk_index=chunk_index,
             num_sequences=int(frames_btchw.shape[0]),
             sequence_length=int(frames_btchw.shape[1]),
-            frame_shape_btchw=tuple(int(x) for x in frames_btchw.shape),
-            action_shape_bt=tuple(int(x) for x in actions_bt.shape),
+            frame_shape_btchw=_as_frame_shape_btchw(tuple(frames_btchw.shape)),
+            action_shape_bt=_as_action_shape_bt(tuple(actions_bt.shape)),
             total_frames=int(frames_btchw.shape[0] * frames_btchw.shape[1]),
             total_actions=int(actions_bt.size),
-            level_summary=level_summ,
             action_summary=action_summ,
-            progression_summary=prog_summ,
+            exact_progression_summary=exact_prog_summ,
         )
 
         with (self.output_dir / f"chunk_{chunk_index:06d}.meta.json").open("w", encoding="utf-8") as f:
@@ -331,6 +313,9 @@ class ChunkWriter:
     def flush(self) -> Optional[Path]:
         if self._current_seq_idx == 0 or self._frames_buf is None:
             return None
+
+        assert self._actions_buf is not None
+        assert self._dones_buf is not None
 
         # Slice the used part
         frames_part = self._frames_buf[:self._current_seq_idx].astype(np.uint8, copy=False)
@@ -344,6 +329,7 @@ class ChunkWriter:
         if self.async_write:
             assert self._write_queue is not None
             assert self._shm_f is not None and self._shm_a is not None and self._shm_d is not None
+            assert self._frames_buf is not None and self._actions_buf is not None and self._dones_buf is not None
             
             if self._current_seq_idx == self.sequences_per_chunk:
                 kwargs_meta = [(k, self._shm_kwargs[k].name, self._kwargs_buf[k].shape, self._kwargs_buf[k].dtype.str) for k in self._kwargs_buf]
@@ -355,11 +341,11 @@ class ChunkWriter:
                     kwargs_meta,
                 ))
                 from multiprocessing.resource_tracker import unregister
-                unregister(self._shm_f._name, 'shared_memory')
-                unregister(self._shm_a._name, 'shared_memory')
-                unregister(self._shm_d._name, 'shared_memory')
+                unregister(getattr(self._shm_f, '_name'), 'shared_memory')
+                unregister(getattr(self._shm_a, '_name'), 'shared_memory')
+                unregister(getattr(self._shm_d, '_name'), 'shared_memory')
                 for shm in self._shm_kwargs.values():
-                    unregister(shm._name, 'shared_memory')
+                    unregister(getattr(shm, '_name'), 'shared_memory')
                 
                 self._shm_f.close()
                 self._shm_a.close()
@@ -374,6 +360,7 @@ class ChunkWriter:
             else:
                 kwargs_part_copy = {k: v.copy() for k, v in kwargs_part.items()}
                 self._write_chunk_sync(chunk_index, frames_part.copy(), actions_part.copy(), dones_part.copy(), **kwargs_part_copy)
+                assert self._shm_f is not None and self._shm_a is not None and self._shm_d is not None
                 self._shm_f.close()
                 self._shm_f.unlink()
                 self._shm_a.close()
@@ -391,6 +378,7 @@ class ChunkWriter:
         else:
             self._write_chunk_sync(chunk_index, frames_part, actions_part, dones_part, **kwargs_part)
             if self._shm_f is not None:
+                assert self._shm_a is not None and self._shm_d is not None
                 self._shm_f.close()
                 self._shm_f.unlink()
                 self._shm_a.close()
@@ -420,12 +408,15 @@ class ChunkWriter:
     def __del__(self):
         try:
             if getattr(self, '_shm_f', None) is not None:
+                assert self._shm_f is not None
                 self._shm_f.close()
                 self._shm_f.unlink()
             if getattr(self, '_shm_a', None) is not None:
+                assert self._shm_a is not None
                 self._shm_a.close()
                 self._shm_a.unlink()
             if getattr(self, '_shm_d', None) is not None:
+                assert self._shm_d is not None
                 self._shm_d.close()
                 self._shm_d.unlink()
             if getattr(self, '_shm_kwargs', None) is not None:

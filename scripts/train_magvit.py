@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
 from mario_world_model.auto_batch_sizer import find_max_batch_size
+from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 
 def _index_chunk(chunk_idx, filepath, seq_len):
     """Index a single chunk file. Returns list of (chunk_idx, seq_idx, t_start) tuples."""
@@ -301,6 +302,7 @@ def train():
         use_gan=False,
         perceptual_loss_weight=0.0
     ).to(device)
+    video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
     # ── Auto batch-size ──────────────────────────────────────────────
     if args.auto_batch_size and device.type == "cuda":
@@ -315,6 +317,7 @@ def train():
             device=device,
             floor=1,
             ceiling=ceiling,
+            video_contains_first_frame=video_contains_first_frame,
         )
         # Rebuild DataLoader with the discovered batch size
         if gpu_cache is None:
@@ -431,7 +434,11 @@ def train():
             batch = batch.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        loss, loss_breakdown = tokenizer(batch, return_loss=True)
+        loss, loss_breakdown = tokenizer(
+            batch,
+            return_loss=True,
+            video_contains_first_frame=video_contains_first_frame,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
@@ -482,8 +489,11 @@ def train():
                 last_image_time = now
                 tokenizer.eval()
                 with torch.no_grad():
-                    codes = tokenizer.tokenize(batch)
-                    recon_video = tokenizer.decode_from_code_indices(codes)
+                    codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                    recon_video = tokenizer.decode_from_code_indices(
+                        codes,
+                        video_contains_first_frame=video_contains_first_frame,
+                    )
 
                     step_metrics["codebook_usage"] = codes.unique().numel()
 
@@ -519,8 +529,11 @@ def train():
 
     tokenizer.eval()
     with torch.no_grad():
-        codes = tokenizer.tokenize(batch)
-        recon_video = tokenizer.decode_from_code_indices(codes)
+        codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+        recon_video = tokenizer.decode_from_code_indices(
+            codes,
+            video_contains_first_frame=video_contains_first_frame,
+        )
         original_frames = batch[0].permute(1, 0, 2, 3)
         recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
         comparison = torch.cat([original_frames, recon_frames], dim=3)

@@ -32,6 +32,7 @@ def _try_batch(
     image_size: int,
     seq_len: int,
     device: torch.device,
+    video_contains_first_frame: bool,
 ) -> bool:
     """Attempt a forward + backward pass with *batch_size* synthetic frames.
 
@@ -43,7 +44,11 @@ def _try_batch(
             batch_size, 3, seq_len, image_size, image_size, device=device
         )
         model.train()
-        loss, _ = model(dummy, return_loss=True)
+        loss, _ = model(
+            dummy,
+            return_loss=True,
+            video_contains_first_frame=video_contains_first_frame,
+        )
         loss.backward()
         model.zero_grad(set_to_none=True)
         del dummy, loss
@@ -65,6 +70,7 @@ def find_max_batch_size(
     floor: int = 1,
     ceiling: int = 256,
     safety_fraction: float = 0.85,
+    video_contains_first_frame: bool = True,
 ) -> int:
     """Find the largest batch size that fits in GPU memory.
 
@@ -96,23 +102,24 @@ def find_max_batch_size(
         device = torch.device(device)
 
     was_training = model.training
+    raw_max = floor
 
     # Doubling from 64 to bracket the OOM boundary, then binary search.
     probe = min(64, ceiling)
     print(f"[auto-batch] Searching [{floor}, {ceiling}], starting at {probe} …")
 
-    if _try_batch(model, probe, image_size, seq_len, device):
+    if _try_batch(model, probe, image_size, seq_len, device, video_contains_first_frame):
         lower = probe
         while probe * 2 <= ceiling:
             probe *= 2
-            if not _try_batch(model, probe, image_size, seq_len, device):
+            if not _try_batch(model, probe, image_size, seq_len, device, video_contains_first_frame):
                 upper = probe
                 break
             lower = probe
         else:
             # Doubling couldn't reach ceiling — test it directly
             if probe < ceiling:
-                if _try_batch(model, ceiling, image_size, seq_len, device):
+                if _try_batch(model, ceiling, image_size, seq_len, device, video_contains_first_frame):
                     raw_max = ceiling
                     lower = upper = ceiling
                 else:
@@ -129,13 +136,13 @@ def find_max_batch_size(
     if lower != upper:
         while upper - lower > 1:
             mid = (lower + upper) // 2
-            if _try_batch(model, mid, image_size, seq_len, device):
+            if _try_batch(model, mid, image_size, seq_len, device, video_contains_first_frame):
                 lower = mid
             else:
                 upper = mid
         raw_max = lower
 
-    if raw_max < floor or not _try_batch(model, max(raw_max, floor), image_size, seq_len, device):
+    if raw_max < floor or not _try_batch(model, max(raw_max, floor), image_size, seq_len, device, video_contains_first_frame):
         print(f"[auto-batch] WARNING: even batch_size={floor} OOMs — returning {floor} anyway")
         model.train(was_training)
         return floor

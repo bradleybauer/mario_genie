@@ -2,7 +2,7 @@
 """
 scripts/balance_report.py
 
-Print (and optionally save) a world-stage balance report for collected data.
+Print progression and action balance reports for collected data.
 
 Usage:
     python scripts/balance_report.py --data-dir data/human_play
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -25,17 +26,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mario_world_model.coverage import (
+    PROGRESSION_BIN_SIZE,
     compute_action_balance,
-    compute_balance_report,
     compute_progression_balance,
-    default_level_pool,
     print_action_report,
     print_progression_report,
-    print_report,
     ProgressionBalanceReport,
-    save_report,
     scan_action_coverage,
-    scan_coverage,
     scan_progression_coverage,
 )
 from mario_world_model.rollouts import RolloutIndex
@@ -43,7 +40,7 @@ from mario_world_model.rollouts import RolloutIndex
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Print a world-stage balance report for collected Mario data."
+        description="Print progression and action balance reports for collected Mario data."
     )
     parser.add_argument(
         "--data-dir",
@@ -55,13 +52,13 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Optional path to write a machine-readable JSON report",
+        help="Optional path to write the requested report data as JSON",
     )
     parser.add_argument(
         "--top",
         type=int,
         default=0,
-        help="Only show the N most-deficient levels (0 = show all)",
+        help="Only show the N most-deficient rows in each printed report (0 = show all)",
     )
     parser.add_argument(
         "--progression",
@@ -78,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         "--plot",
         action="store_true",
         help="Show a matplotlib heatmap of progression distribution (requires --progression)",
+    )
+    parser.add_argument(
+        "--progression-bin-size",
+        type=int,
+        default=PROGRESSION_BIN_SIZE,
+        help="Progression coverage bin width in pixels; default is 64",
     )
     return parser.parse_args()
 
@@ -105,7 +108,7 @@ def plot_progression(report: ProgressionBalanceReport) -> None:
 
     # Colour each bar by level
     levels_ordered = sorted({(b.world, b.stage) for b in bins_sorted})
-    cmap = plt.cm.get_cmap("tab20", len(levels_ordered))
+    cmap = plt.get_cmap("tab20", len(levels_ordered))
     level_to_colour = {lvl: cmap(i) for i, lvl in enumerate(levels_ordered)}
     colours = [level_to_colour[(b.world, b.stage)] for b in bins_sorted]
 
@@ -117,7 +120,9 @@ def plot_progression(report: ProgressionBalanceReport) -> None:
     uniform = 1.0 / report.num_bins if report.num_bins else 0
     y_max = max(densities) * 1.15 if densities else 1
 
-    fig, axes = plt.subplots(2, 1, figsize=(max(14, mid * 0.18), 8))
+    # Cap figure width so fine-grained bins do not request enormous X11 pixmaps.
+    figure_width = min(32.0, max(14.0, len(levels_ordered) * 0.8))
+    fig, axes = plt.subplots(2, 1, figsize=(figure_width, 8))
 
     for row_idx, sl in enumerate(row_slices):
         ax = axes[row_idx]
@@ -160,7 +165,7 @@ def plot_progression(report: ProgressionBalanceReport) -> None:
 
     axes[0].set_title(
         f"Progression Distribution — {report.total_frames:,} frames across "
-        f"{report.num_bins} bins"
+        f"{report.num_bins} bins ({report.bin_size}px/bin)"
     )
     axes[0].legend(fontsize=8)
     axes[1].set_xlabel("World-Stage")
@@ -175,22 +180,22 @@ def main() -> None:
         print(f"Error: directory {args.data_dir} does not exist.")
         sys.exit(1)
 
-    pool = default_level_pool()
-
-    # --- Level balance (always shown) ---
     print(f"Scanning {args.data_dir} ...")
-    coverage = scan_coverage(args.data_dir)
-    report = compute_balance_report(coverage, level_pool=pool)
-    print_report(report, top_n=args.top)
+    output_payload: dict[str, object] = {}
 
     # --- Progression balance ---
     if args.progression:
-        prog_cov = scan_progression_coverage(args.data_dir)
+        prog_cov = scan_progression_coverage(args.data_dir, bin_size=args.progression_bin_size)
         # Load rollout data to determine which bins are actually reachable
         ri = RolloutIndex(args.data_dir)
-        reachable = ri.reachable_bins()
-        prog_report = compute_progression_balance(prog_cov, reachable)
+        reachable = ri.reachable_bins(bin_size=args.progression_bin_size)
+        prog_report = compute_progression_balance(
+            prog_cov,
+            reachable,
+            bin_size=args.progression_bin_size,
+        )
         print_progression_report(prog_report, top_n=args.top)
+        output_payload["progression"] = asdict(prog_report)
         if args.plot:
             plot_progression(prog_report)
 
@@ -207,9 +212,12 @@ def main() -> None:
         act_cov = scan_action_coverage(args.data_dir)
         act_report = compute_action_balance(act_cov, num_actions)
         print_action_report(act_report, action_meanings=action_meanings, top_n=args.top)
+        output_payload["actions"] = asdict(act_report)
 
     if args.output:
-        save_report(report, args.output)
+        with args.output.open("w", encoding="utf-8") as f:
+            import json
+            json.dump(output_payload, f, indent=2)
         print(f"\nJSON report saved to {args.output}")
 
 

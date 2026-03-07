@@ -24,7 +24,17 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
-PROGRESSION_BIN_SIZE: int = 256  # one NES screen width in pixels
+
+DEFAULT_PROGRESSION_BIN_SIZE: int = 64
+
+
+def validate_progression_bin_size(bin_size: int) -> int:
+    value = int(bin_size)
+    if value <= 0:
+        raise ValueError("progression bin size must be a positive integer")
+    return value
+
+PROGRESSION_BIN_SIZE: int = DEFAULT_PROGRESSION_BIN_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +276,7 @@ class RolloutIndex:
         Returns ``None`` if no suitable rollout exists.
         """
         self._ensure_loaded()
+        bin_size = validate_progression_bin_size(bin_size)
         target_x = target_x_bin * bin_size
         candidates = self._by_level.get((world, stage), [])
         best: Optional[Rollout] = None
@@ -295,6 +306,7 @@ class RolloutIndex:
         x_pos reached the target bin, so replaying ``actions[:target_step]``
         positions Mario near the desired x.
         """
+        bin_size = validate_progression_bin_size(bin_size)
         rollout = self.find_rollout(world, stage, target_x_bin, bin_size)
         if rollout is None:
             return None
@@ -321,6 +333,7 @@ class RolloutIndex:
         the replay pool has alternatives when one rollout fails.
         """
         self._ensure_loaded()
+        bin_size = validate_progression_bin_size(bin_size)
         target_x = target_x_bin * bin_size
         candidates = self._by_level.get((world, stage), [])
         # Collect valid rollouts that reach the target
@@ -355,6 +368,7 @@ class RolloutIndex:
         Only counts rollouts that started from level-start.
         """
         self._ensure_loaded()
+        bin_size = validate_progression_bin_size(bin_size)
         cov: dict[tuple[int, int, int], int] = {}
         for r in self._rollouts:
             # Skip rollouts that started mid-level (from a replay fast-forward)
@@ -375,6 +389,7 @@ class RolloutIndex:
         Only considers rollouts that started from level-start.
         """
         self._ensure_loaded()
+        bin_size = validate_progression_bin_size(bin_size)
         result: set[tuple[int, int, int]] = set()
         for r in self._rollouts:
             # Skip rollouts that started mid-level (from a replay fast-forward)

@@ -28,6 +28,7 @@ from mario_world_model.config import (
     SEQUENCE_LENGTH,
     TOKENIZER_LAYERS,
 )
+from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 
 
 def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
@@ -85,6 +86,7 @@ def estimate_forward_gflops(
     device: str,
     warmup_steps: int,
     profile_steps: int,
+    video_contains_first_frame: bool,
 ) -> float:
     activities = [ProfilerActivity.CPU]
     if device == "cuda":
@@ -93,14 +95,14 @@ def estimate_forward_gflops(
     model.eval()
     with torch.no_grad():
         for _ in range(warmup_steps):
-            _ = model(sample, return_loss=True)
+            _ = model(sample, return_loss=True, video_contains_first_frame=video_contains_first_frame)
 
         if device == "cuda":
             torch.cuda.synchronize()
 
         with profile(activities=activities, with_flops=True) as prof:
             for _ in range(profile_steps):
-                _ = model(sample, return_loss=True)
+                _ = model(sample, return_loss=True, video_contains_first_frame=video_contains_first_frame)
 
         if device == "cuda":
             torch.cuda.synchronize()
@@ -155,6 +157,7 @@ def main() -> None:
         perceptual_loss_weight=0.0,
     ).to(device)
     model.eval()
+    video_contains_first_frame = resolve_video_contains_first_frame(model, args.sequence_length)
 
     sample = torch.randn(
         args.batch_size,
@@ -202,6 +205,7 @@ def main() -> None:
             col_names=("input_size", "output_size", "num_params", "kernel_size"),
             verbose=1,
             return_loss=True,
+            video_contains_first_frame=video_contains_first_frame,
         )
     except Exception as exc:
         print(f"[warning] torchinfo summary failed: {exc}")
@@ -215,6 +219,7 @@ def main() -> None:
         device=device,
         warmup_steps=args.warmup_steps,
         profile_steps=args.profile_steps,
+        video_contains_first_frame=video_contains_first_frame,
     )
     print(f"forward_GFLOPs: {gflops:.4f}")
 

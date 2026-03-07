@@ -1,335 +1,118 @@
 """
 Balanced data-collection utilities.
 
-Scans existing .npz / .meta.json chunks to compute per-level sequence counts,
-progression (x-position bin) frame counts, and action distribution, then
-reports balance status and produces sampling weights that prioritise
-under-represented world-stages, progression bins, and actions.
+Scans chunk metadata to compute progression (x-position bin) frame counts and
+action distribution, then reports balance status and produces sampling weights
+that prioritise under-represented progression bins and actions.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import zipfile
 from collections import Counter
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
+
+DEFAULT_PROGRESSION_BIN_SIZE: int = 64
 
 
-def default_level_pool() -> list[tuple[int, int]]:
-    """All 32 Super Mario Bros levels (worlds 1-8, stages 1-4)."""
-    return [(w, s) for w in range(1, 9) for s in range(1, 5)]
+def validate_progression_bin_size(bin_size: int) -> int:
+    value = int(bin_size)
+    if value <= 0:
+        raise ValueError("progression bin size must be a positive integer")
+    return value
 
 
 # ---------------------------------------------------------------------------
 # Scanning
 # ---------------------------------------------------------------------------
 
-def _majority_level(world_t: np.ndarray, stage_t: np.ndarray) -> tuple[int, int]:
-    """Assign a single (world, stage) to a sequence via majority vote over T frames."""
-    codes = world_t.astype(np.int32) * 100 + stage_t.astype(np.int32)
-    values, counts = np.unique(codes, return_counts=True)
-    winner = values[np.argmax(counts)]
-    return int(winner // 100), int(winner % 100)
 
-
-def _scan_chunk_from_meta(meta_path: Path) -> Optional[dict[tuple[int, int], int]]:
-    """Try to read a fast level_summary from a .meta.json file.
-
-    Returns ``None`` if the file lacks a ``level_summary`` field (old chunks).
-    """
+def _load_meta_json(meta_path: Path) -> dict | None:
     try:
         with meta_path.open("r", encoding="utf-8") as f:
-            meta = json.load(f)
+            return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
 
-    summary = meta.get("level_summary")
-    if summary is None:
-        return None
 
-    # Keys are strings like "1-1"; convert to (int, int)
-    result: dict[tuple[int, int], int] = {}
+def _parse_exact_progression_summary(
+    summary: dict[str, int],
+) -> dict[tuple[int, int, int], int]:
+    result: dict[tuple[int, int, int], int] = {}
     for key, count in summary.items():
-        w, s = key.split("-")
-        result[(int(w), int(s))] = int(count)
+        parts = key.split(":")
+        if len(parts) != 3:
+            continue
+        w, s, x = int(parts[0]), int(parts[1]), int(parts[2])
+        result[(w, s, x)] = int(count)
     return result
 
 
-def _scan_chunk_from_npz(npz_path: Path) -> dict[tuple[int, int], int] | None:
-    """Scan an .npz file and count sequences per (world, stage) via majority vote.
-
-    Returns ``None`` if the file cannot be read (e.g. still being written).
-    """
-    counts: dict[tuple[int, int], int] = Counter()
-    try:
-        with np.load(npz_path) as data:
-            world = data["world"]  # (B, T)
-            stage = data["stage"]  # (B, T)
-            for i in range(world.shape[0]):
-                level = _majority_level(world[i], stage[i])
-                counts[level] += 1
-    except (EOFError, OSError, ValueError, zipfile.BadZipFile):
+def _scan_exact_progression_from_meta(
+    meta_path: Path,
+) -> Optional[dict[tuple[int, int, int], int]]:
+    """Try the fast-path: read exact per-(level, x) counts from ``.meta.json``."""
+    meta = _load_meta_json(meta_path)
+    if meta is None:
         return None
-    return dict(counts)
+    summary = meta.get("exact_progression_summary")
+    if summary is None:
+        return None
+    return _parse_exact_progression_summary(summary)
 
 
-def scan_coverage(data_dir: str | Path) -> dict[tuple[int, int], int]:
-    """Return ``{(world, stage): num_sequences}`` for all chunks in *data_dir*.
-
-    Uses the fast ``level_summary`` field in ``.meta.json`` when available,
-    falling back to full ``.npz`` loading for older chunks.
-    """
-    data_dir = Path(data_dir)
-    npz_files = sorted(data_dir.glob("chunk_*.npz"))
-
-    totals: dict[tuple[int, int], int] = Counter()
-
-    for npz_path in npz_files:
-        meta_path = npz_path.with_suffix("").with_suffix(".meta.json")
-        # Prefer fast meta path
-        chunk_counts = _scan_chunk_from_meta(meta_path) if meta_path.exists() else None
-        if chunk_counts is None:
-            chunk_counts = _scan_chunk_from_npz(npz_path)
-        if chunk_counts is None:
-            continue  # skip unreadable chunks (e.g. still being written)
-        for level, count in chunk_counts.items():
-            totals[level] += count
-
+def _bin_exact_progression_counts(
+    exact_counts: dict[tuple[int, int, int], int],
+    bin_size: int,
+) -> dict[tuple[int, int, int], int]:
+    totals: dict[tuple[int, int, int], int] = Counter()
+    for (w, s, x_pos), count in exact_counts.items():
+        totals[(w, s, x_pos // bin_size)] += count
     return dict(totals)
-
-
-# ---------------------------------------------------------------------------
-# Balance report
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LevelInfo:
-    world: int
-    stage: int
-    count: int
-    target: int
-    deficit: int
-    pct_of_total: float
-    weight: float
-
-
-@dataclass
-class BalanceReport:
-    total_sequences: int
-    num_levels: int
-    target_per_level: int
-    mean_count: float
-    min_count: int
-    max_count: int
-    levels: list[LevelInfo] = field(default_factory=list)
-    weights: dict[tuple[int, int], float] = field(default_factory=dict)
-
-
-def compute_balance_report(
-    coverage: dict[tuple[int, int], int],
-    level_pool: Optional[list[tuple[int, int]]] = None,
-) -> BalanceReport:
-    """Compute a full balance report with per-level weights.
-
-    The *target* for each level is ``ceil(total_sequences / num_levels)`` so
-    that equal representation is the goal.  Levels at or above the target get
-    weight 0; levels below get weight proportional to their deficit.
-    """
-    pool = level_pool or default_level_pool()
-    num_levels = len(pool)
-    counts = {lvl: coverage.get(lvl, 0) for lvl in pool}
-    total = sum(counts.values())
-    target = max(1, -(-total // num_levels))  # ceil division
-
-    # Raw deficits (clamped to >= 0)
-    deficits = {lvl: max(0, target - c) for lvl, c in counts.items()}
-    deficit_sum = sum(deficits.values())
-
-    if deficit_sum == 0:
-        # All levels at or above target → uniform
-        weights = {lvl: 1.0 / num_levels for lvl in pool}
-    else:
-        weights = {lvl: d / deficit_sum for lvl, d in deficits.items()}
-
-    count_vals = list(counts.values())
-    levels = []
-    for lvl in sorted(pool):
-        c = counts[lvl]
-        levels.append(LevelInfo(
-            world=lvl[0],
-            stage=lvl[1],
-            count=c,
-            target=target,
-            deficit=max(0, target - c),
-            pct_of_total=(c / total * 100) if total else 0.0,
-            weight=weights[lvl],
-        ))
-
-    return BalanceReport(
-        total_sequences=total,
-        num_levels=num_levels,
-        target_per_level=target,
-        mean_count=total / num_levels if num_levels else 0,
-        min_count=min(count_vals) if count_vals else 0,
-        max_count=max(count_vals) if count_vals else 0,
-        levels=levels,
-        weights=weights,
-    )
-
-
-def save_report(report: BalanceReport, path: str | Path) -> None:
-    """Write a machine-readable JSON report."""
-    path = Path(path)
-    # Convert tuple keys to strings for JSON
-    out = {
-        "total_sequences": report.total_sequences,
-        "num_levels": report.num_levels,
-        "target_per_level": report.target_per_level,
-        "mean_count": report.mean_count,
-        "min_count": report.min_count,
-        "max_count": report.max_count,
-        "levels": [asdict(lvl) for lvl in report.levels],
-        "weights": {f"{w}-{s}": wt for (w, s), wt in report.weights.items()},
-    }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2)
-
-
-def print_report(report: BalanceReport, top_n: int = 0) -> None:
-    """Pretty-print the balance report to stdout."""
-    print()
-    print("=" * 72)
-    print("  WORLD-STAGE BALANCE REPORT")
-    print("=" * 72)
-    print(f"  Total sequences : {report.total_sequences:>8}")
-    print(f"  Levels tracked  : {report.num_levels:>8}")
-    print(f"  Target / level  : {report.target_per_level:>8}")
-    print(f"  Mean count      : {report.mean_count:>8.1f}")
-    print(f"  Min count       : {report.min_count:>8}")
-    print(f"  Max count       : {report.max_count:>8}")
-    print("-" * 72)
-    print(f"  {'Level':<8} {'Count':>8} {'Target':>8} {'Deficit':>8} "
-          f"{'%Total':>8} {'Weight':>8}  Bar")
-    print("-" * 72)
-
-    levels = report.levels
-    if top_n > 0:
-        # Sort by deficit descending, show only top_n
-        levels = sorted(levels, key=lambda l: l.deficit, reverse=True)[:top_n]
-
-    max_target = report.target_per_level or 1
-    for lv in levels:
-        bar_len = int(20 * lv.count / max_target) if max_target else 0
-        bar = "\u2588" * min(bar_len, 20)
-        marker = " \u2713" if lv.deficit == 0 else ""
-        print(
-            f"  {lv.world}-{lv.stage:<6} {lv.count:>8} {lv.target:>8} "
-            f"{lv.deficit:>8} {lv.pct_of_total:>7.1f}% {lv.weight:>8.4f}  "
-            f"{bar}{marker}"
-        )
-    print("=" * 72)
-
-
-def print_guidance(report: BalanceReport, n: int = 5) -> None:
-    """Print a short summary of the *n* most-needed levels for human guidance."""
-    needed = sorted(report.levels, key=lambda l: l.deficit, reverse=True)[:n]
-    if not needed or needed[0].deficit == 0:
-        print("[balance] All levels are at or above the target — collecting uniformly.")
-        return
-    print(f"[balance] Top {n} most-needed levels:")
-    for lv in needed:
-        if lv.deficit == 0:
-            break
-        print(f"  World {lv.world}-{lv.stage}  (have {lv.count}, need {lv.deficit} more)")
-
-
-def compute_level_summary(world_bt: np.ndarray, stage_bt: np.ndarray) -> dict[str, int]:
-    """Compute a per-level sequence count dictionary from (B, T) world/stage arrays.
-
-    Returns a dict like ``{"1-1": 12, "3-2": 5, ...}`` suitable for inclusion
-    in ``.meta.json`` files.
-    """
-    counts: dict[str, int] = Counter()
-    for i in range(world_bt.shape[0]):
-        w, s = _majority_level(world_bt[i], stage_bt[i])
-        counts[f"{w}-{s}"] += 1
-    return dict(counts)
 
 
 # ===================================================================
 # Progression (x-position) coverage
 # ===================================================================
 
-PROGRESSION_BIN_SIZE: int = 256  # one NES screen
+PROGRESSION_BIN_SIZE: int = DEFAULT_PROGRESSION_BIN_SIZE
 
 
-def _scan_progression_from_meta(meta_path: Path) -> Optional[dict[tuple[int, int, int], int]]:
-    """Try the fast-path: read ``progression_summary`` from a ``.meta.json``."""
-    try:
-        with meta_path.open("r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    summary = meta.get("progression_summary")
-    if summary is None:
-        return None
-    result: dict[tuple[int, int, int], int] = {}
-    for key, count in summary.items():
-        parts = key.split("-")
-        if len(parts) != 3:
-            continue
-        w, s, b = int(parts[0]), int(parts[1]), int(parts[2])
-        result[(w, s, b)] = int(count)
-    return result
-
-
-def _scan_progression_from_npz(
-    npz_path: Path,
-    bin_size: int = PROGRESSION_BIN_SIZE,
-) -> dict[tuple[int, int, int], int]:
-    """Scan an ``.npz`` file → ``{(world, stage, x_bin): frame_count}``.
-
-    Returns an empty dict if the file is corrupted or still being written.
-    """
-    counts: dict[tuple[int, int, int], int] = Counter()
-    try:
-        with np.load(npz_path) as data:
-            if "world" not in data or "stage" not in data or "x_pos" not in data:
-                return {}
-            world = data["world"].flatten()
-            stage = data["stage"].flatten()
-            x_pos = data["x_pos"].flatten()
-            bins = (x_pos // bin_size).astype(np.int32)
-            codes = world.astype(np.int64) * 1_000_000 + stage.astype(np.int64) * 1_000 + bins.astype(np.int64)
-            unique, ucounts = np.unique(codes, return_counts=True)
-            for code, cnt in zip(unique, ucounts):
-                w = int(code // 1_000_000)
-                s = int((code % 1_000_000) // 1_000)
-                b = int(code % 1_000)
-                counts[(w, s, b)] += int(cnt)
-    except (EOFError, OSError, ValueError, zipfile.BadZipFile):
-        return {}
-    return dict(counts)
+def _scan_progression_from_meta(
+    meta_path: Path,
+    requested_bin_size: int,
+) -> Optional[dict[tuple[int, int, int], int]]:
+    """Try the fast-path: read progression counts from a ``.meta.json``."""
+    exact_counts = _scan_exact_progression_from_meta(meta_path)
+    if exact_counts is not None:
+        return _bin_exact_progression_counts(exact_counts, requested_bin_size)
+    return None
 
 
 def scan_progression_coverage(
     data_dir: str | Path,
     bin_size: int = PROGRESSION_BIN_SIZE,
 ) -> dict[tuple[int, int, int], int]:
-    """Return ``{(world, stage, x_bin): frame_count}`` for all chunks."""
+    """Return ``{(world, stage, x_bin): frame_count}`` for all chunks.
+
+    Chunk metadata must provide exact per-position counts in
+    ``exact_progression_summary``; those are rebinned on demand to the
+    requested resolution. Chunks without usable progression metadata are
+    skipped.
+    """
+    bin_size = validate_progression_bin_size(bin_size)
     data_dir = Path(data_dir)
     npz_files = sorted(data_dir.glob("chunk_*.npz"))
     totals: dict[tuple[int, int, int], int] = Counter()
     for npz_path in npz_files:
         meta_path = npz_path.with_suffix("").with_suffix(".meta.json")
-        chunk_counts = _scan_progression_from_meta(meta_path) if meta_path.exists() else None
+        chunk_counts = _scan_progression_from_meta(meta_path, bin_size) if meta_path.exists() else None
         if chunk_counts is None:
-            chunk_counts = _scan_progression_from_npz(npz_path, bin_size)
+            continue
         for key, count in chunk_counts.items():
             totals[key] += count
     return dict(totals)
@@ -352,24 +135,11 @@ def _scan_action_from_meta(meta_path: Path) -> Optional[dict[int, int]]:
     return {int(k): int(v) for k, v in summary.items()}
 
 
-def _scan_action_from_npz(npz_path: Path) -> dict[int, int]:
-    """Scan an ``.npz`` file → ``{action_index: count}``.
-
-    Returns an empty dict if the file is corrupted or still being written.
-    """
-    try:
-        with np.load(npz_path) as data:
-            if "actions" not in data:
-                return {}
-            actions = data["actions"].flatten()
-            unique, counts = np.unique(actions, return_counts=True)
-            return {int(u): int(c) for u, c in zip(unique, counts)}
-    except (EOFError, OSError, ValueError, zipfile.BadZipFile):
-        return {}
-
-
 def scan_action_coverage(data_dir: str | Path) -> dict[int, int]:
-    """Return ``{action_index: total_frame_count}`` for all chunks."""
+    """Return ``{action_index: total_frame_count}`` for all chunks.
+
+    Only chunk metadata is scanned. Chunks without an ``action_summary`` are skipped.
+    """
     data_dir = Path(data_dir)
     npz_files = sorted(data_dir.glob("chunk_*.npz"))
     totals: dict[int, int] = Counter()
@@ -377,7 +147,7 @@ def scan_action_coverage(data_dir: str | Path) -> dict[int, int]:
         meta_path = npz_path.with_suffix("").with_suffix(".meta.json")
         chunk_counts = _scan_action_from_meta(meta_path) if meta_path.exists() else None
         if chunk_counts is None:
-            chunk_counts = _scan_action_from_npz(npz_path)
+            continue
         for key, count in chunk_counts.items():
             totals[key] += count
     return dict(totals)
@@ -405,6 +175,7 @@ class ProgressionBalanceReport:
     total_frames: int
     num_bins: int
     target_per_bin: int
+    bin_size: int
     bins: list[ProgressionBinInfo] = field(default_factory=list)
     weights: dict[tuple[int, int, int], float] = field(default_factory=dict)
 
@@ -412,6 +183,7 @@ class ProgressionBalanceReport:
 def compute_progression_balance(
     progression_cov: dict[tuple[int, int, int], int],
     reachable_bins: Optional[set[tuple[int, int, int]]] = None,
+    bin_size: int = PROGRESSION_BIN_SIZE,
 ) -> ProgressionBalanceReport:
     """Compute per-(level, x_bin) balance with weights biased toward deficit.
 
@@ -419,8 +191,9 @@ def compute_progression_balance(
     weight to bins that we can actually replay to.  Bins we can't reach still
     appear in the report but get weight 0.
     """
+    bin_size = validate_progression_bin_size(bin_size)
     if not progression_cov:
-        return ProgressionBalanceReport(total_frames=0, num_bins=0, target_per_bin=0)
+        return ProgressionBalanceReport(total_frames=0, num_bins=0, target_per_bin=0, bin_size=bin_size)
 
     # All observed bins
     all_bins = set(progression_cov.keys())
@@ -486,6 +259,7 @@ def compute_progression_balance(
         total_frames=total,
         num_bins=num_bins,
         target_per_bin=target,
+        bin_size=bin_size,
         bins=bins_list,
         weights=weights,
     )
@@ -565,6 +339,7 @@ def print_progression_report(
     print("=" * 80)
     print("  PROGRESSION (X-POSITION) BALANCE REPORT")
     print("=" * 80)
+    print(f"  Bin size (px)       : {report.bin_size:>10}")
     print(f"  Total frames        : {report.total_frames:>10}")
     print(f"  Distinct bins       : {report.num_bins:>10}")
     print(f"  Target / bin        : {report.target_per_bin:>10}")

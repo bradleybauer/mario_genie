@@ -10,7 +10,7 @@ mkdir -p "$LOCAL_RESULTS"
 RSYNC_OPTS=(-avz --progress)
 
 if [[ "$1" == "--images" ]]; then
-    RSYNC_OPTS+=(--include='*/' --include='*.png' --exclude='*')
+    RSYNC_OPTS+=(--include='*/' --include='*.png' --include='*.json' --exclude='*')
 fi
 
 rsync "${RSYNC_OPTS[@]}" -e "ssh -p $REMOTE_PORT" "$REMOTE:$REMOTE_RESULTS" "$LOCAL_RESULTS"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -25,11 +26,13 @@ if str(SRC_DIR) not in sys.path:
 from mario_world_model.actions import get_action_meanings, get_num_actions
 from mario_world_model.config import SEQUENCE_LENGTH
 from mario_world_model.coverage import (
+    PROGRESSION_BIN_SIZE,
     compute_action_balance,
     compute_progression_balance,
     print_progression_guidance,
     scan_action_coverage,
     scan_progression_coverage,
+    validate_progression_bin_size,
 )
 from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env
 from mario_world_model.preprocess import preprocess_frame
@@ -327,6 +330,81 @@ class HumanActionPolicy:
         pygame.quit()
 
 
+class VectorCollectionVisualizer:
+    def __init__(
+        self,
+        num_envs: int,
+        fps: int = 30,
+        max_window_size: tuple[int, int] = (1280, 960),
+    ):
+        self.num_envs = int(num_envs)
+        self.fps = int(fps)
+        self.max_window_size = max_window_size
+        self.screen: pygame.Surface | None = None
+        self.tile_size: tuple[int, int] | None = None
+        self.grid_size: tuple[int, int] | None = None
+        self.clock = pygame.time.Clock()
+        pygame.init()
+
+    def _handle_events(self) -> None:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise KeyboardInterrupt("Vector recorder window closed.")
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                raise KeyboardInterrupt("Vector recorder stopped by Escape key.")
+
+    def _ensure_screen(self, frame_hwc: np.ndarray) -> None:
+        if self.screen is not None:
+            return
+
+        frame_h, frame_w = frame_hwc.shape[:2]
+        cols = max(1, math.ceil(math.sqrt(self.num_envs)))
+        rows = max(1, math.ceil(self.num_envs / cols))
+
+        max_w, max_h = self.max_window_size
+        scale = min(max_w / max(1, cols * frame_w), max_h / max(1, rows * frame_h))
+        scale = max(scale, 0.25)
+
+        tile_w = max(1, int(frame_w * scale))
+        tile_h = max(1, int(frame_h * scale))
+
+        self.tile_size = (tile_w, tile_h)
+        self.grid_size = (cols, rows)
+        self.screen = pygame.display.set_mode((cols * tile_w, rows * tile_h))
+        pygame.display.set_caption("Mario Vector Data Recorder")
+
+    def draw_frames(self, frames_bhwc: np.ndarray) -> None:
+        self._handle_events()
+        if frames_bhwc.ndim != 4:
+            raise ValueError(f"Expected batched frames with shape (B, H, W, C), got {frames_bhwc.shape}")
+        if frames_bhwc.shape[0] == 0:
+            return
+
+        self._ensure_screen(frames_bhwc[0])
+        assert self.screen is not None
+        assert self.tile_size is not None
+        assert self.grid_size is not None
+
+        tile_w, tile_h = self.tile_size
+        cols, _rows = self.grid_size
+        self.screen.fill((0, 0, 0))
+
+        for env_idx, frame_hwc in enumerate(frames_bhwc):
+            surface = pygame.surfarray.make_surface(np.transpose(frame_hwc, (1, 0, 2)))
+            if surface.get_size() != self.tile_size:
+                surface = pygame.transform.scale(surface, self.tile_size)
+
+            col = env_idx % cols
+            row = env_idx // cols
+            self.screen.blit(surface, (col * tile_w, row * tile_h))
+
+        pygame.display.flip()
+        self.clock.tick(max(1, self.fps))
+
+    def close(self) -> None:
+        pygame.quit()
+
+
 def to_tchw(frame_hwc: np.ndarray) -> np.ndarray:
     padded = preprocess_frame(frame_hwc)
     return np.transpose(padded, (2, 0, 1)).astype(np.uint8, copy=False)
@@ -360,16 +438,17 @@ def build_vector_env(
 
 def _build_replay_pool(
     output_dir: Path,
+    progression_bin_size: int,
 ) -> list[tuple[tuple[int, int], list[int], int, float]]:
     """Scan progression coverage + rollouts, return weighted replay pool.
 
     Returns a list of ``(level, actions, target_step, weight)`` tuples that
     can be fed directly to ``RandomLevelMarioEnv.update_progression_balance()``.
     """
-    prog_cov = scan_progression_coverage(str(output_dir))
+    prog_cov = scan_progression_coverage(str(output_dir), bin_size=progression_bin_size)
     ri = RolloutIndex(output_dir)
-    reachable = ri.reachable_bins()
-    prog_rpt = compute_progression_balance(prog_cov, reachable)
+    reachable = ri.reachable_bins(bin_size=progression_bin_size)
+    prog_rpt = compute_progression_balance(prog_cov, reachable, bin_size=progression_bin_size)
     print_progression_guidance(prog_rpt, n=5)
 
     pool: list[tuple[tuple[int, int], list[int], int, float]] = []
@@ -380,7 +459,7 @@ def _build_replay_pool(
             # Bin 0 = level start — zero-step replay (just selects the level)
             pool.append(((w, s), [], 0, weight))
             continue
-        all_replays = ri.find_all_replay_actions(w, s, b)
+        all_replays = ri.find_all_replay_actions(w, s, b, bin_size=progression_bin_size)
         if not all_replays:
             continue
         # Split the bin's weight equally across candidate rollouts
@@ -395,9 +474,10 @@ def _do_progression_rebalance_vector(
     env: gym.vector.VectorEnv,
     output_dir: Path,
     num_envs: int,
+    progression_bin_size: int,
 ) -> None:
     """Build a replay pool and push it to every sub-env."""
-    pool = _build_replay_pool(output_dir)
+    pool = _build_replay_pool(output_dir, progression_bin_size)
     if not pool:
         print("[progression] No reachable mid-level bins yet — skipping replay pool update.")
         return
@@ -410,9 +490,10 @@ def _do_progression_rebalance_vector(
 def _do_progression_rebalance_human(
     env: RandomLevelMarioEnv,
     output_dir: Path,
+    progression_bin_size: int,
 ) -> None:
     """Build a replay pool and push it to the single env."""
-    pool = _build_replay_pool(output_dir)
+    pool = _build_replay_pool(output_dir, progression_bin_size)
     if not pool:
         print("[progression] No reachable mid-level bins yet — skipping replay pool update.")
         return
@@ -446,10 +527,14 @@ def run_collection(
     human_fps: int,
     level_mode: str,
     max_pending_writes: int,
+    visualize: bool = False,
+    visualize_fps: int = 30,
     balance: bool = False,
     rebalance_interval: int = 5,
     balance_actions: bool = False,
+    progression_bin_size: int = PROGRESSION_BIN_SIZE,
 ):
+    progression_bin_size = validate_progression_bin_size(progression_bin_size)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # --balance-actions implies --balance
@@ -488,6 +573,7 @@ def run_collection(
             balance=balance,
             rebalance_interval=rebalance_interval,
             balance_actions=balance_actions,
+            progression_bin_size=progression_bin_size,
         )
 
     env = build_vector_env(
@@ -507,6 +593,11 @@ def run_collection(
         max_pending_writes=max_pending_writes,
     )
     policy = VectorActionPolicy(mode=mode, num_envs=num_envs, action_meanings=action_meanings, seed=seed)
+    visualizer = (
+        VectorCollectionVisualizer(num_envs=num_envs, fps=visualize_fps)
+        if visualize
+        else None
+    )
 
     # --- Episode tracking (for progression balance) ---
     tracker: EpisodeTracker | None = None
@@ -519,7 +610,7 @@ def run_collection(
     # If rollouts/data exist from a previous session, configure the replay pool
     # and action weights BEFORE the first reset so they take effect immediately.
     if balance:
-        _do_progression_rebalance_vector(env, output_dir, num_envs)
+        _do_progression_rebalance_vector(env, output_dir, num_envs, progression_bin_size)
     if balance_actions:
         _do_action_rebalance(policy, output_dir, num_actions)
 
@@ -549,110 +640,115 @@ def run_collection(
     total_sequences = 0
     chunks_since_rebalance = 0
 
-    for step_idx in range(total_steps):
-        actions = policy.sample()
-        next_obs, _, terminated, truncated, next_info = env.step(actions)
+    try:
+        for step_idx in range(total_steps):
+            if visualizer is not None:
+                visualizer.draw_frames(obs)
 
-        done_flags = np.logical_or(terminated, truncated)
+            actions = policy.sample()
+            next_obs, _, terminated, truncated, next_info = env.step(actions)
 
-        for env_idx in range(num_envs):
-            seq_frames[env_idx].append(to_tchw(obs[env_idx]))
-            seq_actions[env_idx].append(int(actions[env_idx]))
-            seq_dones[env_idx].append(bool(done_flags[env_idx]))
-            
-            for k in INFO_KEYS:
-                val = info.get(k)
-                if val is not None:
-                    seq_info[k][env_idx].append(int(val[env_idx]))
-                else:
-                    seq_info[k][env_idx].append(0)
+            done_flags = np.logical_or(terminated, truncated)
 
-            status_val = info.get("status")
-            if status_val is not None:
-                seq_info["status"][env_idx].append(STATUS_MAP.get(status_val[env_idx], 0))
-            else:
-                seq_info["status"][env_idx].append(0)
-
-            # --- Episode tracking ---
-            if tracker is not None:
-                x_val = info.get("x_pos")
-                w_val = info.get("world")
-                s_val = info.get("stage")
-                l_val = info.get("life")
-                tracker.record_step(
-                    env_idx,
-                    action=int(actions[env_idx]),
-                    x_pos=int(x_val[env_idx]) if x_val is not None else 0,
-                    world=int(w_val[env_idx]) if w_val is not None else 1,
-                    stage=int(s_val[env_idx]) if s_val is not None else 1,
-                    life=int(l_val[env_idx]) if l_val is not None else 2,
-                )
-                if done_flags[env_idx]:
-                    fg_val = next_info.get("flag_get")
-                    nl_val = next_info.get("life")
-                    rollout = tracker.finish_episode(
-                        env_idx,
-                        cur_life=int(nl_val[env_idx]) if nl_val is not None else 2,
-                        flag_get=int(fg_val[env_idx]) if fg_val is not None else 0,
-                        terminated=bool(terminated[env_idx]),
-                        truncated=bool(truncated[env_idx]),
-                    )
-                    if rollout is not None and rollout_writer is not None:
-                        rollout_writer.write(rollout)
-                    # Re-seed tracker with new episode info (auto-reset provides new info)
-                    nw_val = next_info.get("world")
-                    ns_val = next_info.get("stage")
-                    nnl_val = next_info.get("life")
-                    tracker.set_initial_info(
-                        env_idx,
-                        world=int(nw_val[env_idx]) if nw_val is not None else 1,
-                        stage=int(ns_val[env_idx]) if ns_val is not None else 1,
-                        life=int(nnl_val[env_idx]) if nnl_val is not None else 2,
-                    )
-
-            if len(seq_frames[env_idx]) == sequence_length:
-                frames_tchw = np.stack(seq_frames[env_idx], axis=0)
-                actions_t = np.asarray(seq_actions[env_idx], dtype=np.uint8)
-                dones_t = np.asarray(seq_dones[env_idx], dtype=bool)
+            for env_idx in range(num_envs):
+                seq_frames[env_idx].append(to_tchw(obs[env_idx]))
+                seq_actions[env_idx].append(int(actions[env_idx]))
+                seq_dones[env_idx].append(bool(done_flags[env_idx]))
                 
-                kwargs_t = {}
-                for k in INFO_KEYS + ["status"]:
-                    kwargs_t[k] = np.asarray(seq_info[k][env_idx], dtype=np.int32)
-                    seq_info[k][env_idx].clear()
+                for k in INFO_KEYS:
+                    val = info.get(k)
+                    if val is not None:
+                        seq_info[k][env_idx].append(int(val[env_idx]))
+                    else:
+                        seq_info[k][env_idx].append(0)
 
-                out = writer.add_sequence(frames_tchw, actions_t, dones_t, **kwargs_t)
-                total_sequences += 1
-                seq_frames[env_idx].clear()
-                seq_actions[env_idx].clear()
-                seq_dones[env_idx].clear()
-                if out is not None:
-                    print(f"[chunk] wrote {out}")
-                    chunks_since_rebalance += 1
+                status_val = info.get("status")
+                if status_val is not None:
+                    seq_info["status"][env_idx].append(STATUS_MAP.get(status_val[env_idx], 0))
+                else:
+                    seq_info["status"][env_idx].append(0)
 
-                    # Periodic rebalancing
-                    if balance and chunks_since_rebalance >= rebalance_interval:
-                        chunks_since_rebalance = 0
-                        _do_progression_rebalance_vector(
-                            env, output_dir, num_envs,
+                # --- Episode tracking ---
+                if tracker is not None:
+                    x_val = info.get("x_pos")
+                    w_val = info.get("world")
+                    s_val = info.get("stage")
+                    l_val = info.get("life")
+                    tracker.record_step(
+                        env_idx,
+                        action=int(actions[env_idx]),
+                        x_pos=int(x_val[env_idx]) if x_val is not None else 0,
+                        world=int(w_val[env_idx]) if w_val is not None else 1,
+                        stage=int(s_val[env_idx]) if s_val is not None else 1,
+                        life=int(l_val[env_idx]) if l_val is not None else 2,
+                    )
+                    if done_flags[env_idx]:
+                        fg_val = next_info.get("flag_get")
+                        nl_val = next_info.get("life")
+                        rollout = tracker.finish_episode(
+                            env_idx,
+                            cur_life=int(nl_val[env_idx]) if nl_val is not None else 2,
+                            flag_get=int(fg_val[env_idx]) if fg_val is not None else 0,
+                            terminated=bool(terminated[env_idx]),
+                            truncated=bool(truncated[env_idx]),
+                        )
+                        if rollout is not None and rollout_writer is not None:
+                            rollout_writer.write(rollout)
+                        # Re-seed tracker with new episode info (auto-reset provides new info)
+                        nw_val = next_info.get("world")
+                        ns_val = next_info.get("stage")
+                        nnl_val = next_info.get("life")
+                        tracker.set_initial_info(
+                            env_idx,
+                            world=int(nw_val[env_idx]) if nw_val is not None else 1,
+                            stage=int(ns_val[env_idx]) if ns_val is not None else 1,
+                            life=int(nnl_val[env_idx]) if nnl_val is not None else 2,
                         )
 
-                        # Action rebalancing
-                        if balance_actions:
-                            _do_action_rebalance(
-                                policy, output_dir, num_actions,
+                if len(seq_frames[env_idx]) == sequence_length:
+                    frames_tchw = np.stack(seq_frames[env_idx], axis=0)
+                    actions_t = np.asarray(seq_actions[env_idx], dtype=np.uint8)
+                    dones_t = np.asarray(seq_dones[env_idx], dtype=bool)
+                    
+                    kwargs_t = {}
+                    for k in INFO_KEYS + ["status"]:
+                        kwargs_t[k] = np.asarray(seq_info[k][env_idx], dtype=np.int32)
+                        seq_info[k][env_idx].clear()
+
+                    out = writer.add_sequence(frames_tchw, actions_t, dones_t, **kwargs_t)
+                    total_sequences += 1
+                    seq_frames[env_idx].clear()
+                    seq_actions[env_idx].clear()
+                    seq_dones[env_idx].clear()
+                    if out is not None:
+                        print(f"[chunk] wrote {out}")
+                        chunks_since_rebalance += 1
+
+                        # Periodic rebalancing
+                        if balance and chunks_since_rebalance >= rebalance_interval:
+                            chunks_since_rebalance = 0
+                            _do_progression_rebalance_vector(
+                                env, output_dir, num_envs, progression_bin_size,
                             )
 
-        obs = next_obs
-        info = next_info
+                            # Action rebalancing
+                            if balance_actions:
+                                _do_action_rebalance(
+                                    policy, output_dir, num_actions,
+                                )
 
-        if (step_idx + 1) % 500 == 0:
-            print(f"[step {step_idx + 1}/{total_steps}] sequences={total_sequences}")
+            obs = next_obs
+            info = next_info
 
-    try:
+            if (step_idx + 1) % 500 == 0:
+                print(f"[step {step_idx + 1}/{total_steps}] sequences={total_sequences}")
+
         final = writer.flush()
         if final is not None:
             print(f"[chunk] wrote {final}")
     finally:
+        if visualizer is not None:
+            visualizer.close()
         writer.close()
         if rollout_writer is not None:
             rollout_writer.close()
@@ -695,7 +791,9 @@ def run_human_collection(
     balance: bool = False,
     rebalance_interval: int = 5,
     balance_actions: bool = False,
+    progression_bin_size: int = PROGRESSION_BIN_SIZE,
 ):
+    progression_bin_size = validate_progression_bin_size(progression_bin_size)
     num_actions = get_num_actions()
 
     if level_mode == "random":
@@ -723,7 +821,7 @@ def run_human_collection(
     # If rollouts already exist from a previous session, configure the replay
     # pool BEFORE the first reset so replays work from the very first episode.
     if balance and hasattr(env, 'update_progression_balance'):
-        _do_progression_rebalance_human(env, output_dir)  # type: ignore[arg-type]
+        _do_progression_rebalance_human(env, output_dir, progression_bin_size)  # type: ignore[arg-type]
 
     obs, info = env.reset(seed=seed)
 
@@ -806,7 +904,7 @@ def run_human_collection(
                     if balance and chunks_since_rebalance >= rebalance_interval:
                         chunks_since_rebalance = 0
                         if hasattr(env, 'update_progression_balance'):
-                            _do_progression_rebalance_human(env, output_dir)  # type: ignore[arg-type]
+                            _do_progression_rebalance_human(env, output_dir, progression_bin_size)  # type: ignore[arg-type]
 
                         if balance_actions:
                             # For human mode we just print guidance (can't override human input)
@@ -885,9 +983,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vector-mode", type=str, default="sync", choices=["sync", "async"])
     parser.add_argument("--human-fps", type=int, default=75)
     parser.add_argument("--max-pending-writes", type=int, default=8)
+    parser.add_argument("--visualize", action="store_true", help="Render live vector collection frames in a pygame window")
+    parser.add_argument("--visualize-fps", type=int, default=30, help="Target FPS for vector visualization; this also throttles collection speed when --visualize is enabled")
     parser.add_argument("--balance", action="store_true", help="Enable progression-aware balanced collection via action replay")
     parser.add_argument("--rebalance-interval", type=int, default=5, help="Re-scan data and update weights every N chunks (default: 5)")
     parser.add_argument("--balance-actions", action="store_true", help="Balance action distribution via dynamic policy weights (implies --balance)")
+    parser.add_argument(
+        "--progression-bin-size",
+        type=int,
+        default=PROGRESSION_BIN_SIZE,
+        help="Progression coverage bin width in pixels; default is 64",
+    )
     return parser.parse_args()
 
 
@@ -909,9 +1015,12 @@ def main():
         human_fps=args.human_fps,
         level_mode=args.level_mode,
         max_pending_writes=args.max_pending_writes,
+        visualize=args.visualize,
+        visualize_fps=args.visualize_fps,
         balance=args.balance,
         rebalance_interval=args.rebalance_interval,
         balance_actions=args.balance_actions,
+        progression_bin_size=args.progression_bin_size,
     )
 
     elapsed = time.time() - started

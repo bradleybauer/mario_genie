@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Max-Dataset-Size Sweep for MAGVIT-2 Video Tokenizer
-====================================================
+Max-Dataset-Size Sweep for Open-Genie-Style MAGVIT Tokenizers
+==============================================================
 
-For each model configuration (mirrored from sweep_arch.sh), uses binary search
-over dataset sizes (via --overfit-n) to find the largest N-sample subset the
-model can fit to recon_loss < threshold (default 0.0005).
+Sweeps scaled MAGVIT tokenizer backbones inspired by Open-Genie's video
+tokenizer, but expressed using the layer primitives implemented by
+magvit2_pytorch.VideoTokenizer.
+
+Important detail: Open-Genie's reference blueprint ends the encoder with an
+18-channel projection before LFQ. That projection is not something this sweep
+needs to model explicitly. In magvit2_pytorch, LFQ already accepts arbitrary
+encoder widths and projects into codebook space internally via project_in.
 
 Algorithm per model:
     1. Run a binary search over dataset sizes to find the largest passing size.
@@ -13,12 +18,6 @@ Algorithm per model:
     3. If that probe fails, stop early for this model.
     4. If the probe passes, continue searching upward.
     5. Record max_dataset_size.
-
-Usage:
-  python scripts/sweep_dataset_capacity.py                        # full sweep
-  python scripts/sweep_dataset_capacity.py --dry-run              # print plan
-  python scripts/sweep_dataset_capacity.py --filter dim32         # subset
-  python scripts/sweep_dataset_capacity.py --resume               # skip done
 """
 
 import argparse
@@ -28,18 +27,44 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
+
+
 # ---------------------------------------------------------------------------
-# Model configurations — mirrored from sweep_arch.sh
+# Model configurations — Open-Genie-inspired MAGVIT scales
 # ---------------------------------------------------------------------------
 
-BASELINE_LAYERS = "residual,compress_space,residual,compress_space,residual,compress_space"
-DEEP = "residual,residual,compress_space,residual,residual,compress_space,residual,residual,compress_space"
-ATTN_SPACE = "residual,compress_space,attend_space,residual,compress_space,attend_space,residual,compress_space,attend_space"
-LIN_ATTN = "residual,compress_space,residual,compress_space,linear_attend_space,residual,compress_space,linear_attend_space"
-ATTN_TIME = "residual,compress_space,attend_time,residual,compress_space,attend_time,residual,compress_space,attend_time"
-FULL_ATTN = "residual,compress_space,residual,compress_space,attend_space,attend_time,residual,compress_space,attend_space,attend_time"
-GENIE_SMALL = "consecutive_residual:2,compress_space:64,consecutive_residual:2,compress_time:96,compress_space:128,consecutive_residual:2,compress_time:128,compress_space:128,consecutive_residual:2"
+@dataclass(frozen=True)
+class ScaleConfig:
+    name: str
+    residual_blocks: tuple[int, int, int, int]
+
+
+def build_open_genie_layers(init_dim: int, residual_blocks: tuple[int, int, int, int]) -> str:
+    """Approximate the Open-Genie MAGVIT hierarchy with MAGVIT-2 layer primitives."""
+    stage2_dim = init_dim * 2
+    stage3_dim = init_dim * 4
+    blocks_1, blocks_2, blocks_3, blocks_4 = residual_blocks
+
+    layers = [
+        f"consecutive_residual:{blocks_1}",
+        f"compress_space:{init_dim}",
+        f"consecutive_residual:{blocks_2}",
+        f"compress_time:{stage2_dim}",
+        f"compress_space:{stage2_dim}",
+        f"consecutive_residual:{blocks_3}",
+        f"compress_time:{stage3_dim}",
+        f"compress_space:{stage3_dim}",
+        f"consecutive_residual:{blocks_4}",
+    ]
+    return ",".join(layers)
+
+
+SCALE_CONFIGS = {
+    "genie_tiny": ScaleConfig(name="genie_tiny", residual_blocks=(2, 2, 2, 2)),
+    "genie_small": ScaleConfig(name="genie_small", residual_blocks=(2, 4, 4, 4)),
+    "genie_base": ScaleConfig(name="genie_base", residual_blocks=(4, 4, 4, 8)),
+}
 
 
 @dataclass
@@ -48,43 +73,30 @@ class ModelConfig:
     init_dim: int
     codebook_size: int
     layers: str
-    layer_type: str = "baseline"
+    scale_name: str
 
 
 DIMS = [32, 64]
 CODEBOOK_SIZES = [8192, 16384, 32768, 65536]
-LAYER_CONFIGS = {
-    "baseline":   BASELINE_LAYERS,
-    "deep":       DEEP,
-    "genie_small": GENIE_SMALL,
-    "attn_space": ATTN_SPACE,
-    "lin_attn":   LIN_ATTN,
-    "attn_time":  ATTN_TIME,
-    "full_attn":  FULL_ATTN,
-}
 
-# Complexity rank: lower = simpler (used for sorting sweep order)
-LAYER_COMPLEXITY = {
-    "genie_small": -1,
-    "baseline":   0,
-    "deep":       1,
-    "lin_attn":   2,
-    "attn_space": 3,
-    "attn_time":  4,
-    "full_attn":  5,
+# Simpler scales run first so early-exit pruning is more useful.
+SCALE_COMPLEXITY = {
+    "genie_tiny": 0,
+    "genie_small": 1,
+    "genie_base": 2,
 }
 
 MODEL_CONFIGS = [
     ModelConfig(
-        name=f"dim{dim}_cb{cb}{'_' + lname if lname != 'baseline' else ''}",
+        name=f"dim{dim}_cb{cb}_{scale.name}",
         init_dim=dim,
         codebook_size=cb,
-        layers=layers,
-        layer_type=lname,
+        layers=build_open_genie_layers(dim, scale.residual_blocks),
+        scale_name=scale.name,
     )
     for dim in DIMS
     for cb in CODEBOOK_SIZES
-    for lname, layers in LAYER_CONFIGS.items()
+    for scale in SCALE_CONFIGS.values()
 ]
 
 
@@ -514,7 +526,7 @@ def main():
         description="Binary-search sweep: find max dataset size each model can memorize."
     )
     parser.add_argument("--data-dir", default="data/human_play")
-    parser.add_argument("--output-dir", default="checkpoints/capacity_sweep")
+    parser.add_argument("--output-dir", default="checkpoints/capacity_sweep_genie")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")
     parser.add_argument("--max-patience", type=float, default=12,
@@ -539,10 +551,10 @@ def main():
     args = parser.parse_args()
 
     # ── Select model configs ─────────────────────────────────────────────
-    # Sort from simplest to most complex: layer complexity, then dim, then codebook
+    # Sort from simplest to most complex: scale depth, then width, then codebook.
     configs = sorted(
         MODEL_CONFIGS,
-        key=lambda c: (LAYER_COMPLEXITY[c.layer_type], c.init_dim, c.codebook_size),
+        key=lambda c: (SCALE_COMPLEXITY[c.scale_name], c.init_dim, c.codebook_size),
     )
     if args.filter:
         configs = [c for c in configs if args.filter in c.name]

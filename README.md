@@ -20,7 +20,7 @@ This project implements an Action-Conditioned Mario World Model. It focuses on l
 ├── data/
 │   └── human_play/              # Default output directory for collected chunks
 │       ├── chunk_*.npz          # Sequence data (frames, actions, dones, metadata)
-│       ├── chunk_*.meta.json    # Per-chunk summaries (level, action, progression)
+│       ├── chunk_*.meta.json    # Per-chunk metadata (action counts, exact progression positions)
 │       └── rollouts.jsonl       # Episode rollouts for replay-based progression balance
 ├── remote/
 │   ├── config.sh                       # Single source of truth for host, port, and user
@@ -186,7 +186,7 @@ At each rebalance interval, the system scans chunk metadata for per-action frame
 
 #### 4. Chunk Metadata Fast-Path
 
-Each `.meta.json` includes `action_summary` and `progression_summary` fields alongside the existing `level_summary`. Rebalance scans read these lightweight JSON files instead of decompressing full `.npz` arrays, keeping the rebalance loop fast even with hundreds of chunks.
+Each `.meta.json` includes `action_summary` plus an `exact_progression_summary` mapping exact `world:stage:x` coordinates to frame counts. Rebalance scans aggregate those lightweight counts into whatever progression bin size is requested, avoiding repeated `.npz` decompression while preserving flexible reporting resolution.
 
 ### CLI Flags
 
