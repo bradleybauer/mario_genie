@@ -1,4 +1,4 @@
-# Mario World Model: Data Generation
+# Mario World Model
 
 This project implements an Action-Conditioned Mario World Model. It focuses on large-scale dataset generation, providing the engine, environments, and chunking storage components required to record gameplay experiences from Super Mario Bros. The collection captures frame observations, actions taken, environment signals, and side information (like coins, scores, and status) into sequenced files for downstream model training.
 
@@ -268,26 +268,24 @@ By targeting a 16x16 latent grid, we achieve **1 discrete token = 1 NES metatile
 
 A native `256x256` input with 4 `compress_space` layers would achieve identical token alignment with sharper pixel fidelity, but was ruled out due to the increased computational cost.
 
-### Capacity Planning for Full-Dataset Training
+### Data Loading Performance
 
-Overfitting 1–2 samples confirms optimization and implementation correctness, but does **not** imply sufficient model capacity for large-scale generalization. As dataset size and diversity increase, reconstruction quality usually drops unless capacity and/or token budget is scaled appropriately.
+The training script uses a three-tier data loading strategy, chosen automatically based on dataset size and available memory:
 
-**Recommended scaling order (highest impact first):**
-1. Increase `init_dim` (e.g. 32 → 64).
-2. Add residual depth (extra `residual` blocks around `compress_space` stages).
-3. Add selective attention (`attend_space`, `attend_time`, or `gateloop_time`) near bottlenecks.
-4. Increase codebook size (e.g. 256 → 512/1024) once encoder-decoder capacity is no longer the bottleneck.
+| Tier | Condition | Speed | Mechanism |
+|---|---|---|---|
+| **GPU cache** | Dataset fits in ≤25% of free VRAM | Fastest (~900 GB/s) | `torch.randint` + GPU tensor gather |
+| **CPU preload** | Dataset fits in RAM (default) | Fast (~30-50 GB/s effective) | Preloaded CPU tensor + background prefetch thread |
+| **DataLoader** | `--no-preload` or fallback | Slowest | Standard PyTorch DataLoader with multiprocessing |
 
-**How to interpret training signals:**
-- **Train recon high + Val recon high**: likely under-capacity (or optimization constraints) → increase architecture capacity.
-- **Train recon low + Val recon high**: likely overfitting or data split/domain issues → improve data/regularization before scaling params.
-- **Good PSNR but blurry textures**: codebook likely too small or quantization too coarse → increase codebook size.
-- **Temporal artifacts/flicker**: add temporal modeling blocks (`attend_time` / `gateloop_time`) rather than only widening spatial conv stacks.
+**Why the GPU cache is ~10x faster than a naïve DataLoader:**
+The naïve DataLoader path has compounding overhead: (1) each `__getitem__` re-opens `.npz` zip archives, (2) per-sample NumPy→Torch conversion in Python, (3) multiprocessing IPC serialization across 16+ workers, and (4) CPU→GPU PCIe transfer at ~32 GB/s vs ~900 GB/s for on-GPU indexing. The GPU cache eliminates all of these — a single `torch.randint` + gather in VRAM.
 
-**Practical staged recipe:**
-- **Stage A**: keep layer topology; increase `init_dim` to 64.
-- **Stage B**: add one extra `residual` block after each `compress_space`.
-- **Stage C**: add one bottleneck `attend_space` and one `attend_time` block.
-- Move to the next stage only if both train and validation reconstruction metrics plateau for multiple epochs.
+**CPU preload tier design (for datasets too large for VRAM):**
+- Data is loaded once at startup into a regular (non-pinned) CPU tensor. Pinned memory bypasses CPU caches, which makes random reads across large tensors ~10x slower — great for DMA, terrible for gathers.
+- A background thread continuously prepares batches: it generates a `randperm` per epoch, sorts indices within each batch for sequential memory access, gathers into a small pinned staging buffer, and enqueues the result. This overlaps CPU gather with GPU compute.
+- The main thread dequeues pre-built pinned batches and transfers with `.to(device, non_blocking=True)` for async DMA.
+
+**Throughput note:** At large batch sizes (e.g. bs=40), iterations-per-second drops significantly compared to bs=2, but **samples-per-second increases** (e.g. 80 samp/s at bs=40 vs 60 samp/s at bs=2). Lower it/s with larger batches reflects longer GPU forward/backward passes, not a data loading bottleneck.
 
 

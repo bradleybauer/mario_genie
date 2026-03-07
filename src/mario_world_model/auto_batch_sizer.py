@@ -1,6 +1,6 @@
 """Automatic batch-size finder for maximising GPU utilisation.
 
-Runs a binary search over batch sizes using synthetic data to find the largest
+Binary-searches over batch sizes using synthetic data to find the largest
 batch that fits in VRAM.  A configurable safety margin is subtracted so that
 the validation forward pass (which also allocates memory) doesn't OOM.
 
@@ -14,7 +14,6 @@ Usage
 from __future__ import annotations
 
 import gc
-import math
 
 import torch
 import torch.nn as nn
@@ -80,11 +79,9 @@ def find_max_batch_size(
     device:
         CUDA device to probe.
     floor:
-        Smallest batch size to consider (guaranteed to be returned if even
-        ``floor`` OOMs — but that would indicate a model too large for the GPU).
+        Smallest batch size to consider (returned even if it OOMs).
     ceiling:
-        Upper bound on the search range.  Kept reasonable to avoid wasting time
-        on impossibly large batches.
+        Upper bound on the search range.
     safety_fraction:
         After finding the raw maximum, the returned batch size is
         ``max(floor, int(raw_max * safety_fraction))`` so that peaks during
@@ -100,35 +97,36 @@ def find_max_batch_size(
 
     was_training = model.training
 
-    # ── Phase 1: exponential growth to find an upper bound ───────────
-    print(f"[auto-batch] Phase 1/2: exponential probing (floor={floor}, ceiling={ceiling}) …")
-    hi = floor
-    while hi <= ceiling:
-        if _try_batch(model, hi, image_size, seq_len, device):
-            hi *= 2
+    # Doubling from 64 to bracket the OOM boundary, then binary search.
+    probe = min(64, ceiling)
+    print(f"[auto-batch] Searching [{floor}, {ceiling}], starting at {probe} …")
+
+    if _try_batch(model, probe, image_size, seq_len, device):
+        lower = probe
+        while probe * 2 <= ceiling:
+            probe *= 2
+            if not _try_batch(model, probe, image_size, seq_len, device):
+                upper = probe
+                break
+            lower = probe
         else:
-            break
-    # hi is now the first power-of-2 that OOM'd (or > ceiling)
-
-    # If hi exceeded ceiling without OOM, ceiling itself was tested and fits.
-    ceiling_fits = hi > ceiling
-
-    upper = min(hi, ceiling)
-    lower = max(floor, upper // 2)
-
-    # If even floor fails, nothing we can do — return floor and hope for the
-    # best (the real training loop will OOM on its own, with a clear message).
-    if upper == floor and not _try_batch(model, floor, image_size, seq_len, device):
-        print(f"[auto-batch] WARNING: even batch_size={floor} OOMs — returning {floor} anyway")
-        model.train(was_training)
-        return floor
-
-    # ── Phase 2: binary search between lower (fits) and upper (OOMs) ─
-    # Skip if ceiling already fits — no OOM boundary to refine.
-    print(f"[auto-batch] Phase 2/2: binary search (lower={lower}, upper={upper}) …")
-    if ceiling_fits:
-        raw_max = ceiling
+            # Doubling couldn't reach ceiling — test it directly
+            if probe < ceiling:
+                if _try_batch(model, ceiling, image_size, seq_len, device):
+                    raw_max = ceiling
+                    lower = upper = ceiling
+                else:
+                    # OOM boundary is between last fit and ceiling
+                    upper = ceiling
+            else:
+                # probe == ceiling and it fit
+                raw_max = ceiling
+                lower = upper = ceiling
     else:
+        upper = probe
+        lower = floor
+
+    if lower != upper:
         while upper - lower > 1:
             mid = (lower + upper) // 2
             if _try_batch(model, mid, image_size, seq_len, device):
@@ -137,8 +135,11 @@ def find_max_batch_size(
                 upper = mid
         raw_max = lower
 
-    # If we never hit OOM (raw_max == ceiling), the safety margin is
-    # unnecessary — there's no OOM edge to back off from.
+    if raw_max < floor or not _try_batch(model, max(raw_max, floor), image_size, seq_len, device):
+        print(f"[auto-batch] WARNING: even batch_size={floor} OOMs — returning {floor} anyway")
+        model.train(was_training)
+        return floor
+
     if raw_max >= ceiling:
         safe = ceiling
     else:

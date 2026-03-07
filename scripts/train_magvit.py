@@ -5,6 +5,8 @@ import glob
 import json
 import math
 import os
+import queue as queue_mod
+import threading
 import time
 from datetime import datetime
 import torch
@@ -95,8 +97,8 @@ class MarioVideoDataset(Dataset):
 
         n = len(self.samples)
         total_mb = n * C * T * H * W * 4 / 2**20  # float32
-        print(f"Pre-loading {n} samples into pinned CPU tensor ({total_mb:.0f} MB)...")
-        self.data = torch.empty(n, C, T, H, W, dtype=torch.float32, pin_memory=True)
+        print(f"Pre-loading {n} samples into CPU tensor ({total_mb:.0f} MB)...")
+        self.data = torch.empty(n, C, T, H, W, dtype=torch.float32)
 
         print(f"Grouping samples by chunk for efficient loading...")
         # Group samples by chunk to open each file only once
@@ -353,7 +355,9 @@ def train():
     metrics_path = os.path.join(args.output_dir, "metrics.json")
     train_start = time.time()
 
-    best_recon_loss = float('inf')
+    smooth_alpha = 0.95
+    smoothed_recon = None
+    best_smoothed_recon = float('inf')
     last_improvement_time = time.time()
     last_image_time = 0.0
 
@@ -368,7 +372,7 @@ def train():
         cpu_cache = raw
 
     def batch_iter():
-        """Yields batches: GPU cache > pinned CPU tensor > DataLoader."""
+        """Yields batches: GPU cache > pinned CPU prefetch > DataLoader."""
         bs = args.batch_size
         if gpu_cache is not None:
             n = gpu_cache.shape[0]
@@ -376,10 +380,27 @@ def train():
                 idx = torch.randint(n, (bs,), device=device)
                 yield gpu_cache[idx]
         elif cpu_cache is not None:
+            # Shuffle-then-stream: sequential RAM reads are 10-50x faster
+            # than random gathers across a large tensor.
             n = cpu_cache.shape[0]
+            sample_shape = cpu_cache.shape[1:]
+            q = queue_mod.Queue(maxsize=3)
+
+            def _prefetch():
+                buf = torch.empty(bs, *sample_shape, dtype=torch.float32, pin_memory=True)
+                while True:
+                    perm = torch.randperm(n)
+                    for start in range(0, n - bs + 1, bs):
+                        idx = perm[start:start + bs]
+                        # Sort indices within batch for sequential memory access
+                        idx, _ = idx.sort()
+                        torch.index_select(cpu_cache, 0, idx, out=buf)
+                        q.put(buf.clone())
+
+            t = threading.Thread(target=_prefetch, daemon=True)
+            t.start()
             while True:
-                idx = torch.randint(n, (bs,))
-                yield cpu_cache[idx]
+                yield q.get()
         else:
             yield from dataloader
 
@@ -408,19 +429,45 @@ def train():
 
         current_lr = optimizer.param_groups[0]['lr']
         recon = loss_breakdown.recon_loss.item()
-        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{recon:.4f}", 'lr': f"{current_lr:.2e}"})
 
+        # Update EMA of recon loss
+        if smoothed_recon is None:
+            smoothed_recon = recon
+        else:
+            smoothed_recon = smooth_alpha * smoothed_recon + (1 - smooth_alpha) * recon
+
+        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{recon:.4f}", 'smooth': f"{smoothed_recon:.4f}", 'lr': f"{current_lr:.2e}"})
+
+        # ── Checkpoint: smoothed trend improved AND raw batch confirms ──
+        if smoothed_recon < best_smoothed_recon - 1e-6 and recon < best_smoothed_recon:
+            best_smoothed_recon = smoothed_recon
+            last_improvement_time = time.time()
+
+        if args.threshold > 0 and smoothed_recon < args.threshold:
+            print(f"\n[threshold] smoothed_recon={smoothed_recon:.6f} < "
+                  f"threshold={args.threshold:.6f}. Stopping.")
+            break
+
+        if args.max_patience is not None and (time.time() - last_improvement_time) >= args.max_patience:
+            print(f"\n[early-stop] No improvement for {time.time() - last_improvement_time:.0f}s "
+                  f"(patience={args.max_patience:.0f}s). "
+                  f"Best smoothed_recon={best_smoothed_recon:.6f}")
+            break
+
+        # ── Periodic logging & image saves ───────────────────────────
         if global_step % args.val_interval == 0:
             step_metrics = {
                 "step": global_step,
                 "loss": loss.item(),
                 "recon_loss": recon,
+                "smoothed_recon_loss": smoothed_recon,
+                "best_smoothed_recon": best_smoothed_recon,
                 "lr": current_lr,
                 "elapsed_s": round(time.time() - train_start, 2),
             }
             metrics_log.append(step_metrics)
 
-            # Expensive eval-mode image generation on a wall-clock schedule
+            # Image generation on a wall-clock schedule
             now = time.time()
             if now - last_image_time >= args.image_interval_secs:
                 last_image_time = now
@@ -435,33 +482,7 @@ def train():
                     recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
                     comparison = torch.cat([original_frames, recon_frames], dim=3)
                     save_image(comparison, os.path.join(args.output_dir, f"step_{global_step:06d}.png"), nrow=1)
-
-                    _, eval_breakdown = tokenizer(batch, return_loss=True)
-                    eval_recon = eval_breakdown.recon_loss.item()
                 tokenizer.train()
-            else:
-                eval_recon = recon  # use train-mode recon for checkpoint decisions
-
-            step_metrics["eval_recon_loss"] = eval_recon
-
-            if eval_recon < best_recon_loss - 1e-6:
-                best_recon_loss = eval_recon
-                last_improvement_time = time.time()
-                torch.save(tokenizer.state_dict(),
-                           os.path.join(args.output_dir, "magvit2_latest.pt"))
-
-            if args.threshold > 0 and eval_recon < args.threshold:
-                print(f"\n[threshold] eval_recon={eval_recon:.6f} < "
-                      f"threshold={args.threshold:.6f}. Stopping.")
-                torch.save(tokenizer.state_dict(),
-                           os.path.join(args.output_dir, "magvit2_latest.pt"))
-                break
-
-            elif args.max_patience is not None and (time.time() - last_improvement_time) >= args.max_patience:
-                print(f"\n[early-stop] No improvement for {time.time() - last_improvement_time:.0f}s "
-                      f"(patience={args.max_patience:.0f}s). "
-                      f"Best recon_loss={best_recon_loss:.6f}")
-                break
 
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_log, f, indent=2)
@@ -469,20 +490,20 @@ def train():
     with open(metrics_path, 'w') as f:
         json.dump(metrics_log, f, indent=2)
 
-    # ── Final reconstruction using best weights ──────────────────────
-    best_ckpt = os.path.join(args.output_dir, "magvit2_latest.pt")
-    if os.path.exists(best_ckpt):
-        tokenizer.load_state_dict(torch.load(best_ckpt, map_location=device))
-        tokenizer.eval()
-        with torch.no_grad():
-            # Use last batch from training loop
-            codes = tokenizer.tokenize(batch)
-            recon_video = tokenizer.decode_from_code_indices(codes)
-            original_frames = batch[0].permute(1, 0, 2, 3)
-            recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
-            comparison = torch.cat([original_frames, recon_frames], dim=3)
-            save_image(comparison, os.path.join(args.output_dir, "final_reconstruction.png"), nrow=1)
-        print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
+    # ── Save checkpoint & final reconstruction ───────────────────────
+    ckpt_path = os.path.join(args.output_dir, "magvit2_best.pt")
+    torch.save(tokenizer.state_dict(), ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path}")
+
+    tokenizer.eval()
+    with torch.no_grad():
+        codes = tokenizer.tokenize(batch)
+        recon_video = tokenizer.decode_from_code_indices(codes)
+        original_frames = batch[0].permute(1, 0, 2, 3)
+        recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
+        comparison = torch.cat([original_frames, recon_frames], dim=3)
+        save_image(comparison, os.path.join(args.output_dir, "final_reconstruction.png"), nrow=1)
+    print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
 
 if __name__ == "__main__":
     train()

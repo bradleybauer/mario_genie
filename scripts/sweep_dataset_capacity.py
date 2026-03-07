@@ -380,8 +380,8 @@ def main():
     parser.add_argument("--output-dir", default="checkpoints/capacity_sweep")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")
-    parser.add_argument("--max-patience", type=float, default=120,
-                        help="Seconds without improvement before early stop (default: 120)")
+    parser.add_argument("--max-patience", type=float, default=12,
+                        help="Minutes without improvement before early stop (default: 12)")
     parser.add_argument("--max-minutes", type=float, default=120,
                         help="Wall-clock minute budget per trial (default: 120)")
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -436,7 +436,7 @@ def main():
         output_dir=args.output_dir,
         max_minutes=args.max_minutes,
         lr=args.lr,
-        patience=args.max_patience,
+        patience=args.max_patience * 60,
         val_interval=args.val_interval,
         batch_size=args.batch_size,
         auto_batch=args.auto_batch,
