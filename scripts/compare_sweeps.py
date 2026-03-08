@@ -14,7 +14,6 @@ Usage:
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 from collections import OrderedDict
@@ -22,6 +21,15 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+LAYER_ABBREVIATIONS = {
+    "compress_space": "cs",
+    "compress_time": "ct",
+    "attend_space": "as",
+    "attend_time": "at",
+    "consecutive_residual": "r",
+}
 
 
 def get_recon_series(metrics: list[dict]) -> tuple[str | None, list[float], list[float]]:
@@ -42,29 +50,79 @@ def extract_dataset_size(run_name: str) -> int | None:
 
 
 def build_run_colors(runs: list[dict]) -> dict[str, tuple[float, float, float, float] | None]:
-    """Assign consistent colors to runs based on dataset-size suffixes."""
-    dataset_sizes = sorted({
-        dataset_size
-        for run in runs
-        if (dataset_size := extract_dataset_size(run["name"])) is not None
-    })
-    if not dataset_sizes:
-        return {run["name"]: None for run in runs}
+    """Assign colors across the compared subset, ordered by dataset-size suffix when present."""
+    if not runs:
+        return {}
+
+    ordered_runs = sorted(
+        runs,
+        key=lambda run: (
+            extract_dataset_size(run["name"]) is None,
+            extract_dataset_size(run["name"]) or 0,
+            run["name"],
+        ),
+    )
 
     cmap = plt.get_cmap("viridis")
-    if len(dataset_sizes) == 1:
-        size_to_color = {dataset_sizes[0]: cmap(0.6)}
+    if len(ordered_runs) == 1:
+        positions = [0.6]
     else:
-        positions = np.linspace(0.1, 0.9, len(dataset_sizes))
-        size_to_color = {
-            dataset_size: cmap(position)
-            for dataset_size, position in zip(dataset_sizes, positions)
-        }
+        positions = np.linspace(0.1, 0.9, len(ordered_runs))
 
     return {
-        run["name"]: size_to_color.get(extract_dataset_size(run["name"]))
-        for run in runs
+        run["name"]: cmap(position)
+        for run, position in zip(ordered_runs, positions)
     }
+
+
+def abbreviate_layer_component(component: str) -> str:
+    """Shorten verbose layer names for compact summary tables."""
+    name, sep, value = component.partition(":")
+    abbreviated_name = LAYER_ABBREVIATIONS.get(name, name)
+    if not sep:
+        return abbreviated_name
+    return f"{abbreviated_name}{sep}{value}"
+
+
+def format_layers(layers: object) -> str:
+    """Render layer definitions with abbreviated component names."""
+    if not isinstance(layers, list):
+        return str(layers)
+
+    formatted_layers = []
+    for layer in layers:
+        if isinstance(layer, list) and len(layer) == 2:
+            formatted_layers.append(
+                abbreviate_layer_component(f"{layer[0]}:{layer[1]}")
+            )
+        else:
+            formatted_layers.append(abbreviate_layer_component(str(layer)))
+    return ",".join(formatted_layers)
+
+
+def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
+    """Fit codebook-usage axis limits to observed values only."""
+    usages = [
+        m["codebook_usage"]
+        for run in runs
+        for m in run["metrics"]
+        if "codebook_usage" in m
+    ]
+    if not usages:
+        return None
+
+    min_usage = min(usages)
+    max_usage = max(usages)
+    if min_usage == max_usage:
+        padding = max(1.0, max_usage * 0.05)
+    else:
+        padding = max(1.0, (max_usage - min_usage) * 0.05)
+
+    lower = max(0.0, min_usage - padding)
+    upper = max_usage + padding
+    if lower == upper:
+        upper = lower + 1.0
+    return lower, upper
 
 
 def discover_runs(results_dir: str) -> list[dict]:
@@ -115,12 +173,7 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         total_steps = last.get("step", 0)
         elapsed_s = last.get("elapsed_s", 0)
 
-        layers_str = cfg.get("layers", "?")
-        if isinstance(layers_str, list):
-            layers_str = ",".join(
-                f"{l[0]}:{l[1]}" if isinstance(l, list) else str(l)
-                for l in layers_str
-            )
+        layers_str = format_layers(cfg.get("layers", "?"))
 
         rows.append(OrderedDict([
             ("name", run["name"]),
@@ -228,6 +281,9 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
                 )[0]
                 if cb_size is not None:
                     ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.6)
+        usage_ylim = get_codebook_usage_ylim(sorted_runs)
+        if usage_ylim is not None:
+            ax.set_ylim(*usage_ylim)
         ax.set_ylabel("Unique codes used")
         ax.set_title("Codebook Usage")
         ax.legend(fontsize=7, ncol=2)
