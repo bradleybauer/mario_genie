@@ -8,7 +8,9 @@ metrics.json, then produces:
 
 Usage:
     python scripts/compare_sweeps.py --results-dir checkpoints/magvit2
+    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 results/capacity_sweep
     python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 -o sweep_comparison.png
+    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 --x-axis step
 """
 
 import argparse
@@ -32,7 +34,11 @@ LAYER_ABBREVIATIONS = {
     "residual": "r",
 }
 
-DISTINCT_COLORS = list(plt.get_cmap("tab10").colors) + list(plt.get_cmap("Dark2").colors)
+DISTINCT_COLORS = [
+    tuple(color) for color in plt.get_cmap("tab10")(np.linspace(0, 1, 10))
+] + [
+    tuple(color) for color in plt.get_cmap("Dark2")(np.linspace(0, 1, 8))
+]
 LINE_STYLES = ["-", "--", "-.", ":"]
 
 
@@ -45,13 +51,21 @@ def get_recon_values(metrics: list[dict]) -> tuple[str | None, list[float]]:
     return None, []
 
 
-def get_recon_series(metrics: list[dict]) -> tuple[str | None, list[float], list[float]]:
+def get_x_axis_metadata(x_axis: str) -> tuple[str, float, str]:
+    """Return the metric key, scale factor, and label for the chosen x-axis."""
+    if x_axis == "time":
+        return "elapsed_s", 1.0 / 3600.0, "Elapsed Time (hours)"
+    return "step", 1.0, "Step"
+
+
+def get_recon_series(metrics: list[dict], x_axis: str) -> tuple[str | None, list[float], list[float]]:
     """Return the preferred reconstruction-loss series for plotting."""
     key, _ = get_recon_values(metrics)
     if key is not None:
-        points = [m for m in metrics if key in m and "step" in m]
+        axis_key, axis_scale, _ = get_x_axis_metadata(x_axis)
+        points = [m for m in metrics if key in m and axis_key in m]
         if points:
-            return key, [m["step"] for m in points], [m[key] for m in points]
+            return key, [m[axis_key] * axis_scale for m in points], [m[key] for m in points]
     return None, [], []
 
 
@@ -139,29 +153,38 @@ def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
     return lower, upper
 
 
-def discover_runs(results_dir: str) -> list[dict]:
-    """Find all directories under the results tree with config.json and metrics.json."""
+def discover_runs(results_dirs: list[str]) -> list[dict]:
+    """Find all directories under one or more results trees with config.json and metrics.json."""
     runs = []
-    base = Path(results_dir)
-    candidates = [base]
-    if base.is_dir():
-        candidates.extend(sorted(path for path in base.rglob("*") if path.is_dir()))
-    for d in candidates:
-        config_path = d / "config.json"
-        metrics_path = d / "metrics.json"
-        if config_path.exists() and metrics_path.exists():
-            with open(config_path) as f:
-                config = json.load(f)
-            with open(metrics_path) as f:
-                metrics = json.load(f)
-            if metrics:  # skip empty
-                run_name = d.relative_to(base).as_posix() if d != base else d.name
-                runs.append({
-                    "name": run_name,
-                    "dir": str(d),
-                    "config": config,
-                    "metrics": metrics,
-                })
+    bases = [Path(results_dir) for results_dir in results_dirs]
+    include_base_prefix = len(bases) > 1
+
+    for base in bases:
+        candidates = [base]
+        if base.is_dir():
+            candidates.extend(sorted(path for path in base.rglob("*") if path.is_dir()))
+        base_label = base.as_posix()
+
+        for d in candidates:
+            config_path = d / "config.json"
+            metrics_path = d / "metrics.json"
+            if config_path.exists() and metrics_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+                with open(metrics_path) as f:
+                    metrics = json.load(f)
+                if metrics:  # skip empty
+                    if d == base:
+                        run_name = base_label if include_base_prefix else d.name
+                    else:
+                        relative_name = d.relative_to(base).as_posix()
+                        run_name = f"{base_label}/{relative_name}" if include_base_prefix else relative_name
+                    runs.append({
+                        "name": run_name,
+                        "dir": str(d),
+                        "config": config,
+                        "metrics": metrics,
+                    })
     return runs
 
 
@@ -236,13 +259,14 @@ def save_csv(rows: list[OrderedDict], path: str) -> None:
     print(f"Saved CSV to {path}")
 
 
-def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
+def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: str = "step") -> None:
     if not runs:
         print("Nothing to plot.")
         return
 
     has_cb = any("codebook_usage" in m for run in runs for m in run["metrics"])
     has_smoothed_recon = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
+    axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
     run_styles = build_run_styles(runs)
     nrows = 2 if has_cb else 1
     fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True)
@@ -252,21 +276,21 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
     # Sort runs by the best available reconstruction curve so the legend is ordered.
     sorted_runs = sorted(
         runs,
-        key=lambda r: min(get_recon_series(r["metrics"])[2], default=float("inf")),
+        key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
     )
 
     # --- Recon loss ---
     ax = axes[0]
     for run in sorted_runs:
-        _, steps, recon = get_recon_series(run["metrics"])
-        if steps:
+        _, x_values, recon = get_recon_series(run["metrics"], x_axis)
+        if x_values:
             style = run_styles[run["name"]]
             label = run["name"]
             params = run["config"].get("num_parameters", 0)
             if params:
                 label += f" ({params / 1e6:.1f}M)"
             ax.plot(
-                steps,
+                x_values,
                 recon,
                 label=label,
                 color=style["color"],
@@ -288,8 +312,9 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
         for run in sorted_runs:
             metrics = run["metrics"]
             style = run_styles[run["name"]]
-            cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
-            cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
+            cb_points = [m for m in metrics if "codebook_usage" in m and axis_key in m]
+            cb_steps = [m[axis_key] * axis_scale for m in cb_points]
+            cb_usage = [m["codebook_usage"] for m in cb_points]
             if cb_steps:
                 cb_size = run["config"].get("codebook_size", None)
                 label = run["name"]
@@ -314,7 +339,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
         ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Step")
+    axes[-1].set_xlabel(axis_label)
     fig.tight_layout()
 
     if output_path:
@@ -326,14 +351,16 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results-dir", type=str, default="checkpoints/magvit2",
-                        help="Directory containing run folders anywhere under it")
+    parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/magvit2"],
+                        help="One or more directories containing run folders anywhere under them")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Save comparison plot to file (e.g. sweep_comparison.png)")
     parser.add_argument("--csv", type=str, default=None,
                         help="Save summary table as CSV")
     parser.add_argument("--filter", type=str, default=None,
                         help="Only include runs whose name contains this substring")
+    parser.add_argument("--x-axis", choices=("time", "step"), default="step",
+                        help="X-axis for plots: elapsed time in hours or training step")
     args = parser.parse_args()
 
     runs = discover_runs(args.results_dir)
@@ -341,10 +368,12 @@ def main():
         runs = [r for r in runs if args.filter in r["name"]]
 
     if not runs:
-        print(f"No runs found in {args.results_dir}", file=sys.stderr)
+        searched_dirs = ", ".join(args.results_dir)
+        print(f"No runs found in {searched_dirs}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(runs)} run(s) in {args.results_dir}\n")
+    searched_dirs = ", ".join(args.results_dir)
+    print(f"Found {len(runs)} run(s) in {searched_dirs}\n")
 
     rows = summarise(runs)
     print_table(rows)
@@ -353,7 +382,7 @@ def main():
     if args.csv:
         save_csv(rows, args.csv)
 
-    plot_comparison(runs, output_path=args.output)
+    plot_comparison(runs, output_path=args.output, x_axis=args.x_axis)
 
 
 if __name__ == "__main__":
