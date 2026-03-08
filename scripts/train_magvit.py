@@ -1,7 +1,6 @@
 import argparse
 import concurrent.futures
 from collections import defaultdict
-import glob
 import json
 import math
 import os
@@ -29,6 +28,7 @@ from tqdm import tqdm
 
 from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
 from mario_world_model.auto_batch_sizer import find_max_batch_size
+from mario_world_model.dataset_paths import find_chunk_files
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 
 def _count_scene_cuts(npz, seq_idx, t_start, seq_len):
@@ -77,7 +77,7 @@ def _index_chunk(chunk_idx, filepath, seq_len):
 
 class MarioVideoDataset(Dataset):
     def __init__(self, data_dir, seq_len=4, preload=True, subset_n=0, seed=42):
-        self.chunk_files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+        self.chunk_files = find_chunk_files(data_dir)
         self.seq_len = seq_len
         self.samples = []
         
@@ -169,7 +169,12 @@ class MarioVideoDataset(Dataset):
 
 def train():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to chunk files")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        required=True,
+        help="Path to chunk files or a parent directory containing nested chunk folders",
+    )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
         "--auto-batch-size", action="store_true",

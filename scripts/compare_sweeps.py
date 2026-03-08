@@ -15,12 +15,56 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from collections import OrderedDict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+
+def get_recon_series(metrics: list[dict]) -> tuple[str | None, list[float], list[float]]:
+    """Return the preferred reconstruction-loss series for plotting."""
+    for key in ("smoothed_recon_loss", "recon_loss"):
+        points = [m for m in metrics if key in m and "step" in m]
+        if points:
+            return key, [m["step"] for m in points], [m[key] for m in points]
+    return None, [], []
+
+
+def extract_dataset_size(run_name: str) -> int | None:
+    """Extract the dataset size from a run name ending in _n<k>."""
+    match = re.search(r"_n(\d+)$", run_name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def build_run_colors(runs: list[dict]) -> dict[str, tuple[float, float, float, float] | None]:
+    """Assign consistent colors to runs based on dataset-size suffixes."""
+    dataset_sizes = sorted({
+        dataset_size
+        for run in runs
+        if (dataset_size := extract_dataset_size(run["name"])) is not None
+    })
+    if not dataset_sizes:
+        return {run["name"]: None for run in runs}
+
+    cmap = plt.get_cmap("viridis")
+    if len(dataset_sizes) == 1:
+        size_to_color = {dataset_sizes[0]: cmap(0.6)}
+    else:
+        positions = np.linspace(0.1, 0.9, len(dataset_sizes))
+        size_to_color = {
+            dataset_size: cmap(position)
+            for dataset_size, position in zip(dataset_sizes, positions)
+        }
+
+    return {
+        run["name"]: size_to_color.get(extract_dataset_size(run["name"]))
+        for run in runs
+    }
 
 
 def discover_runs(results_dir: str) -> list[dict]:
@@ -131,35 +175,34 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
         return
 
     has_cb = any("codebook_usage" in m for run in runs for m in run["metrics"])
+    has_smoothed_recon = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
+    run_colors = build_run_colors(runs)
     nrows = 2 if has_cb else 1
     fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True)
     if nrows == 1:
         axes = [axes]
 
-    # Sort runs by final recon loss so the legend is ordered
+    # Sort runs by the best available reconstruction curve so the legend is ordered.
     sorted_runs = sorted(
         runs,
-        key=lambda r: min(
-            (m["recon_loss"] for m in r["metrics"] if "recon_loss" in m),
-            default=float("inf"),
-        ),
+        key=lambda r: min(get_recon_series(r["metrics"])[2], default=float("inf")),
     )
 
     # --- Recon loss ---
     ax = axes[0]
     for run in sorted_runs:
-        metrics = run["metrics"]
-        steps = [m["step"] for m in metrics if "recon_loss" in m]
-        recon = [m["recon_loss"] for m in metrics if "recon_loss" in m]
+        _, steps, recon = get_recon_series(run["metrics"])
         if steps:
             label = run["name"]
             params = run["config"].get("num_parameters", 0)
             if params:
                 label += f" ({params / 1e6:.1f}M)"
-            ax.plot(steps, recon, label=label, alpha=0.8, linewidth=1.0)
-    ax.set_ylabel("Reconstruction Loss")
+            ax.plot(steps, recon, label=label, color=run_colors[run["name"]], alpha=0.8, linewidth=1.0)
+    ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
+    title = "Smoothed Reconstruction Loss Comparison" if has_smoothed_recon else "Reconstruction Loss Comparison"
+    ax.set_ylabel(ylabel)
     ax.set_yscale("log")
-    ax.set_title("Reconstruction Loss Comparison")
+    ax.set_title(title)
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.3)
 
@@ -173,7 +216,16 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
             if cb_steps:
                 cb_size = run["config"].get("codebook_size", None)
                 label = run["name"]
-                line = ax.plot(cb_steps, cb_usage, marker=".", markersize=2, label=label, alpha=0.7, linewidth=0.8)[0]
+                line = ax.plot(
+                    cb_steps,
+                    cb_usage,
+                    marker=".",
+                    markersize=2,
+                    label=label,
+                    color=run_colors[run["name"]],
+                    alpha=0.7,
+                    linewidth=0.8,
+                )[0]
                 if cb_size is not None:
                     ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.6)
         ax.set_ylabel("Unique codes used")

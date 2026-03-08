@@ -20,6 +20,7 @@ Algorithm per model:
     5. Record max_dataset_size.
 """
 
+import random
 import argparse
 import json
 import math
@@ -28,6 +29,17 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from mario_world_model.dataset_paths import find_chunk_files
 
 
 # ---------------------------------------------------------------------------
@@ -40,11 +52,24 @@ class ScaleConfig:
     residual_blocks: tuple[int, int, int, int]
 
 
-def build_open_genie_layers(init_dim: int, residual_blocks: tuple[int, int, int, int]) -> str:
+@dataclass(frozen=True)
+class AttentionVariant:
+    name: str
+    suffix: str
+    enabled: bool = False
+
+
+def build_open_genie_layers(
+    init_dim: int,
+    residual_blocks: tuple[int, int, int, int],
+    *,
+    use_attention: bool = False,
+) -> str:
     """Approximate the Open-Genie MAGVIT hierarchy with MAGVIT-2 layer primitives."""
     stage2_dim = init_dim * 2
     stage3_dim = init_dim * 4
     blocks_1, blocks_2, blocks_3, blocks_4 = residual_blocks
+    attention_layers = ["attend_space", "attend_time"] if use_attention else []
 
     layers = [
         f"consecutive_residual:{blocks_1}",
@@ -52,18 +77,25 @@ def build_open_genie_layers(init_dim: int, residual_blocks: tuple[int, int, int,
         f"consecutive_residual:{blocks_2}",
         f"compress_time:{stage2_dim}",
         f"compress_space:{stage2_dim}",
+        *attention_layers,
         f"consecutive_residual:{blocks_3}",
         f"compress_time:{stage3_dim}",
         f"compress_space:{stage3_dim}",
+        *attention_layers,
         f"consecutive_residual:{blocks_4}",
     ]
     return ",".join(layers)
 
 
 SCALE_CONFIGS = {
-    "genie_tiny": ScaleConfig(name="genie_tiny", residual_blocks=(2, 2, 2, 2)),
+    # "genie_tiny": ScaleConfig(name="genie_tiny", residual_blocks=(2, 2, 2, 2)),
     "genie_small": ScaleConfig(name="genie_small", residual_blocks=(2, 4, 4, 4)),
     "genie_base": ScaleConfig(name="genie_base", residual_blocks=(4, 4, 4, 8)),
+}
+
+ATTENTION_VARIANTS = {
+    "plain": AttentionVariant(name="plain", suffix="", enabled=False),
+    "attn": AttentionVariant(name="attn", suffix="_attn", enabled=True),
 }
 
 
@@ -74,29 +106,41 @@ class ModelConfig:
     codebook_size: int
     layers: str
     scale_name: str
+    attention_name: str
 
 
-DIMS = [32, 64]
-CODEBOOK_SIZES = [8192, 16384, 32768, 65536]
+CODEBOOK_SIZES = [65536, 32768, 16384]
 
 # Simpler scales run first so early-exit pruning is more useful.
 SCALE_COMPLEXITY = {
-    "genie_tiny": 0,
+    # "genie_tiny": 0,
     "genie_small": 1,
     "genie_base": 2,
 }
 
+ATTENTION_COMPLEXITY = {
+    "plain": 0,
+    "attn": 1,
+}
+
+DIMS = [64, 32]
 MODEL_CONFIGS = [
     ModelConfig(
-        name=f"dim{dim}_cb{cb}_{scale.name}",
+        name=f"dim{dim}_cb{cb}_{scale.name}{variant.suffix}",
         init_dim=dim,
         codebook_size=cb,
-        layers=build_open_genie_layers(dim, scale.residual_blocks),
+        layers=build_open_genie_layers(
+            dim,
+            scale.residual_blocks,
+            use_attention=variant.enabled,
+        ),
         scale_name=scale.name,
+        attention_name=variant.name,
     )
     for dim in DIMS
     for cb in CODEBOOK_SIZES
     for scale in SCALE_CONFIGS.values()
+    for variant in ATTENTION_VARIANTS.values()
 ]
 
 
@@ -174,9 +218,8 @@ def _count_chunk(filepath: str, seq_len: int) -> int:
 def get_total_samples(data_dir: str, seq_len: int = 16) -> int:
     """Count samples the same way MarioVideoDataset does."""
     import concurrent.futures
-    import glob
 
-    chunk_files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    chunk_files = find_chunk_files(data_dir)
     total = 0
     with concurrent.futures.ThreadPoolExecutor() as pool:
         futures = [pool.submit(_count_chunk, f, seq_len) for f in chunk_files]
@@ -305,6 +348,24 @@ def write_summary(summary_path: str, threshold: float, total_samples: int, resul
     }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
+
+
+def resolve_global_best_max(
+    *,
+    completed_results: dict[str, ModelResult],
+    initial_global_best: int,
+    total_samples: int,
+) -> int:
+    """Resolve the starting global best, clamped to the current dataset size."""
+    if initial_global_best < 0:
+        raise ValueError("initial_global_best must be non-negative")
+
+    completed_best = max(
+        (result.max_dataset_size for result in completed_results.values()),
+        default=0,
+    )
+    requested_best = min(initial_global_best, total_samples)
+    return max(completed_best, requested_best)
 
 
 def build_train_cmd(
@@ -557,6 +618,8 @@ def main():
     parser.add_argument("--max-samples", type=int, default=0,
                         help="Override upper bound for dataset size "
                              "(0 = auto-detect from data)")
+    parser.add_argument("--initial-global-best", type=int, default=0,
+                        help="Seed the sweep with a known best passing dataset size")
     parser.add_argument("--filter", type=str, default=None,
                         help="Only run models whose name contains this substring")
     parser.add_argument("--dry-run", action="store_true",
@@ -565,12 +628,22 @@ def main():
                         help="Skip trials whose metrics.json already exists")
     args = parser.parse_args()
 
+    if args.initial_global_best < 0:
+        parser.error("--initial-global-best must be non-negative")
+
     # ── Select model configs ─────────────────────────────────────────────
-    # Sort from simplest to most complex: scale depth, then width, then codebook.
-    configs = sorted(
-        MODEL_CONFIGS,
-        key=lambda c: (SCALE_COMPLEXITY[c.scale_name], c.init_dim, c.codebook_size),
-    )
+    # # Sort from simplest to most complex: scale depth, then attention, then width, then codebook.
+    # configs = sorted(
+    #     MODEL_CONFIGS,
+    #     key=lambda c: (
+    #         SCALE_COMPLEXITY[c.scale_name],
+    #         ATTENTION_COMPLEXITY[c.attention_name],
+    #         c.init_dim,
+    #         c.codebook_size,
+    #     ),
+    # )
+    configs = MODEL_CONFIGS.copy()
+    random.shuffle(configs)
     if args.filter:
         configs = [c for c in configs if args.filter in c.name]
         if not configs:
@@ -618,10 +691,19 @@ def main():
     # ── Run sweep ────────────────────────────────────────────────────────
     print(f"\nSweeping {len(configs)} model(s), threshold={args.threshold}")
     all_results: list[ModelResult] = []
-    global_best_max = max(
-        (r.max_dataset_size for r in completed_results.values()),
-        default=0,
+    if args.initial_global_best > total_samples:
+        print(
+            f"[init] Clamping requested initial global best from "
+            f"{args.initial_global_best} to dataset upper bound {total_samples}"
+        )
+
+    global_best_max = resolve_global_best_max(
+        completed_results=completed_results,
+        initial_global_best=args.initial_global_best,
+        total_samples=total_samples,
     )
+    if global_best_max > 0:
+        print(f"[init] Starting global best dataset size: {global_best_max}")
 
     for model in configs:
         if model.name in completed_results:

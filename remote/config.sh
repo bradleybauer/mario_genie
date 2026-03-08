@@ -6,6 +6,7 @@
 #
 # to scroll up in tmux session: Ctrl-b then [ then pgup/pgdn or arrow keys, q to exit scroll mode
 
+#h100
 REMOTE_HOST="154.57.34.100"
 REMOTE_PORT=19805
 REMOTE_USER="root"

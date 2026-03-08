@@ -102,47 +102,59 @@ def find_max_batch_size(
         device = torch.device(device)
 
     was_training = model.training
-    raw_max = floor
+    lower_fit: int | None = None
 
-    # Doubling from 64 to bracket the OOM boundary, then binary search.
-    probe = min(64, ceiling)
+    # Start near 64 for efficiency, but never below the requested floor.
+    probe = min(max(floor, 64), ceiling)
     print(f"[auto-batch] Searching [{floor}, {ceiling}], starting at {probe} …")
 
     if _try_batch(model, probe, image_size, seq_len, device, video_contains_first_frame):
         lower = probe
+        lower_fit = probe
         while probe * 2 <= ceiling:
             probe *= 2
             if not _try_batch(model, probe, image_size, seq_len, device, video_contains_first_frame):
                 upper = probe
                 break
             lower = probe
+            lower_fit = probe
         else:
             # Doubling couldn't reach ceiling — test it directly
             if probe < ceiling:
                 if _try_batch(model, ceiling, image_size, seq_len, device, video_contains_first_frame):
-                    raw_max = ceiling
+                    lower_fit = ceiling
                     lower = upper = ceiling
                 else:
                     # OOM boundary is between last fit and ceiling
                     upper = ceiling
             else:
                 # probe == ceiling and it fit
-                raw_max = ceiling
+                lower_fit = ceiling
                 lower = upper = ceiling
     else:
         upper = probe
         lower = floor
 
-    if lower != upper:
+    if lower_fit is not None and lower == upper:
+        raw_max = lower_fit
+    else:
         while upper - lower > 1:
             mid = (lower + upper) // 2
             if _try_batch(model, mid, image_size, seq_len, device, video_contains_first_frame):
                 lower = mid
+                lower_fit = mid
             else:
                 upper = mid
-        raw_max = lower
+        if lower_fit is None:
+            if not _try_batch(model, floor, image_size, seq_len, device, video_contains_first_frame):
+                print(f"[auto-batch] WARNING: even batch_size={floor} OOMs — returning {floor} anyway")
+                model.train(was_training)
+                return floor
+            raw_max = floor
+        else:
+            raw_max = lower_fit
 
-    if raw_max < floor or not _try_batch(model, max(raw_max, floor), image_size, seq_len, device, video_contains_first_frame):
+    if raw_max < floor:
         print(f"[auto-batch] WARNING: even batch_size={floor} OOMs — returning {floor} anyway")
         model.train(was_training)
         return floor
