@@ -439,10 +439,10 @@ def build_vector_env(
 def _build_replay_pool(
     output_dir: Path,
     progression_bin_size: int,
-) -> list[tuple[tuple[int, int], list[int], int, float]]:
+) -> list[tuple[tuple[int, int], list[int], int, float, int]]:
     """Scan progression coverage + rollouts, return weighted replay pool.
 
-    Returns a list of ``(level, actions, target_step, weight)`` tuples that
+    Returns a list of ``(level, actions, target_step, weight, x_bin)`` tuples that
     can be fed directly to ``RandomLevelMarioEnv.update_progression_balance()``.
     """
     prog_cov = scan_progression_coverage(str(output_dir), bin_size=progression_bin_size)
@@ -451,13 +451,13 @@ def _build_replay_pool(
     prog_rpt = compute_progression_balance(prog_cov, reachable, bin_size=progression_bin_size)
     print_progression_guidance(prog_rpt, n=5)
 
-    pool: list[tuple[tuple[int, int], list[int], int, float]] = []
+    pool: list[tuple[tuple[int, int], list[int], int, float, int]] = []
     for (w, s, b), weight in prog_rpt.weights.items():
         if weight <= 0:
             continue
         if b == 0:
             # Bin 0 = level start — zero-step replay (just selects the level)
-            pool.append(((w, s), [], 0, weight))
+            pool.append(((w, s), [], 0, weight, b))
             continue
         all_replays = ri.find_all_replay_actions(w, s, b, bin_size=progression_bin_size)
         if not all_replays:
@@ -465,7 +465,7 @@ def _build_replay_pool(
         # Split the bin's weight equally across candidate rollouts
         per_rollout_weight = weight / len(all_replays)
         for actions_list, target_step in all_replays:
-            pool.append(((w, s), actions_list, target_step, per_rollout_weight))
+            pool.append(((w, s), actions_list, target_step, per_rollout_weight, b))
 
     return pool
 

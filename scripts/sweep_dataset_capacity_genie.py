@@ -127,9 +127,24 @@ class ModelResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _count_scene_cuts(npz, seq_idx: int, t_start: int, seq_len: int) -> int:
+    if "world" in npz.files and "stage" in npz.files:
+        world_window = np.asarray(npz["world"][seq_idx, t_start : t_start + seq_len])
+        stage_window = np.asarray(npz["stage"][seq_idx, t_start : t_start + seq_len])
+        if len(world_window) <= 1:
+            return 0
+        transitions = (world_window[1:] != world_window[:-1]) | (stage_window[1:] != stage_window[:-1])
+        return int(np.count_nonzero(transitions))
+
+    if "dones" in npz.files:
+        done_window = np.asarray(npz["dones"][seq_idx, t_start : t_start + seq_len], dtype=bool)
+        return int(np.count_nonzero(done_window[:-1]))
+
+    return 0
+
+
 def _count_chunk(filepath: str, seq_len: int) -> int:
-    """Count valid samples in a single chunk file."""
-    import numpy as np
+    """Count fixed-length samples with fewer than two scene cuts."""
     try:
         meta_path = filepath.replace(".npz", ".meta.json")
         if os.path.exists(meta_path):
@@ -145,19 +160,19 @@ def _count_chunk(filepath: str, seq_len: int) -> int:
             return 0
 
         npz = np.load(filepath, mmap_mode="r")
-        dones = np.array(npz["dones"])
         count = 0
         for i in range(num_seqs):
             for t in range(0, total_t - seq_len + 1, seq_len):
-                if not np.any(dones[i, t : t + seq_len - 1]):
-                    count += 1
+                if _count_scene_cuts(npz, i, t, seq_len) >= 2:
+                    continue
+                count += 1
         return count
     except Exception:
         return 0
 
 
 def get_total_samples(data_dir: str, seq_len: int = 16) -> int:
-    """Count valid samples the same way MarioVideoDataset does."""
+    """Count samples the same way MarioVideoDataset does."""
     import concurrent.futures
     import glob
 
@@ -570,9 +585,9 @@ def main():
         total_samples = 18000  # placeholder for dry-run
         print(f"Upper bound: ~{total_samples} (estimate, dry-run)")
     else:
-        print("Counting valid samples in dataset...")
+        print("Counting samples in dataset (skipping windows with >=2 scene cuts)...")
         total_samples = get_total_samples(args.data_dir)
-        print(f"Upper bound: {total_samples} valid samples")
+        print(f"Upper bound: {total_samples} samples")
 
     if total_samples < 2:
         print("Dataset too small.")

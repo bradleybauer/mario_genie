@@ -31,6 +31,22 @@ from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS
 from mario_world_model.auto_batch_sizer import find_max_batch_size
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 
+def _count_scene_cuts(npz, seq_idx, t_start, seq_len):
+    if "world" in npz.files and "stage" in npz.files:
+        world_window = np.asarray(npz["world"][seq_idx, t_start:t_start+seq_len])
+        stage_window = np.asarray(npz["stage"][seq_idx, t_start:t_start+seq_len])
+        if len(world_window) <= 1:
+            return 0
+        transitions = (world_window[1:] != world_window[:-1]) | (stage_window[1:] != stage_window[:-1])
+        return int(np.count_nonzero(transitions))
+
+    if "dones" in npz.files:
+        done_window = np.asarray(npz["dones"][seq_idx, t_start:t_start+seq_len], dtype=bool)
+        return int(np.count_nonzero(done_window[:-1]))
+
+    return 0
+
+
 def _index_chunk(chunk_idx, filepath, seq_len):
     """Index a single chunk file. Returns list of (chunk_idx, seq_idx, t_start) tuples."""
     try:
@@ -48,13 +64,10 @@ def _index_chunk(chunk_idx, filepath, seq_len):
             return []
 
         npz = np.load(filepath, mmap_mode='r')
-        dones = np.array(npz['dones'])
-
         samples = []
         for i in range(num_seqs):
             for t in range(0, total_t - seq_len + 1, seq_len):
-                window_dones = dones[i, t:t+seq_len]
-                if np.any(window_dones[:-1]):
+                if _count_scene_cuts(npz, i, t, seq_len) >= 2:
                     continue
                 samples.append((chunk_idx, i, t))
         return samples
