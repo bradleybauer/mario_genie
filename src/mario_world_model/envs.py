@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import random
 from typing import Optional
 
@@ -10,6 +11,17 @@ import numpy as np
 from shimmy import GymV21CompatibilityV0
 
 from mario_world_model.actions import apply_action_space
+
+
+ROLLOUT_PREFIX_INFO_KEY = "rollout_prefix_json"
+
+
+def _encode_rollout_prefix(actions: list[int], x_positions: list[int]) -> str:
+    payload = {
+        "actions": [int(action) for action in actions],
+        "x_positions": [int(x_pos) for x_pos in x_positions],
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _load_super_mario_bros_env_class():
@@ -43,6 +55,9 @@ def default_level_pool() -> list[tuple[int, int]]:
     return [(world, stage) for world in range(1, 9) for stage in range(1, 5)]
 
 
+ReplayPoolEntry = tuple[tuple[int, int], list[int], int, float, int]
+
+
 class RandomLevelMarioEnv(gym.Env):
     def __init__(
         self,
@@ -66,8 +81,8 @@ class RandomLevelMarioEnv(gym.Env):
         self._pending_replay: Optional[dict] = None
 
         # Persistent replay pool for progression balance.
-        # Each entry: (level, actions, target_step, weight)
-        self._replay_pool: list[tuple[tuple[int, int], list[int], int, float]] = []
+        # Each entry: (level, actions, target_step, weight, x_bin)
+        self._replay_pool: list[ReplayPoolEntry] = []
         self._replay_probability: float = 0.0  # probability of doing a replay on each reset
 
         initial_world, initial_stage = self._sample_level()
@@ -113,7 +128,7 @@ class RandomLevelMarioEnv(gym.Env):
             pass
 
     def _try_replay(
-        self, replay: dict, seed: Optional[int], pool_entry: Optional[tuple] = None,
+        self, replay: dict, seed: Optional[int], pool_entry: Optional[ReplayPoolEntry] = None,
     ) -> Optional[tuple]:
         """Attempt a single replay.  Returns ``(obs, info)`` on success, ``None`` on failure.
 
@@ -127,11 +142,13 @@ class RandomLevelMarioEnv(gym.Env):
 
         # --- Fast-forward phase ---
         replayed_steps = 0
+        replay_x_positions: list[int] = []
         if target_step > 0 and actions:
             print(f"[replay] Attempting replay: World {world}-{stage}, {target_step} steps")
             for i in range(min(target_step, len(actions))):
                 obs, _, terminated, truncated, info = self._env.step(actions[i])
                 replayed_steps += 1
+                replay_x_positions.append(int(info.get("x_pos", 0)))
                 if terminated or truncated:
                     print(f"[replay] FAILED at step {replayed_steps}/{target_step} "
                           f"(Mario died during fast-forward) — removing from pool")
@@ -144,6 +161,10 @@ class RandomLevelMarioEnv(gym.Env):
         info["stage"] = int(stage)
         info["replayed_to_x"] = int(info.get("x_pos", 0))
         info["replayed_steps"] = replayed_steps
+        info[ROLLOUT_PREFIX_INFO_KEY] = _encode_rollout_prefix(
+            actions=list(actions[:replayed_steps]),
+            x_positions=replay_x_positions,
+        )
         if replayed_steps > 0:
             print(f"[replay] SUCCESS: World {world}-{stage} at x={info['replayed_to_x']} "
                   f"({replayed_steps} steps replayed)")
@@ -165,7 +186,12 @@ class RandomLevelMarioEnv(gym.Env):
             if replay is None and self._replay_pool and self.rng.random() < self._replay_probability:
                 pool_weights = [entry[3] for entry in self._replay_pool]
                 chosen = self.rng.choices(self._replay_pool, weights=pool_weights, k=1)[0]
-                level, actions, target_step, _w = chosen
+                level, actions, target_step, entry_weight, x_bin = chosen
+                world, stage = level
+                print(
+                    f"[replay] Selected choice: World {world}-{stage}, bin={x_bin}, "
+                    f"target_step={target_step}, weight={entry_weight:.4f}"
+                )
                 replay = {"level": level, "actions": actions, "target_step": target_step}
                 pool_entry = chosen
 
@@ -194,11 +220,14 @@ class RandomLevelMarioEnv(gym.Env):
         info = dict(info)
         info["world"] = int(world)
         info["stage"] = int(stage)
+        info["replayed_to_x"] = 0
+        info["replayed_steps"] = 0
+        info[ROLLOUT_PREFIX_INFO_KEY] = _encode_rollout_prefix(actions=[], x_positions=[])
         return obs, info
 
     def update_progression_balance(
         self,
-        replay_pool: list[tuple[tuple[int, int], list[int], int, float]],
+        replay_pool: list[ReplayPoolEntry],
         replay_probability: float = 1.0,
     ) -> None:
         """Configure automatic progression-based replays on future resets.
@@ -211,7 +240,7 @@ class RandomLevelMarioEnv(gym.Env):
         Parameters
         ----------
         replay_pool
-            List of ``(level, actions, target_step, weight)`` tuples.
+            List of ``(level, actions, target_step, weight, x_bin)`` tuples.
         replay_probability
             Probability of doing a replay vs. a normal level start on each
             reset.  ``0.5`` means half the episodes start mid-level.

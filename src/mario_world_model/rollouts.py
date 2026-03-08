@@ -20,7 +20,7 @@ Key classes
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -43,14 +43,19 @@ PROGRESSION_BIN_SIZE: int = DEFAULT_PROGRESSION_BIN_SIZE
 
 @dataclass
 class Rollout:
-    """A complete episode record (lightweight – no frames)."""
+    """A complete episode record (lightweight - no frames).
+
+    ``actions`` and ``x_positions`` always describe the full trajectory from
+    level start to episode end, including any replay prefix executed during
+    reset before live collection resumed.
+    """
 
     world: int
     stage: int
     actions: list[int]
     x_positions: list[int]
     max_x: int
-    outcome: str  # "death" | "flag" | "timeout"
+    outcome: str  # "death" | "flag" | "timeout" | "transition"
     num_steps: int
 
     def to_json_line(self) -> str:
@@ -122,12 +127,55 @@ class EpisodeTracker:
         self._world: list[int] = [1] * num_envs
         self._stage: list[int] = [1] * num_envs
         self._prev_life: list[int] = [2] * num_envs  # Mario starts with 2 extra lives
+        self._suspended_until_reset: list[bool] = [False] * num_envs
 
-    def set_initial_info(self, env_idx: int, world: int, stage: int, life: int) -> None:
-        """Seed the tracker with info from the very first observation."""
+    def _clear_env_buffer(self, env_idx: int) -> None:
+        self._actions[env_idx] = []
+        self._x_positions[env_idx] = []
+
+    def _build_rollout(self, env_idx: int, outcome: str) -> Optional[Rollout]:
+        actions = self._actions[env_idx]
+        x_positions = self._x_positions[env_idx]
+        if not actions:
+            return None
+        return Rollout(
+            world=self._world[env_idx],
+            stage=self._stage[env_idx],
+            actions=list(actions),
+            x_positions=list(x_positions),
+            max_x=max(x_positions) if x_positions else 0,
+            outcome=outcome,
+            num_steps=len(actions),
+        )
+
+    def set_initial_info(
+        self,
+        env_idx: int,
+        world: int,
+        stage: int,
+        life: int,
+        *,
+        prefix_actions: Optional[list[int]] = None,
+        prefix_x_positions: Optional[list[int]] = None,
+    ) -> None:
+        """Seed the tracker with info from the first collected observation.
+
+        When an episode starts from a replay fast-forward, *prefix_actions* and
+        *prefix_x_positions* preload the trajectory that was already executed
+        during ``reset()`` so the eventual rollout remains replayable from
+        level start.
+        """
+        seed_actions = list(prefix_actions or [])
+        seed_x_positions = list(prefix_x_positions or [])
+        if len(seed_actions) != len(seed_x_positions):
+            raise ValueError("prefix_actions and prefix_x_positions must have the same length")
+
         self._world[env_idx] = int(world)
         self._stage[env_idx] = int(stage)
         self._prev_life[env_idx] = int(life)
+        self._actions[env_idx] = seed_actions
+        self._x_positions[env_idx] = seed_x_positions
+        self._suspended_until_reset[env_idx] = False
 
     def record_step(
         self,
@@ -137,14 +185,43 @@ class EpisodeTracker:
         world: int,
         stage: int,
         life: int,
-    ) -> None:
-        """Append one timestep to the episode buffer for *env_idx*."""
+    ) -> Optional[Rollout]:
+        """Append one timestep to the episode buffer for *env_idx*.
+
+        If the environment changed ``(world, stage)`` since the last observed
+        frame, the previous stage-local rollout is emitted with outcome
+        ``"transition"`` and tracking is suspended until the next reset.
+        This prevents pipe-entered stages from being stored as replayable from
+        their nominal stage start.
+        """
+        observed_world = int(world)
+        observed_stage = int(stage)
+        observed_life = int(life)
+
+        if self._suspended_until_reset[env_idx]:
+            self._world[env_idx] = observed_world
+            self._stage[env_idx] = observed_stage
+            self._prev_life[env_idx] = observed_life
+            return None
+
+        transition_rollout: Optional[Rollout] = None
+        if self._actions[env_idx] and (
+            observed_world != self._world[env_idx] or observed_stage != self._stage[env_idx]
+        ):
+            transition_rollout = self._build_rollout(env_idx, outcome="transition")
+            self._clear_env_buffer(env_idx)
+            self._world[env_idx] = observed_world
+            self._stage[env_idx] = observed_stage
+            self._prev_life[env_idx] = observed_life
+            self._suspended_until_reset[env_idx] = True
+            return transition_rollout
+
         self._actions[env_idx].append(int(action))
         self._x_positions[env_idx].append(int(x_pos))
-        # Keep latest world/stage/life in case the env transitions mid-episode
-        self._world[env_idx] = int(world)
-        self._stage[env_idx] = int(stage)
-        self._prev_life[env_idx] = int(life)
+        self._world[env_idx] = observed_world
+        self._stage[env_idx] = observed_stage
+        self._prev_life[env_idx] = observed_life
+        return None
 
     def finish_episode(
         self,
@@ -158,6 +235,8 @@ class EpisodeTracker:
 
         Returns ``None`` if no steps were recorded (e.g. immediate reset).
         """
+        if self._suspended_until_reset[env_idx]:
+            return None
         actions = self._actions[env_idx]
         x_positions = self._x_positions[env_idx]
         if not actions:
@@ -171,19 +250,12 @@ class EpisodeTracker:
             truncated=truncated,
         )
 
-        rollout = Rollout(
-            world=self._world[env_idx],
-            stage=self._stage[env_idx],
-            actions=list(actions),
-            x_positions=list(x_positions),
-            max_x=max(x_positions) if x_positions else 0,
-            outcome=outcome,
-            num_steps=len(actions),
-        )
+        rollout = self._build_rollout(env_idx, outcome=outcome)
+        if rollout is None:
+            return None
 
         # Reset the per-env buffer
-        self._actions[env_idx] = []
-        self._x_positions[env_idx] = []
+        self._clear_env_buffer(env_idx)
 
         return rollout
 
@@ -260,6 +332,21 @@ class RolloutIndex:
         self._ensure_loaded()
         return self._rollouts
 
+    @staticmethod
+    def _visited_bins(rollout: Rollout, bin_size: int) -> set[int]:
+        return {int(x_pos) // bin_size for x_pos in rollout.x_positions}
+
+    @staticmethod
+    def _first_step_in_bin(
+        rollout: Rollout,
+        target_x_bin: int,
+        bin_size: int,
+    ) -> Optional[int]:
+        for i, x_pos in enumerate(rollout.x_positions):
+            if int(x_pos) // bin_size == target_x_bin:
+                return i + 1
+        return None
+
     def find_rollout(
         self,
         world: int,
@@ -267,11 +354,10 @@ class RolloutIndex:
         target_x_bin: int,
         bin_size: int = PROGRESSION_BIN_SIZE,
     ) -> Optional[Rollout]:
-        """Find the shortest rollout that reaches *target_x_bin* in the given level.
+        """Find the shortest-prefix rollout that actually visits *target_x_bin*.
 
-        Only considers rollouts that started from level-start (x_positions[0]
-        within bin 0).  Rollouts recorded after a replay fast-forward have
-        inflated x_positions and cannot be replayed from scratch.
+        Every rollout stores a full from-level-start trajectory, so any record
+        that reaches the target bin is a valid replay source.
 
         Returns ``None`` if no suitable rollout exists.
         """
@@ -280,14 +366,21 @@ class RolloutIndex:
         target_x = target_x_bin * bin_size
         candidates = self._by_level.get((world, stage), [])
         best: Optional[Rollout] = None
+        best_target_step: Optional[int] = None
         for ri in candidates:
             r = self._rollouts[ri]
-            # Skip rollouts that started mid-level (from a replay fast-forward)
-            if r.x_positions and r.x_positions[0] >= bin_size:
-                continue
             if r.max_x >= target_x:
-                if best is None or r.num_steps < best.num_steps:
+                target_step = self._first_step_in_bin(r, target_x_bin, bin_size)
+                if target_step is None:
+                    continue
+                if (
+                    best is None
+                    or best_target_step is None
+                    or target_step < best_target_step
+                    or (target_step == best_target_step and r.num_steps < best.num_steps)
+                ):
                     best = r
+                    best_target_step = target_step
             else:
                 # List is sorted by max_x desc, so no more candidates can reach target
                 break
@@ -303,20 +396,16 @@ class RolloutIndex:
         """Return ``(actions, target_step)`` to replay up to *target_x_bin*.
 
         *target_step* is the index of the first action where the recorded
-        x_pos reached the target bin, so replaying ``actions[:target_step]``
+        x_pos entered the target bin, so replaying ``actions[:target_step]``
         positions Mario near the desired x.
         """
         bin_size = validate_progression_bin_size(bin_size)
         rollout = self.find_rollout(world, stage, target_x_bin, bin_size)
         if rollout is None:
             return None
-        target_x = target_x_bin * bin_size
-        # Find the step where x first reaches the target bin
-        target_step = len(rollout.actions)  # fallback: replay everything
-        for i, xp in enumerate(rollout.x_positions):
-            if xp >= target_x:
-                target_step = i + 1  # include this step
-                break
+        target_step = self._first_step_in_bin(rollout, target_x_bin, bin_size)
+        if target_step is None:
+            return None
         return rollout.actions, target_step
 
     def find_all_replay_actions(
@@ -325,35 +414,30 @@ class RolloutIndex:
         stage: int,
         target_x_bin: int,
         bin_size: int = PROGRESSION_BIN_SIZE,
-        max_results: int = 10,
     ) -> list[tuple[list[int], int]]:
-        """Return up to *max_results* ``(actions, target_step)`` pairs, shortest first.
+        """Return all ``(actions, target_step)`` pairs that visit *target_x_bin*.
 
         Like :meth:`find_replay_actions` but returns multiple candidates so
-        the replay pool has alternatives when one rollout fails.
+        the replay pool can sample uniformly across every known rollout that
+        reaches the requested bin.
         """
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
         target_x = target_x_bin * bin_size
         candidates = self._by_level.get((world, stage), [])
-        # Collect valid rollouts that reach the target
-        valid: list[Rollout] = []
+        valid: list[tuple[int, Rollout]] = []
         for ri in candidates:
             r = self._rollouts[ri]
-            if r.x_positions and r.x_positions[0] >= bin_size:
-                continue
             if r.max_x >= target_x:
-                valid.append(r)
-        # Sort by num_steps ascending (shortest first) and take top N
-        valid.sort(key=lambda r: r.num_steps)
-        valid = valid[:max_results]
+                target_step = self._first_step_in_bin(r, target_x_bin, bin_size)
+                if target_step is not None:
+                    valid.append((target_step, r))
+            else:
+                break
+        # Sort by earliest hit first for deterministic output ordering.
+        valid.sort(key=lambda item: (item[0], item[1].num_steps))
         results: list[tuple[list[int], int]] = []
-        for r in valid:
-            target_step = len(r.actions)
-            for i, xp in enumerate(r.x_positions):
-                if xp >= target_x:
-                    target_step = i + 1
-                    break
+        for target_step, r in valid:
             results.append((list(r.actions), target_step))
         return results
 
@@ -363,19 +447,14 @@ class RolloutIndex:
     ) -> dict[tuple[int, int, int], int]:
         """Return ``{(world, stage, x_bin): rollout_count}``.
 
-        A rollout *covers* bin ``b`` if its ``max_x >= b * bin_size``.
-        This tells us which progression bins we could potentially replay to.
-        Only counts rollouts that started from level-start.
+        A rollout covers exactly the bins whose x-positions it actually visits.
+        This avoids inferring support across discontinuous pipe jumps.
         """
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
         cov: dict[tuple[int, int, int], int] = {}
         for r in self._rollouts:
-            # Skip rollouts that started mid-level (from a replay fast-forward)
-            if r.x_positions and r.x_positions[0] >= bin_size:
-                continue
-            max_bin = r.max_x // bin_size
-            for b in range(max_bin + 1):
+            for b in self._visited_bins(r, bin_size):
                 key = (r.world, r.stage, b)
                 cov[key] = cov.get(key, 0) + 1
         return cov
@@ -384,18 +463,11 @@ class RolloutIndex:
         self,
         bin_size: int = PROGRESSION_BIN_SIZE,
     ) -> set[tuple[int, int, int]]:
-        """Return the set of ``(world, stage, x_bin)`` tuples we can replay to.
-
-        Only considers rollouts that started from level-start.
-        """
+        """Return the set of ``(world, stage, x_bin)`` tuples we can replay to."""
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
         result: set[tuple[int, int, int]] = set()
         for r in self._rollouts:
-            # Skip rollouts that started mid-level (from a replay fast-forward)
-            if r.x_positions and r.x_positions[0] >= bin_size:
-                continue
-            max_bin = r.max_x // bin_size
-            for b in range(max_bin + 1):
+            for b in self._visited_bins(r, bin_size):
                 result.add((r.world, r.stage, b))
         return result

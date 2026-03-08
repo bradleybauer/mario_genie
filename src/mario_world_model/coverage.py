@@ -2,8 +2,8 @@
 Balanced data-collection utilities.
 
 Scans chunk metadata to compute progression (x-position bin) frame counts and
-action distribution, then reports balance status and produces sampling weights
-that prioritise under-represented progression bins and actions.
+action distribution, then reports coverage status and produces sampling weights
+from inverse frame counts over the current replay support.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import math
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 DEFAULT_PROGRESSION_BIN_SIZE: int = 64
@@ -163,8 +163,6 @@ class ProgressionBinInfo:
     stage: int
     x_bin: int
     frame_count: int
-    target: int
-    deficit: int
     pct_of_total: float
     weight: float
     reachable: bool  # True if a rollout exists that reaches this bin
@@ -174,7 +172,6 @@ class ProgressionBinInfo:
 class ProgressionBalanceReport:
     total_frames: int
     num_bins: int
-    target_per_bin: int
     bin_size: int
     bins: list[ProgressionBinInfo] = field(default_factory=list)
     weights: dict[tuple[int, int, int], float] = field(default_factory=dict)
@@ -183,82 +180,72 @@ class ProgressionBalanceReport:
 def compute_progression_balance(
     progression_cov: dict[tuple[int, int, int], int],
     reachable_bins: Optional[set[tuple[int, int, int]]] = None,
+    all_levels: Optional[Iterable[tuple[int, int]]] = None,
     bin_size: int = PROGRESSION_BIN_SIZE,
 ) -> ProgressionBalanceReport:
-    """Compute per-(level, x_bin) balance with weights biased toward deficit.
+    """Compute inverse-count sampling weights over the current replay support.
 
-    *reachable_bins* (from ``RolloutIndex.reachable_bins()``) limits the
-    weight to bins that we can actually replay to.  Bins we can't reach still
-    appear in the report but get weight 0.
+    The balancing support is the set of bins we can currently start from via
+    replay, plus bin 0 for every level in *all_levels*. Within that support,
+    weights are proportional to ``1 / (frame_count + 1)`` so zero-count bins
+    receive the highest probability without introducing any target/deficit
+    bookkeeping.
     """
     bin_size = validate_progression_bin_size(bin_size)
-    if not progression_cov:
-        return ProgressionBalanceReport(total_frames=0, num_bins=0, target_per_bin=0, bin_size=bin_size)
-
-    # All observed bins
-    all_bins = set(progression_cov.keys())
-    if reachable_bins is not None:
-        all_bins = all_bins | reachable_bins
-    # Also include bin-0 for every level observed (always reachable via plain reset)
-    levels_seen = {(w, s) for (w, s, _) in all_bins}
-    for w, s in levels_seen:
-        all_bins.add((w, s, 0))
+    support_bins: set[tuple[int, int, int]] = set(reachable_bins or set())
+    for world, stage in all_levels or []:
+        support_bins.add((int(world), int(stage), 0))
+    if not support_bins:
+        support_bins = {(w, s, 0) for (w, s, _b) in progression_cov.keys()}
+    if not support_bins:
+        return ProgressionBalanceReport(total_frames=0, num_bins=0, bin_size=bin_size)
 
     total = sum(progression_cov.values())
-    num_bins = len(all_bins)
-    target = max(1, math.ceil(total / num_bins)) if num_bins else 1
+    num_bins = len(support_bins)
+    support_bins_per_level: dict[tuple[int, int], int] = Counter((w, s) for (w, s, _b) in support_bins)
+    total_frames_per_level: dict[tuple[int, int], int] = Counter()
+    for (w, s, _b), count in progression_cov.items():
+        total_frames_per_level[(w, s)] += int(count)
+    average_support_bins_per_level = max(
+        1.0,
+        float(num_bins) / float(max(1, len(support_bins_per_level))),
+    )
+    inverse_count_scores = {
+        key: 1.0 / (float(progression_cov.get(key, 0)) + 1.0)
+        for key in support_bins
+    }
+    for key in support_bins:
+        world, stage, x_bin = key
+        if x_bin != 0:
+            continue
+        if total_frames_per_level.get((world, stage), 0) != 0:
+            continue
+        # If a stage has never been seen at all, its level-start is the only
+        # gateway to discovering that stage. Give it the exploration mass of a
+        # whole average stage instead of treating it like just one more zero-count bin.
+        inverse_count_scores[key] *= average_support_bins_per_level
 
-    deficits: dict[tuple[int, int, int], int] = {}
-    for key in all_bins:
-        count = progression_cov.get(key, 0)
-        deficits[key] = max(0, target - count)
-
-    # Only allow weight on reachable bins (bin 0 always reachable).
-    # Redirect unreachable bin deficits to their level's bin-0 so that
-    # levels with many unreachable deep bins (e.g. 8-4) still receive
-    # collection priority proportional to their total deficit.
-    effective_deficits: dict[tuple[int, int, int], float] = {}
-    for key in all_bins:
-        if key[2] == 0:
-            effective_deficits[key] = float(deficits[key])
-        elif reachable_bins is not None and key in reachable_bins:
-            effective_deficits[key] = float(deficits[key])
-        elif reachable_bins is None:
-            effective_deficits[key] = float(deficits[key])
-        else:
-            # Bin is unreachable — redirect its deficit to bin-0 of the
-            # same level so the level still gets selected frequently,
-            # giving the player a chance to progress and unlock the bin.
-            w, s, _b = key
-            bin0_key = (w, s, 0)
-            effective_deficits.setdefault(bin0_key, 0.0)
-            effective_deficits[bin0_key] += float(deficits[key])
-            effective_deficits[key] = 0.0
-
-    deficit_sum = sum(effective_deficits.values())
-    if deficit_sum == 0:
-        weights = {key: 1.0 / num_bins for key in all_bins}
+    score_sum = sum(inverse_count_scores.values())
+    if score_sum == 0:
+        weights = {key: 1.0 / num_bins for key in support_bins}
     else:
-        weights = {key: d / deficit_sum for key, d in effective_deficits.items()}
+        weights = {key: score / score_sum for key, score in inverse_count_scores.items()}
 
     bins_list: list[ProgressionBinInfo] = []
-    for key in sorted(all_bins):
+    for key in sorted(support_bins):
         w, s, b = key
         count = progression_cov.get(key, 0)
-        reachable = (b == 0) or (reachable_bins is not None and key in reachable_bins) or (reachable_bins is None)
         bins_list.append(ProgressionBinInfo(
             world=w, stage=s, x_bin=b,
-            frame_count=count, target=target,
-            deficit=deficits[key],
+            frame_count=count,
             pct_of_total=(count / total * 100) if total else 0.0,
             weight=weights[key],
-            reachable=reachable,
+            reachable=True,
         ))
 
     return ProgressionBalanceReport(
         total_frames=total,
         num_bins=num_bins,
-        target_per_bin=target,
         bin_size=bin_size,
         bins=bins_list,
         weights=weights,
@@ -342,23 +329,22 @@ def print_progression_report(
     print(f"  Bin size (px)       : {report.bin_size:>10}")
     print(f"  Total frames        : {report.total_frames:>10}")
     print(f"  Distinct bins       : {report.num_bins:>10}")
-    print(f"  Target / bin        : {report.target_per_bin:>10}")
     print("-" * 80)
-    print(f"  {'Level':<8} {'Bin':>4} {'Frames':>10} {'Target':>10} "
-          f"{'Deficit':>10} {'%Total':>8} {'Weight':>8} {'Reach':>6}")
+    print(f"  {'Level':<8} {'Bin':>4} {'Frames':>10} {'%Total':>8} {'Weight':>8} {'Reach':>6}")
     print("-" * 80)
 
     bins = report.bins
     if top_n > 0:
-        bins = sorted(bins, key=lambda b: b.deficit, reverse=True)[:top_n]
+        bins = sorted(bins, key=lambda b: (b.frame_count, -b.weight, b.world, b.stage, b.x_bin))[:top_n]
 
     for bi in bins:
         reach_str = "yes" if bi.reachable else " - "
-        bar_len = int(15 * bi.frame_count / report.target_per_bin) if report.target_per_bin else 0
+        max_count = max((entry.frame_count for entry in report.bins), default=0)
+        bar_len = int(15 * bi.frame_count / max_count) if max_count else 0
         bar = "\u2588" * min(bar_len, 15)
         print(
             f"  {bi.world}-{bi.stage:<6} {bi.x_bin:>4} {bi.frame_count:>10} "
-            f"{bi.target:>10} {bi.deficit:>10} {bi.pct_of_total:>7.1f}% "
+            f"{bi.pct_of_total:>7.1f}% "
             f"{bi.weight:>8.4f} {reach_str:>6}  {bar}"
         )
     print("=" * 80)
@@ -399,16 +385,17 @@ def print_action_report(
 
 
 def print_progression_guidance(report: ProgressionBalanceReport, n: int = 5) -> None:
-    """Print a short summary of the *n* most-needed progression bins."""
-    needed = sorted(report.bins, key=lambda b: b.deficit, reverse=True)[:n]
-    if not needed or needed[0].deficit == 0:
-        print("[progression] All bins at or above target — collecting uniformly.")
+    """Print a short summary of the lowest-coverage progression bins."""
+    if report.total_frames == 0 and report.bins:
+        print("[progression] No frames yet — sampling uniformly over initial replay support.")
         return
-    print(f"[progression] Top {n} most-needed progression bins:")
+    needed = sorted(report.bins, key=lambda b: (b.frame_count, -b.weight, b.world, b.stage, b.x_bin))[:n]
+    if not needed:
+        print("[progression] No supported bins to sample.")
+        return
+    print(f"[progression] Lowest-coverage support bins:")
     for bi in needed:
-        if bi.deficit == 0:
-            break
         reach = "reachable" if bi.reachable else "NOT reachable"
         print(f"  World {bi.world}-{bi.stage} bin {bi.x_bin} "
-              f"(have {bi.frame_count}, need {bi.deficit} more, {reach})")
+              f"(frames={bi.frame_count}, weight={bi.weight:.4f}, {reach})")
 
