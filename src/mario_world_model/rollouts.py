@@ -25,16 +25,13 @@ from pathlib import Path
 from typing import Optional
 
 
-DEFAULT_PROGRESSION_BIN_SIZE: int = 64
-
-
 def validate_progression_bin_size(bin_size: int) -> int:
     value = int(bin_size)
     if value <= 0:
         raise ValueError("progression bin size must be a positive integer")
     return value
 
-PROGRESSION_BIN_SIZE: int = DEFAULT_PROGRESSION_BIN_SIZE
+PROGRESSION_BIN_SIZE: int = 64
 
 
 # ---------------------------------------------------------------------------

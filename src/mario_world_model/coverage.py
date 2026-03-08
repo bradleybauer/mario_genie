@@ -16,8 +16,6 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-DEFAULT_PROGRESSION_BIN_SIZE: int = 64
-
 
 def validate_progression_bin_size(bin_size: int) -> int:
     value = int(bin_size)
@@ -79,7 +77,7 @@ def _bin_exact_progression_counts(
 # Progression (x-position) coverage
 # ===================================================================
 
-PROGRESSION_BIN_SIZE: int = DEFAULT_PROGRESSION_BIN_SIZE
+PROGRESSION_BIN_SIZE: int = 64
 
 
 def _scan_progression_from_meta(
