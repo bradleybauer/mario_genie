@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare sweep results across multiple training runs.
 
-Scans a results directory for sub-folders containing config.json + metrics.json,
-then produces:
+Scans a results directory recursively for folders containing config.json +
+metrics.json, then produces:
   1. A summary table (printed and optionally saved as CSV).
   2. A multi-panel comparison plot (recon loss + codebook usage).
 
@@ -29,6 +29,7 @@ LAYER_ABBREVIATIONS = {
     "attend_space": "as",
     "attend_time": "at",
     "consecutive_residual": "r",
+    "residual": "r",
 }
 
 
@@ -126,14 +127,13 @@ def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
 
 
 def discover_runs(results_dir: str) -> list[dict]:
-    """Find all sub-directories that have both config.json and metrics.json."""
+    """Find all directories under the results tree with config.json and metrics.json."""
     runs = []
     base = Path(results_dir)
-    # Check both the directory itself and one level of sub-directories
-    candidates = [base] + sorted(base.iterdir()) if base.is_dir() else []
+    candidates = [base]
+    if base.is_dir():
+        candidates.extend(sorted(path for path in base.rglob("*") if path.is_dir()))
     for d in candidates:
-        if not d.is_dir():
-            continue
         config_path = d / "config.json"
         metrics_path = d / "metrics.json"
         if config_path.exists() and metrics_path.exists():
@@ -142,8 +142,9 @@ def discover_runs(results_dir: str) -> list[dict]:
             with open(metrics_path) as f:
                 metrics = json.load(f)
             if metrics:  # skip empty
+                run_name = d.relative_to(base).as_posix() if d != base else d.name
                 runs.append({
-                    "name": d.name,
+                    "name": run_name,
                     "dir": str(d),
                     "config": config,
                     "metrics": metrics,
@@ -302,7 +303,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results-dir", type=str, default="checkpoints/magvit2",
-                        help="Directory containing run sub-folders")
+                        help="Directory containing run folders anywhere under it")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Save comparison plot to file (e.g. sweep_comparison.png)")
     parser.add_argument("--csv", type=str, default=None,
