@@ -32,10 +32,23 @@ LAYER_ABBREVIATIONS = {
     "residual": "r",
 }
 
+DISTINCT_COLORS = list(plt.get_cmap("tab10").colors) + list(plt.get_cmap("Dark2").colors)
+LINE_STYLES = ["-", "--", "-.", ":"]
+
+
+def get_recon_values(metrics: list[dict]) -> tuple[str | None, list[float]]:
+    """Return the preferred reconstruction-loss values for summaries and sorting."""
+    for key in ("smoothed_recon_loss", "recon_loss"):
+        values = [m[key] for m in metrics if key in m]
+        if values:
+            return key, values
+    return None, []
+
 
 def get_recon_series(metrics: list[dict]) -> tuple[str | None, list[float], list[float]]:
     """Return the preferred reconstruction-loss series for plotting."""
-    for key in ("smoothed_recon_loss", "recon_loss"):
+    key, _ = get_recon_values(metrics)
+    if key is not None:
         points = [m for m in metrics if key in m and "step" in m]
         if points:
             return key, [m["step"] for m in points], [m[key] for m in points]
@@ -50,8 +63,11 @@ def extract_dataset_size(run_name: str) -> int | None:
     return int(match.group(1))
 
 
-def build_run_colors(runs: list[dict]) -> dict[str, tuple[float, float, float, float] | None]:
-    """Assign colors across the compared subset, ordered by dataset-size suffix when present."""
+def build_run_styles(runs: list[dict]) -> dict[str, dict[str, object]]:
+    """Assign distinct plot styles across the compared subset.
+
+    Ordering still follows dataset-size suffixes when present so adjacent sizes read naturally.
+    """
     if not runs:
         return {}
 
@@ -64,15 +80,12 @@ def build_run_colors(runs: list[dict]) -> dict[str, tuple[float, float, float, f
         ),
     )
 
-    cmap = plt.get_cmap("viridis")
-    if len(ordered_runs) == 1:
-        positions = [0.6]
-    else:
-        positions = np.linspace(0.1, 0.9, len(ordered_runs))
-
     return {
-        run["name"]: cmap(position)
-        for run, position in zip(ordered_runs, positions)
+        run["name"]: {
+            "color": DISTINCT_COLORS[index % len(DISTINCT_COLORS)],
+            "linestyle": LINE_STYLES[(index // len(DISTINCT_COLORS)) % len(LINE_STYLES)],
+        }
+        for index, run in enumerate(ordered_runs)
     }
 
 
@@ -160,7 +173,7 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         metrics = run["metrics"]
 
         # Best (minimum) reconstruction loss
-        recon_losses = [m["recon_loss"] for m in metrics if "recon_loss" in m]
+        _, recon_losses = get_recon_values(metrics)
         best_recon = min(recon_losses) if recon_losses else float("nan")
         final_recon = recon_losses[-1] if recon_losses else float("nan")
 
@@ -182,8 +195,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
             ("codebook_size", cfg.get("codebook_size", "?")),
             ("layers", layers_str),
             ("num_params", f"{cfg.get('num_parameters', 0):,}"),
-            ("best_recon", f"{best_recon:.5f}"),
-            ("final_recon", f"{final_recon:.5f}"),
+            ("best_recon", f"{best_recon:.4f}"),
+            ("final_recon", f"{final_recon:.4f}"),
             ("final_cb_usage", final_cb),
             ("max_cb_usage", max_cb),
             ("total_steps", total_steps),
@@ -230,7 +243,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
 
     has_cb = any("codebook_usage" in m for run in runs for m in run["metrics"])
     has_smoothed_recon = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
-    run_colors = build_run_colors(runs)
+    run_styles = build_run_styles(runs)
     nrows = 2 if has_cb else 1
     fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True)
     if nrows == 1:
@@ -247,17 +260,26 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
     for run in sorted_runs:
         _, steps, recon = get_recon_series(run["metrics"])
         if steps:
+            style = run_styles[run["name"]]
             label = run["name"]
             params = run["config"].get("num_parameters", 0)
             if params:
                 label += f" ({params / 1e6:.1f}M)"
-            ax.plot(steps, recon, label=label, color=run_colors[run["name"]], alpha=0.8, linewidth=1.0)
+            ax.plot(
+                steps,
+                recon,
+                label=label,
+                color=style["color"],
+                linestyle=style["linestyle"],
+                alpha=0.9,
+                linewidth=1.6,
+            )
     ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
     title = "Smoothed Reconstruction Loss Comparison" if has_smoothed_recon else "Reconstruction Loss Comparison"
     ax.set_ylabel(ylabel)
     ax.set_yscale("log")
     ax.set_title(title)
-    ax.legend(fontsize=7, ncol=2)
+    ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
     ax.grid(True, alpha=0.3)
 
     # --- Codebook usage ---
@@ -265,6 +287,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
         ax = axes[1]
         for run in sorted_runs:
             metrics = run["metrics"]
+            style = run_styles[run["name"]]
             cb_steps = [m["step"] for m in metrics if "codebook_usage" in m]
             cb_usage = [m["codebook_usage"] for m in metrics if "codebook_usage" in m]
             if cb_steps:
@@ -276,9 +299,10 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
                     marker=".",
                     markersize=2,
                     label=label,
-                    color=run_colors[run["name"]],
-                    alpha=0.7,
-                    linewidth=0.8,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    alpha=0.85,
+                    linewidth=1.2,
                 )[0]
                 if cb_size is not None:
                     ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.6)
@@ -287,7 +311,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None) -> None:
             ax.set_ylim(*usage_ylim)
         ax.set_ylabel("Unique codes used")
         ax.set_title("Codebook Usage")
-        ax.legend(fontsize=7, ncol=2)
+        ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel("Step")
