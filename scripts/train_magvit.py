@@ -22,6 +22,7 @@ if str(SRC_DIR) not in sys.path:
 
 from torchvision.utils import save_image
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
 from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
@@ -30,6 +31,17 @@ from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS
 from mario_world_model.auto_batch_sizer import find_max_batch_size
 from mario_world_model.dataset_paths import find_chunk_files
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
+
+
+def _format_elapsed(seconds):
+    seconds = max(int(seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 def _count_scene_cuts(npz, seq_idx, t_start, seq_len):
     if "world" in npz.files and "stage" in npz.files:
@@ -186,7 +198,9 @@ def train():
         help="Cap batch size (0 = no cap). Use with --auto-batch-size to "
              "limit large batches for faster convergence.",
     )
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--warmup-steps", type=int, default=200,
+                        help="Linear warmup from 0 to --lr over this many steps (default: 200)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=200)
     parser.add_argument("--image-interval-secs", type=float, default=300,
@@ -362,9 +376,29 @@ def train():
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
-    # ── LR schedule: time-based cosine annealing ─────────────────────
+    # ── LR schedule: linear warmup → cosine decay to 10 % of peak ────
     max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
-    eta_min = args.lr / 2
+    min_lr = args.lr * 0.1
+    warmup_steps = args.warmup_steps
+
+    # Estimate total training steps for the cosine T_max
+    if max_seconds > 0:
+        estimated_total = max(int(max_seconds * 5), warmup_steps + 100)
+    else:
+        estimated_total = 100_000
+    decay_steps = max(estimated_total - warmup_steps, 1)
+
+    warmup_scheduler = LinearLR(
+        optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+    )
+    decay_scheduler = CosineAnnealingLR(
+        optimizer, T_max=decay_steps, eta_min=min_lr
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, decay_scheduler],
+        milestones=[warmup_steps],
+    )
 
     # Save config for reproducibility
     config = vars(args).copy()
@@ -441,13 +475,6 @@ def train():
             print(f"\n[max-time] Reached {elapsed/60:.1f} min. Stopping.")
             break
 
-        # Time-based cosine LR
-        if max_seconds > 0:
-            progress = min(elapsed / max_seconds, 1.0)
-            new_lr = eta_min + 0.5 * (args.lr - eta_min) * (1 + math.cos(math.pi * progress))
-            for pg in optimizer.param_groups:
-                pg['lr'] = new_lr
-
         if gpu_cache is None:
             batch = batch.to(device, non_blocking=True)
 
@@ -460,6 +487,7 @@ def train():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
         recon = loss_breakdown.recon_loss.item()
@@ -470,12 +498,19 @@ def train():
         else:
             smoothed_recon = smooth_alpha * smoothed_recon + (1 - smooth_alpha) * recon
 
-        pbar.set_postfix({'loss': f"{loss.item():.4f}", 'recon': f"{recon:.4f}", 'smooth': f"{smoothed_recon:.4f}", 'lr': f"{current_lr:.2e}"})
-
         # ── Checkpoint: smoothed trend improved AND raw batch confirms ──
         if smoothed_recon < best_smoothed_recon - 1e-6 and recon < best_smoothed_recon:
             best_smoothed_recon = smoothed_recon
             last_improvement_time = time.time()
+
+        pbar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'recon': f"{recon:.4f}",
+            'smooth': f"{smoothed_recon:.4f}",
+            'best': f"{best_smoothed_recon:.4f}",
+            'since_best': _format_elapsed(time.time() - last_improvement_time),
+            'lr': f"{current_lr:.2e}",
+        })
 
         if args.threshold > 0 and smoothed_recon < args.threshold:
             print(f"\n[threshold] smoothed_recon={smoothed_recon:.6f} < "

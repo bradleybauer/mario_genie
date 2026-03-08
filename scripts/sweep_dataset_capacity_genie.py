@@ -376,6 +376,7 @@ def build_train_cmd(
     output_dir: str,
     max_minutes: float,
     lr: float,
+    warmup_steps: int,
     patience: float,
     val_interval: int,
     max_batch_size: int,
@@ -394,6 +395,7 @@ def build_train_cmd(
         "--layers", model.layers,
         "--max-minutes", str(max_minutes),
         "--lr", str(lr),
+        "--warmup-steps", str(warmup_steps),
         "--threshold", str(threshold),
         "--max-patience", str(patience),
         "--val-interval", str(val_interval),
@@ -605,11 +607,13 @@ def main():
     parser.add_argument("--output-dir", default="checkpoints/capacity_sweep_genie")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")
-    parser.add_argument("--max-patience", type=float, default=12,
+    parser.add_argument("--max-patience", type=float, default=30,
                         help="Minutes without improvement before early stop (default: 12)")
-    parser.add_argument("--max-minutes", type=float, default=120,
+    parser.add_argument("--max-minutes", type=float, default=150,
                         help="Wall-clock minute budget per trial (default: 120)")
-    parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--warmup-steps", type=int, default=500,
+                        help="Linear warmup steps passed to train_magvit (default: 200)")
     parser.add_argument("--val-interval", type=int, default=100)
     parser.add_argument("--max-batch-size", type=int, default=16,
                         help="Cap auto-detected batch size (default: 16)")
@@ -672,6 +676,7 @@ def main():
         output_dir=args.output_dir,
         max_minutes=args.max_minutes,
         lr=args.lr,
+        warmup_steps=args.warmup_steps,
         patience=args.max_patience * 60,
         val_interval=args.val_interval,
         max_batch_size=args.max_batch_size,
