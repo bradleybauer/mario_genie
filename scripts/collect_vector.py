@@ -252,9 +252,38 @@ class HumanActionPolicy:
         print(f"Warning: {buttons} not found in actions! Falling back to NOOP.")
         return self._noop_index
 
+    def _compose_action(self, *, right: bool, left: bool, up: bool, down: bool, jump: bool, sprint: bool) -> int:
+        if right and left:
+            left = False
+
+        # The action space only includes a standalone "up" action, so give it
+        # priority over other held inputs when climbing vines or entering pipes.
+        if up and not down:
+            return self._lookup_action({"up"})
+
+        buttons: set[str] = set()
+        if down:
+            buttons.add("down")
+
+        if right:
+            buttons.add("right")
+        elif left:
+            buttons.add("left")
+
+        if jump:
+            buttons.add("a")
+        if sprint:
+            buttons.add("b")
+
+        if buttons:
+            return self._lookup_action(buttons)
+
+        return self._noop_index
+
     def _keys_to_action(self, keys: pygame.key.ScancodeWrapper) -> int:
         right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
         left = keys[pygame.K_LEFT] or keys[pygame.K_a]
+        up = keys[pygame.K_UP] or keys[pygame.K_w]
         down = keys[pygame.K_DOWN] or keys[pygame.K_s]
         jump = keys[pygame.K_o]
         sprint = keys[pygame.K_p]
@@ -276,6 +305,7 @@ class HumanActionPolicy:
             y_val = _axis_norm("ABS_Y")
             right = right or x_val > 0.5
             left = left or x_val < -0.5
+            up = up or y_val < -0.5
             down = down or y_val > 0.5
 
             # HAT / d-pad axes (ABS_HAT0X / ABS_HAT0Y) — common on budget USB gamepads
@@ -283,6 +313,7 @@ class HumanActionPolicy:
             hat_y = _axis_norm("ABS_HAT0Y")
             right = right or hat_x > 0.5
             left = left or hat_x < -0.5
+            up = up or hat_y < -0.5
             down = down or hat_y > 0.5
 
             # Button input: BTN_TRIGGER(0x120)=btn0, BTN_THUMB(0x121)=btn1, etc.
@@ -290,28 +321,14 @@ class HumanActionPolicy:
             # If these are backwards on your controller, swap the codes!
             jump = jump or (evdev.ecodes.BTN_THUMB in self._evdev_buttons)
             sprint = sprint or (evdev.ecodes.BTN_TRIGGER in self._evdev_buttons)
-
-        if right and left:
-            left = False
-
-        buttons: set[str] = set()
-        if down:
-            buttons.add("down")
-
-        if right:
-            buttons.add("right")
-        elif left:
-            buttons.add("left")
-
-        if jump:
-            buttons.add("a")
-        if sprint:
-            buttons.add("b")
-
-        if buttons:
-            return self._lookup_action(buttons)
-
-        return self._noop_index
+        return self._compose_action(
+            right=right,
+            left=left,
+            up=up,
+            down=down,
+            jump=jump,
+            sprint=sprint,
+        )
 
     def sample(self) -> int:
         for event in pygame.event.get():

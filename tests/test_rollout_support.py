@@ -3,10 +3,52 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from mario_world_model.actions import get_action_meanings
 from mario_world_model.rollouts import Rollout, RolloutIndex
+from scripts.collect_vector import HumanActionPolicy
 
 
 class RolloutSupportTests(unittest.TestCase):
+    def test_human_action_policy_maps_up_to_standalone_up_action(self) -> None:
+        action_meanings = get_action_meanings()
+        policy = HumanActionPolicy.__new__(HumanActionPolicy)
+        policy._action_to_index = {
+            frozenset(token.lower() for token in action): idx
+            for idx, action in enumerate(action_meanings)
+        }
+        policy._noop_index = policy._action_to_index[frozenset({"noop"})]
+
+        action = policy._compose_action(
+            right=False,
+            left=False,
+            up=True,
+            down=False,
+            jump=False,
+            sprint=False,
+        )
+
+        self.assertEqual(action_meanings[action], ["up"])
+
+    def test_human_action_policy_prioritizes_up_over_unsupported_combos(self) -> None:
+        action_meanings = get_action_meanings()
+        policy = HumanActionPolicy.__new__(HumanActionPolicy)
+        policy._action_to_index = {
+            frozenset(token.lower() for token in action): idx
+            for idx, action in enumerate(action_meanings)
+        }
+        policy._noop_index = policy._action_to_index[frozenset({"noop"})]
+
+        action = policy._compose_action(
+            right=True,
+            left=False,
+            up=True,
+            down=False,
+            jump=False,
+            sprint=False,
+        )
+
+        self.assertEqual(action_meanings[action], ["up"])
+
     def test_discontinuous_positions_do_not_create_phantom_bins(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             data_dir = Path(tmp_dir)
