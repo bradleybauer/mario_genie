@@ -18,7 +18,7 @@ import csv
 import json
 import re
 import sys
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -101,6 +101,27 @@ def build_run_styles(runs: list[dict]) -> dict[str, dict[str, object]]:
         }
         for index, run in enumerate(ordered_runs)
     }
+
+
+FACET_PROPERTIES = ("init_dim", "codebook_size", "model", "attention")
+
+
+def extract_run_property(run: dict, prop: str) -> str:
+    """Extract a categorical property from a run for grouping/faceting."""
+    cfg = run["config"]
+    name = run["name"]
+    if prop == "init_dim":
+        return str(cfg.get("init_dim", "?"))
+    if prop == "codebook_size":
+        return str(cfg.get("codebook_size", "?"))
+    if prop == "model":
+        for token in ("small", "base", "large"):
+            if token in name:
+                return token
+        return "other"
+    if prop == "attention":
+        return "attn" if "attn" in name else "no-attn"
+    return str(cfg.get(prop, "?"))
 
 
 def abbreviate_layer_component(component: str) -> str:
@@ -349,6 +370,122 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
         plt.show()
 
 
+def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None, x_axis: str = "step") -> None:
+    """Small-multiple plot: one subplot per facet value, shared y-axis."""
+    if not runs:
+        print("Nothing to plot.")
+        return
+
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for run in runs:
+        key = extract_run_property(run, facet_by)
+        groups[key].append(run)
+
+    def sort_key(k: str) -> tuple:
+        try:
+            return (0, int(k), k)
+        except ValueError:
+            return (1, 0, k)
+
+    sorted_keys = sorted(groups.keys(), key=sort_key)
+    ncols = len(sorted_keys)
+    run_styles = build_run_styles(runs)
+    has_smoothed = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
+    axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
+
+    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5), sharey=True)
+    if ncols == 1:
+        axes = [axes]
+
+    for ax, key in zip(axes, sorted_keys):
+        group_runs = sorted(
+            groups[key],
+            key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
+        )
+        for run in group_runs:
+            _, x_values, recon = get_recon_series(run["metrics"], x_axis)
+            if x_values:
+                style = run_styles[run["name"]]
+                label = run["name"].rsplit("/", 1)[-1]
+                params = run["config"].get("num_parameters", 0)
+                if params:
+                    label += f" ({params / 1e6:.1f}M)"
+                ax.plot(x_values, recon, label=label,
+                        color=style["color"], linestyle=style["linestyle"],
+                        alpha=0.9, linewidth=1.6)
+        ax.set_title(f"{facet_by} = {key}")
+        ax.set_yscale("log")
+        ax.set_xlabel(axis_label)
+        ax.legend(fontsize=7, frameon=True)
+        ax.grid(True, alpha=0.3)
+
+    ylabel = "Smoothed Recon Loss" if has_smoothed else "Recon Loss"
+    axes[0].set_ylabel(ylabel)
+    fig.suptitle(f"Loss by {facet_by}", fontsize=14, y=1.02)
+    fig.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    else:
+        plt.show()
+
+
+def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | None = None) -> None:
+    """Horizontal bar chart of best reconstruction loss per run."""
+    if not runs:
+        print("Nothing to plot.")
+        return
+
+    entries = []
+    for run in runs:
+        _, recon_losses = get_recon_values(run["metrics"])
+        best = min(recon_losses) if recon_losses else float("inf")
+        params = run["config"].get("num_parameters", 0)
+        label = run["name"].rsplit("/", 1)[-1]
+        if params:
+            label += f" ({params / 1e6:.1f}M)"
+        prop = extract_run_property(run, color_by) if color_by else None
+        entries.append((label, best, prop))
+
+    entries.sort(key=lambda e: e[1])  # best first
+
+    labels = [e[0] for e in entries]
+    values = [e[1] for e in entries]
+    props = [e[2] for e in entries]
+
+    # Color by property if requested
+    if color_by:
+        unique_props = sorted(set(props))
+        prop_colors = {p: DISTINCT_COLORS[i % len(DISTINCT_COLORS)] for i, p in enumerate(unique_props)}
+        colors = [prop_colors[p] for p in props]
+    else:
+        colors = [DISTINCT_COLORS[0]] * len(entries)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(labels) * 0.45)))
+    y_pos = range(len(labels))
+    ax.barh(y_pos, values, color=colors, edgecolor="white", linewidth=0.5)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()  # best (smallest) at top
+    ax.set_xlabel("Best Reconstruction Loss")
+    ax.set_title("Best Reconstruction Loss by Run")
+    ax.grid(True, axis="x", alpha=0.3)
+
+    if color_by:
+        from matplotlib.patches import Patch
+        legend_handles = [Patch(facecolor=prop_colors[p], label=f"{color_by}={p}") for p in unique_props]
+        ax.legend(handles=legend_handles, fontsize=8, loc="lower right")
+
+    fig.tight_layout()
+
+    if output_path:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        print(f"Saved plot to {output_path}")
+    else:
+        plt.show()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/magvit2"],
@@ -361,6 +498,12 @@ def main():
                         help="Only include runs whose name contains this substring")
     parser.add_argument("--x-axis", choices=("time", "step"), default="step",
                         help="X-axis for plots: elapsed time in hours or training step")
+    parser.add_argument("--facet", choices=FACET_PROPERTIES, default=None,
+                        help="Small-multiple subplots split by this property")
+    parser.add_argument("--bar", action="store_true",
+                        help="Horizontal bar chart of best reconstruction loss")
+    parser.add_argument("--color-by", choices=FACET_PROPERTIES, default=None,
+                        help="Color bar chart bars by this property")
     args = parser.parse_args()
 
     runs = discover_runs(args.results_dir)
@@ -382,7 +525,12 @@ def main():
     if args.csv:
         save_csv(rows, args.csv)
 
-    plot_comparison(runs, output_path=args.output, x_axis=args.x_axis)
+    if args.bar:
+        plot_bar(runs, output_path=args.output, color_by=args.color_by)
+    elif args.facet:
+        plot_faceted(runs, args.facet, output_path=args.output, x_axis=args.x_axis)
+    else:
+        plot_comparison(runs, output_path=args.output, x_axis=args.x_axis)
 
 
 if __name__ == "__main__":
