@@ -31,6 +31,7 @@ from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS
 from mario_world_model.auto_batch_sizer import find_max_batch_size
 from mario_world_model.dataset_paths import find_chunk_files
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
+from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 
 
 def _format_elapsed(seconds):
@@ -120,11 +121,18 @@ class MarioVideoDataset(Dataset):
         npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
         probe = npz['frames'][seq_idx, t_start:t_start+self.seq_len]
         T, C, H, W = probe.shape
+        self._palette_index_mode = (C == 1)
 
         n = len(self.samples)
-        total_mb = n * C * T * H * W * 4 / 2**20  # float32
-        print(f"Pre-loading {n} samples into CPU tensor ({total_mb:.0f} MB)...")
-        self.data = torch.empty(n, C, T, H, W, dtype=torch.float32)
+        if self._palette_index_mode:
+            # Palette indices: store as (N, T, H, W) uint8
+            total_mb = n * T * H * W / 2**20
+            print(f"Pre-loading {n} palette-index samples into CPU tensor ({total_mb:.0f} MB)...")
+            self.data = torch.empty(n, T, H, W, dtype=torch.uint8)
+        else:
+            total_mb = n * C * T * H * W * 4 / 2**20  # float32
+            print(f"Pre-loading {n} samples into CPU tensor ({total_mb:.0f} MB)...")
+            self.data = torch.empty(n, C, T, H, W, dtype=torch.float32)
 
         print(f"Grouping samples by chunk for efficient loading...")
         # Group samples by chunk to open each file only once
@@ -132,15 +140,21 @@ class MarioVideoDataset(Dataset):
         for sample_idx, (chunk_idx, seq_idx, t_start) in enumerate(self.samples):
             chunk_groups[chunk_idx].append((sample_idx, seq_idx, t_start))
 
+        palette_idx = self._palette_index_mode
+
         def _load_chunk(chunk_idx, entries):
             """Load one chunk file and write samples into the shared tensor."""
             npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
             frames_arr = npz['frames']
             for sample_idx, seq_idx, t_start in entries:
                 frames = np.array(frames_arr[seq_idx, t_start:t_start+self.seq_len])
-                # [T, C, H, W] -> [C, T, H, W], float32, /255
-                t = torch.from_numpy(frames).float().div_(255.0).permute(1, 0, 2, 3)
-                self.data[sample_idx] = t
+                if palette_idx:
+                    # (T, 1, H, W) -> (T, H, W) uint8
+                    self.data[sample_idx] = torch.from_numpy(frames[:, 0])
+                else:
+                    # [T, C, H, W] -> [C, T, H, W], float32, /255
+                    t = torch.from_numpy(frames).float().div_(255.0).permute(1, 0, 2, 3)
+                    self.data[sample_idx] = t
             return len(entries)
 
         num_threads = min(4, len(chunk_groups))
@@ -172,12 +186,18 @@ class MarioVideoDataset(Dataset):
         # Load only the slice we need via memory-mapped access
         npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
         frames = np.array(npz['frames'][seq_idx, t_start:t_start+self.seq_len])
-        
-        # Convert to tensor: [T, C, H, W] -> [C, T, H, W] required by VideoTokenizer
+        T, C, H, W = frames.shape
+
+        if C == 1:
+            # Palette indices: (T, 1, H, W) -> (T, H, W) uint8
+            return torch.from_numpy(frames[:, 0])
+
+        # RGB: [T, C, H, W] -> [C, T, H, W] float32, /255
         frames = torch.from_numpy(frames).float() / 255.0
         frames = frames.permute(1, 0, 2, 3) 
         
         return frames
+
 
 def train():
     parser = argparse.ArgumentParser()
@@ -286,6 +306,18 @@ def train():
     )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
 
+    # ── Palette mode: auto-detect from palette.json in data dir ────────
+    palette_path = os.path.join(args.data_dir, "palette.json")
+    palette_mode = os.path.exists(palette_path)
+    palette = torch.empty(0, 3)  # overwritten below when palette_mode is True
+    num_palette_colors = 0
+    if palette_mode:
+        with open(palette_path) as f:
+            palette_rgb = json.load(f)
+        palette = torch.tensor(palette_rgb, dtype=torch.float32) / 255.0  # (K, 3)
+        num_palette_colors = palette.shape[0]
+        print(f"[palette] Loaded {num_palette_colors} colours from {palette_path}")
+
     num_unique_samples = len(dataset)
     gpu_cache = None
     if args.overfit_n > 0:
@@ -326,14 +358,24 @@ def train():
     else:
         dataloader = None
 
-    tokenizer = VideoTokenizer(
-        image_size=IMAGE_SIZE,
-        init_dim=args.init_dim,
-        codebook_size=args.codebook_size,
-        layers=tokenizer_layers,
-        use_gan=False,
-        perceptual_loss_weight=0.0
-    ).to(device)
+    if palette_mode:
+        tokenizer = PaletteVideoTokenizer(
+            num_palette_colors=num_palette_colors,
+            image_size=IMAGE_SIZE,
+            init_dim=args.init_dim,
+            codebook_size=args.codebook_size,
+            layers=tokenizer_layers,
+        ).to(device)
+        palette = palette.to(device)
+    else:
+        tokenizer = VideoTokenizer(
+            image_size=IMAGE_SIZE,
+            init_dim=args.init_dim,
+            codebook_size=args.codebook_size,
+            layers=tokenizer_layers,
+            use_gan=False,
+            perceptual_loss_weight=0.0,
+        ).to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
     # ── Auto batch-size ──────────────────────────────────────────────
@@ -450,7 +492,7 @@ def train():
             q = queue_mod.Queue(maxsize=3)
 
             def _prefetch():
-                buf = torch.empty(bs, *sample_shape, dtype=torch.float32, pin_memory=True)
+                buf = torch.empty(bs, *sample_shape, dtype=cpu_cache.dtype, pin_memory=True)
                 while True:
                     perm = torch.randperm(n)
                     for start in range(0, n - bs + 1, bs):
@@ -479,11 +521,23 @@ def train():
             batch = batch.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        loss, loss_breakdown = tokenizer(
-            batch,
-            return_loss=True,
-            video_contains_first_frame=video_contains_first_frame,
-        )
+        if palette_mode:
+            targets = batch.long()
+            inp = PaletteVideoTokenizer.indices_to_onehot(
+                targets, num_palette_colors,
+            )
+            loss, loss_breakdown = tokenizer(
+                inp,
+                targets=targets,
+                return_loss=True,
+                video_contains_first_frame=video_contains_first_frame,
+            )
+        else:
+            loss, loss_breakdown = tokenizer(
+                batch,
+                return_loss=True,
+                video_contains_first_frame=video_contains_first_frame,
+            )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
@@ -542,7 +596,13 @@ def train():
                 last_image_time = now
                 tokenizer.eval()
                 with torch.no_grad():
-                    codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                    if palette_mode:
+                        inp = PaletteVideoTokenizer.indices_to_onehot(
+                            batch.long(), num_palette_colors,
+                        )
+                        codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                    else:
+                        codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
                     recon_video = tokenizer.decode_from_code_indices(
                         codes,
                         video_contains_first_frame=video_contains_first_frame,
@@ -550,8 +610,15 @@ def train():
 
                     step_metrics["codebook_usage"] = codes.unique().numel()
 
-                    original_frames = batch[0].permute(1, 0, 2, 3)
-                    recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
+                    if palette_mode:
+                        original_rgb = palette[batch[0].long()]
+                        original_frames = original_rgb.permute(0, 3, 1, 2)
+                        recon_idx = recon_video[0].argmax(dim=0)
+                        recon_rgb = palette[recon_idx]
+                        recon_frames = recon_rgb.permute(0, 3, 1, 2)
+                    else:
+                        original_frames = batch[0].permute(1, 0, 2, 3)
+                        recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
                     comparison = torch.cat([original_frames, recon_frames], dim=3)
                     save_image(comparison, os.path.join(args.output_dir, f"step_{global_step:06d}.png"), nrow=1)
                 tokenizer.train()
@@ -582,13 +649,26 @@ def train():
 
     tokenizer.eval()
     with torch.no_grad():
-        codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+        if palette_mode:
+            inp = PaletteVideoTokenizer.indices_to_onehot(
+                batch.long(), num_palette_colors,
+            )
+            codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+        else:
+            codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
         recon_video = tokenizer.decode_from_code_indices(
             codes,
             video_contains_first_frame=video_contains_first_frame,
         )
-        original_frames = batch[0].permute(1, 0, 2, 3)
-        recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
+        if palette_mode:
+            original_rgb = palette[batch[0].long()]
+            original_frames = original_rgb.permute(0, 3, 1, 2)
+            recon_idx = recon_video[0].argmax(dim=0)
+            recon_rgb = palette[recon_idx]
+            recon_frames = recon_rgb.permute(0, 3, 1, 2)
+        else:
+            original_frames = batch[0].permute(1, 0, 2, 3)
+            recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
         comparison = torch.cat([original_frames, recon_frames], dim=3)
         save_image(comparison, os.path.join(args.output_dir, "final_reconstruction.png"), nrow=1)
     print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")

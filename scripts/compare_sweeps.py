@@ -23,6 +23,14 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+
+def smooth(values: list[float], sigma: float) -> np.ndarray:
+    """Gaussian smoothing with the given sigma (in data points)."""
+    if sigma <= 0 or len(values) <= 1:
+        return np.asarray(values)
+    return gaussian_filter1d(values, sigma=sigma)
 
 
 LAYER_ABBREVIATIONS = {
@@ -39,7 +47,8 @@ DISTINCT_COLORS = [
 ] + [
     tuple(color) for color in plt.get_cmap("Dark2")(np.linspace(0, 1, 8))
 ]
-LINE_STYLES = ["-", "--", "-.", ":"]
+LINE_STYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), (0, (5, 2, 1, 2, 1, 2))]
+LINE_WIDTHS = [1.8, 1.2, 2.4]
 
 
 def get_recon_values(metrics: list[dict]) -> tuple[str | None, list[float]]:
@@ -94,10 +103,15 @@ def build_run_styles(runs: list[dict]) -> dict[str, dict[str, object]]:
         ),
     )
 
+    n_colors = len(DISTINCT_COLORS)
+    n_styles = len(LINE_STYLES)
+    n_widths = len(LINE_WIDTHS)
+
     return {
         run["name"]: {
-            "color": DISTINCT_COLORS[index % len(DISTINCT_COLORS)],
-            "linestyle": LINE_STYLES[(index // len(DISTINCT_COLORS)) % len(LINE_STYLES)],
+            "color": DISTINCT_COLORS[index % n_colors],
+            "linestyle": LINE_STYLES[(index * 3) % n_styles],
+            "linewidth": LINE_WIDTHS[(index * 2) % n_widths],
         }
         for index, run in enumerate(ordered_runs)
     }
@@ -120,7 +134,7 @@ def extract_run_property(run: dict, prop: str) -> str:
                 return token
         return "other"
     if prop == "attention":
-        return "attn" if "attn" in name else "no-attn"
+        return "With Attention" if "attn" in name else "Without Attention"
     return str(cfg.get(prop, "?"))
 
 
@@ -280,7 +294,7 @@ def save_csv(rows: list[OrderedDict], path: str) -> None:
     print(f"Saved CSV to {path}")
 
 
-def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: str = "step") -> None:
+def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: str = "step", smooth_window: int = 1, show_legend: bool = True) -> None:
     if not runs:
         print("Nothing to plot.")
         return
@@ -312,19 +326,20 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
                 label += f" ({params / 1e6:.1f}M)"
             ax.plot(
                 x_values,
-                recon,
+                smooth(recon, smooth_window),
                 label=label,
                 color=style["color"],
                 linestyle=style["linestyle"],
                 alpha=0.9,
-                linewidth=1.6,
+                linewidth=style["linewidth"],
             )
     ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
     title = "Smoothed Reconstruction Loss Comparison" if has_smoothed_recon else "Reconstruction Loss Comparison"
     ax.set_ylabel(ylabel)
     ax.set_yscale("log")
     ax.set_title(title)
-    ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
+    if show_legend:
+        ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
     ax.grid(True, alpha=0.3)
 
     # --- Codebook usage ---
@@ -341,14 +356,14 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
                 label = run["name"]
                 line = ax.plot(
                     cb_steps,
-                    cb_usage,
+                    smooth(cb_usage, smooth_window),
                     marker=".",
                     markersize=2,
                     label=label,
                     color=style["color"],
                     linestyle=style["linestyle"],
                     alpha=0.85,
-                    linewidth=1.2,
+                    linewidth=style["linewidth"],
                 )[0]
                 if cb_size is not None:
                     ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.6)
@@ -357,7 +372,8 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
             ax.set_ylim(*usage_ylim)
         ax.set_ylabel("Unique codes used")
         ax.set_title("Codebook Usage")
-        ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
+        if show_legend:
+            ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel(axis_label)
@@ -370,7 +386,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
         plt.show()
 
 
-def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None, x_axis: str = "step") -> None:
+def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None, x_axis: str = "step", smooth_window: int = 1, show_legend: bool = True) -> None:
     """Small-multiple plot: one subplot per facet value, shared y-axis."""
     if not runs:
         print("Nothing to plot.")
@@ -410,13 +426,14 @@ def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None
                 params = run["config"].get("num_parameters", 0)
                 if params:
                     label += f" ({params / 1e6:.1f}M)"
-                ax.plot(x_values, recon, label=label,
+                ax.plot(x_values, smooth(recon, smooth_window), label=label,
                         color=style["color"], linestyle=style["linestyle"],
-                        alpha=0.9, linewidth=1.6)
-        ax.set_title(f"{facet_by} = {key}")
+                        alpha=0.9, linewidth=style["linewidth"])
+        ax.set_title(key)
         ax.set_yscale("log")
         ax.set_xlabel(axis_label)
-        ax.legend(fontsize=7, frameon=True)
+        if show_legend:
+            ax.legend(fontsize=7, frameon=True)
         ax.grid(True, alpha=0.3)
 
     ylabel = "Smoothed Recon Loss" if has_smoothed else "Recon Loss"
@@ -431,7 +448,7 @@ def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None
         plt.show()
 
 
-def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | None = None) -> None:
+def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | None = None, show_legend: bool = True) -> None:
     """Horizontal bar chart of best reconstruction loss per run."""
     if not runs:
         print("Nothing to plot.")
@@ -472,7 +489,7 @@ def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | N
     ax.set_title("Best Reconstruction Loss by Run")
     ax.grid(True, axis="x", alpha=0.3)
 
-    if color_by:
+    if color_by and show_legend:
         from matplotlib.patches import Patch
         legend_handles = [Patch(facecolor=prop_colors[p], label=f"{color_by}={p}") for p in unique_props]
         ax.legend(handles=legend_handles, fontsize=8, loc="lower right")
@@ -504,6 +521,10 @@ def main():
                         help="Horizontal bar chart of best reconstruction loss")
     parser.add_argument("--color-by", choices=FACET_PROPERTIES, default=None,
                         help="Color bar chart bars by this property")
+    parser.add_argument("--smooth", type=float, default=5.0,
+                        help="Gaussian sigma for plot smoothing (0 = no smoothing)")
+    parser.add_argument("--no-legend", action="store_true",
+                        help="Hide the legend on plots")
     args = parser.parse_args()
 
     runs = discover_runs(args.results_dir)
@@ -525,12 +546,13 @@ def main():
     if args.csv:
         save_csv(rows, args.csv)
 
+    show_legend = not args.no_legend
     if args.bar:
-        plot_bar(runs, output_path=args.output, color_by=args.color_by)
+        plot_bar(runs, output_path=args.output, color_by=args.color_by, show_legend=show_legend)
     elif args.facet:
-        plot_faceted(runs, args.facet, output_path=args.output, x_axis=args.x_axis)
+        plot_faceted(runs, args.facet, output_path=args.output, x_axis=args.x_axis, smooth_window=args.smooth, show_legend=show_legend)
     else:
-        plot_comparison(runs, output_path=args.output, x_axis=args.x_axis)
+        plot_comparison(runs, output_path=args.output, x_axis=args.x_axis, smooth_window=args.smooth, show_legend=show_legend)
 
 
 if __name__ == "__main__":

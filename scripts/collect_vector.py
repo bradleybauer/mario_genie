@@ -35,6 +35,7 @@ from mario_world_model.coverage import (
     validate_progression_bin_size,
 )
 from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env
+from mario_world_model.palette_mapper import PaletteMapper
 from mario_world_model.preprocess import preprocess_frame
 from mario_world_model.rollouts import (
     EpisodeTracker,
@@ -422,8 +423,16 @@ class VectorCollectionVisualizer:
         pygame.quit()
 
 
-def to_tchw(frame_hwc: np.ndarray) -> np.ndarray:
+def to_tchw(frame_hwc: np.ndarray, palette_mapper: PaletteMapper | None = None) -> np.ndarray:
+    """Preprocess a raw NES frame → (C, H, W) uint8.
+
+    If *palette_mapper* is provided the output has shape ``(1, H, W)``
+    containing palette indices.  Otherwise ``(3, H, W)`` RGB.
+    """
     padded = preprocess_frame(frame_hwc)
+    if palette_mapper is not None:
+        idx_hw = palette_mapper.map_frame(padded)  # (H, W) uint8
+        return idx_hw[np.newaxis, :, :]  # (1, H, W)
     return np.transpose(padded, (2, 0, 1)).astype(np.uint8, copy=False)
 
 
@@ -554,6 +563,9 @@ def run_collection(
     progression_bin_size = validate_progression_bin_size(progression_bin_size)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Palette mapper (always active) ──────────────────────────────
+    palette_mapper = PaletteMapper(output_dir / "palette.json")
+
     # --balance-actions implies --balance
     if balance_actions:
         balance = True
@@ -591,6 +603,7 @@ def run_collection(
             rebalance_interval=rebalance_interval,
             balance_actions=balance_actions,
             progression_bin_size=progression_bin_size,
+            palette_mapper=palette_mapper,
         )
 
     env = build_vector_env(
@@ -668,7 +681,7 @@ def run_collection(
             done_flags = np.logical_or(terminated, truncated)
 
             for env_idx in range(num_envs):
-                seq_frames[env_idx].append(to_tchw(obs[env_idx]))
+                seq_frames[env_idx].append(to_tchw(obs[env_idx], palette_mapper))
                 seq_actions[env_idx].append(int(actions[env_idx]))
                 seq_dones[env_idx].append(bool(done_flags[env_idx]))
                 
@@ -809,6 +822,7 @@ def run_human_collection(
     rebalance_interval: int = 5,
     balance_actions: bool = False,
     progression_bin_size: int = PROGRESSION_BIN_SIZE,
+    palette_mapper: PaletteMapper | None = None,
 ):
     progression_bin_size = validate_progression_bin_size(progression_bin_size)
     num_actions = get_num_actions()
@@ -869,7 +883,7 @@ def run_human_collection(
             next_obs, _, terminated, truncated, next_info = env.step(action)
             done = bool(terminated or truncated)
 
-            seq_frames.append(to_tchw(obs))
+            seq_frames.append(to_tchw(obs, palette_mapper))
             seq_actions.append(int(action))
             seq_dones.append(done)
 

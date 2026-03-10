@@ -37,7 +37,7 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     if IMAGE_SIZE != 256:
         # Resize using PIL
         img = Image.fromarray(padded.astype(np.uint8, copy=False))
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
+        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
         padded = np.array(img)
 
     return padded.astype(np.uint8, copy=False)
