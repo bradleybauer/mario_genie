@@ -27,9 +27,10 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
 
-from mario_world_model.config import IMAGE_SIZE, CODEBOOK_SIZE, TOKENIZER_LAYERS, SEQUENCE_LENGTH
+from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
 from mario_world_model.auto_batch_sizer import find_max_batch_size
 from mario_world_model.dataset_paths import find_chunk_files
+from mario_world_model.model_configs import MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 
@@ -226,8 +227,21 @@ def train():
     parser.add_argument("--image-interval-secs", type=float, default=300,
                         help="Minimum seconds between saving reconstruction images (default: 300)")
     parser.add_argument("--overfit-n", type=int, default=0, help="Train on N random samples (overfit sanity check)")
-    parser.add_argument("--codebook-size", type=int, default=CODEBOOK_SIZE)
+    parser.add_argument("--codebook-size", type=int, default=256)
     parser.add_argument("--init-dim", type=int, default=32)
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Named model config (overrides --init-dim, --codebook-size, --layers). "
+             "Use --list-models to see available configs.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print available model configs and exit.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
     parser.add_argument("--num-workers", type=int, default=16, help="Number of DataLoader workers")
@@ -237,7 +251,7 @@ def train():
     parser.add_argument(
         "--layers", type=str, default=None,
         help=(
-            "Comma-separated encoder layer spec, overrides config.TOKENIZER_LAYERS. "
+            "Comma-separated encoder layer spec. "
             "e.g. 'residual,compress_space,residual,compress_space,residual,compress_space'. "
             "Use 'consecutive_residual:N' for parameterised layers."
         ),
@@ -267,8 +281,25 @@ def train():
     )
     args = parser.parse_args()
 
-    # Parse --layers into a tuple
-    if args.layers is not None:
+    if args.list_models:
+        for name in sorted(MODEL_CONFIGS_BY_NAME):
+            print(name)
+        return
+
+    if args.model is not None and args.model not in MODEL_CONFIGS_BY_NAME:
+        parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
+
+    # Resolve model config: --model overrides --init-dim, --codebook-size, --layers
+    if args.model is not None:
+        mc = MODEL_CONFIGS_BY_NAME[args.model]
+        args.init_dim = mc.init_dim
+        args.codebook_size = mc.codebook_size
+        tokenizer_layers = tuple(
+            (name, int(val)) if ":" in tok else tok
+            for tok in mc.layers.split(",")
+            for name, _, val in [tok.partition(":")]
+        )
+    elif args.layers is not None:
         parsed = []
         for tok in args.layers.split(","):
             tok = tok.strip()
@@ -279,7 +310,12 @@ def train():
                 parsed.append(tok)
         tokenizer_layers = tuple(parsed)
     else:
-        tokenizer_layers = TOKENIZER_LAYERS
+        tokenizer_layers = (
+            'residual', 'compress_space',
+            'residual', 'compress_space',
+            'residual', 'compress_space',
+            'residual', 'compress_space',
+        )
 
     # ── Normal training ──────────────────────────────────────────────────
 

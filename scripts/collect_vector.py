@@ -473,6 +473,8 @@ def _build_replay_pool(
     """
     prog_cov = scan_progression_coverage(str(output_dir), bin_size=progression_bin_size)
     ri = RolloutIndex(output_dir)
+    # Print the number of rollouts loaded
+    print(f"[replay] {len(ri.rollouts)} rollouts loaded.")
     reachable = ri.reachable_bins(bin_size=progression_bin_size)
     prog_rpt = compute_progression_balance(prog_cov, reachable, bin_size=progression_bin_size)
     print_progression_guidance(prog_rpt, n=5)
@@ -632,9 +634,15 @@ def run_collection(
     # --- Episode tracking (for progression balance) ---
     tracker: EpisodeTracker | None = None
     rollout_writer: RolloutWriter | None = None
+    total_rollouts_saved = 0
     if balance:
         tracker = EpisodeTracker(num_envs)
         rollout_writer = RolloutWriter(output_dir)
+        try:
+            ri = RolloutIndex(output_dir)
+            total_rollouts_saved = len(ri.rollouts)
+        except Exception:
+            pass
 
     # --- Initial rebalance at startup ---
     # If rollouts/data exist from a previous session, configure the replay pool
@@ -724,6 +732,8 @@ def run_collection(
                         )
                         if rollout is not None and rollout_writer is not None:
                             rollout_writer.write(rollout)
+                            total_rollouts_saved += 1
+                            print(f"[rollout] Saved trajectory: W{rollout.world}-{rollout.stage} ending at max_x={rollout.max_x} (total recorded: {total_rollouts_saved})")
                         # Re-seed tracker with new episode info (auto-reset provides new info)
                         nw_val = next_info.get("world")
                         ns_val = next_info.get("stage")
@@ -844,9 +854,15 @@ def run_human_collection(
     # --- Episode tracking ---
     tracker: EpisodeTracker | None = None
     rollout_writer: RolloutWriter | None = None
+    total_rollouts_saved = 0
     if balance:
         tracker = EpisodeTracker(1)
         rollout_writer = RolloutWriter(output_dir)
+        try:
+            ri = RolloutIndex(output_dir)
+            total_rollouts_saved = len(ri.rollouts)
+        except Exception:
+            pass
 
     # --- Initial progression rebalance at startup ---
     # If rollouts already exist from a previous session, configure the replay
@@ -911,6 +927,8 @@ def run_human_collection(
                     )
                     if rollout is not None and rollout_writer is not None:
                         rollout_writer.write(rollout)
+                        total_rollouts_saved += 1
+                        print(f"[rollout] Saved trajectory: W{rollout.world}-{rollout.stage} ending at max_x={rollout.max_x} (total recorded: {total_rollouts_saved})")
 
             if len(seq_frames) == sequence_length:
                 frames_tchw = np.stack(seq_frames, axis=0)

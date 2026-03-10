@@ -34,29 +34,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mario_world_model.dataset_paths import find_chunk_files
-
-
-@dataclass(frozen=True)
-class ScaleConfig:
-    name: str
-    residual_blocks: tuple[int, int, int, int]
-
-
-@dataclass(frozen=True)
-class AttentionVariant:
-    name: str
-    suffix: str
-    enabled: bool = False
-
-
-@dataclass(frozen=True)
-class ModelConfig:
-    name: str
-    init_dim: int
-    codebook_size: int
-    layers: str
-    scale_name: str
-    attention_name: str
+from mario_world_model.model_configs import MODEL_CONFIGS, ModelConfig
 
 
 @dataclass
@@ -67,76 +45,6 @@ class ModelRunResult:
     passed: bool
     run_name: str
     elapsed_s: float = 0.0
-
-
-def build_open_genie_layers(
-    init_dim: int,
-    residual_blocks: tuple[int, int, int, int],
-    *,
-    use_attention: bool = False,
-) -> str:
-    """Approximate the Open-Genie MAGVIT hierarchy with MAGVIT-2 layer primitives."""
-    stage2_dim = init_dim * 2
-    stage3_dim = init_dim * 4
-    blocks_1, blocks_2, blocks_3, blocks_4 = residual_blocks
-    attention_layers = ["attend_space", "attend_time"] if use_attention else []
-
-    layers = [
-        f"consecutive_residual:{blocks_1}",
-        f"compress_space:{init_dim}",
-        f"consecutive_residual:{blocks_2}",
-        f"compress_time:{stage2_dim}",
-        f"compress_space:{stage2_dim}",
-        *attention_layers,
-        f"consecutive_residual:{blocks_3}",
-        f"compress_time:{stage3_dim}",
-        f"compress_space:{stage3_dim}",
-        *attention_layers,
-        f"consecutive_residual:{blocks_4}",
-    ]
-    return ",".join(layers)
-
-
-SCALE_CONFIGS = {
-    # "genie_tiny": ScaleConfig(name="genie_tiny", residual_blocks=(2, 2, 2, 2)),
-    "genie_small": ScaleConfig(name="genie_small", residual_blocks=(2, 4, 4, 4)),
-    "genie_base": ScaleConfig(name="genie_base", residual_blocks=(4, 4, 4, 8)),
-}
-
-ATTENTION_VARIANTS = {
-    "plain": AttentionVariant(name="plain", suffix="", enabled=False),
-    "attn": AttentionVariant(name="attn", suffix="_attn", enabled=True),
-}
-
-CODEBOOK_SIZES = [65536, 32768, 16384]
-SCALE_COMPLEXITY = {
-    # "genie_tiny": 0,
-    "genie_small": 1,
-    "genie_base": 2,
-}
-ATTENTION_COMPLEXITY = {
-    "plain": 0,
-    "attn": 1,
-}
-DIMS = [64, 32]
-MODEL_CONFIGS = [
-    ModelConfig(
-        name=f"dim{dim}_cb{cb}_{scale.name}{variant.suffix}",
-        init_dim=dim,
-        codebook_size=cb,
-        layers=build_open_genie_layers(
-            dim,
-            scale.residual_blocks,
-            use_attention=variant.enabled,
-        ),
-        scale_name=scale.name,
-        attention_name=variant.name,
-    )
-    for dim in DIMS
-    for cb in CODEBOOK_SIZES
-    for scale in SCALE_CONFIGS.values()
-    for variant in ATTENTION_VARIANTS.values()
-]
 
 
 def _count_scene_cuts(npz, seq_idx: int, t_start: int, seq_len: int) -> int:

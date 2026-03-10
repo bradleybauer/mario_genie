@@ -22,12 +22,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.config import (
-    CODEBOOK_SIZE,
-    IMAGE_SIZE,
-    SEQUENCE_LENGTH,
-    TOKENIZER_LAYERS,
-)
+from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
+from mario_world_model.model_configs import MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 
 
@@ -120,8 +116,19 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--image-size", type=int, default=IMAGE_SIZE)
     parser.add_argument("--sequence-length", type=int, default=SEQUENCE_LENGTH)
-    parser.add_argument("--codebook-size", type=int, default=CODEBOOK_SIZE)
-    parser.add_argument("--init-dim", type=int, default=32)
+    parser.add_argument("--num-palette-colors", type=int, default=23)
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Named model config to profile. Use --list-models to see available configs.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="Print available model configs and exit.",
+    )
     parser.add_argument("--summary-depth", type=int, default=3)
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--profile-steps", type=int, default=3)
@@ -139,6 +146,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.list_models:
+        for name in sorted(MODEL_CONFIGS_BY_NAME):
+            print(name)
+        return
+
+    if args.model is None:
+        parser.error("--model is required. Use --list-models to see available configs.")
+
+    if args.model not in MODEL_CONFIGS_BY_NAME:
+        parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
+
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     elif args.device == "cuda" and not torch.cuda.is_available():
@@ -146,12 +164,20 @@ def main() -> None:
     else:
         device = args.device
 
-    layers = tuple(TOKENIZER_LAYERS)
+    mc = MODEL_CONFIGS_BY_NAME[args.model]
+    init_dim = mc.init_dim
+    codebook_size = mc.codebook_size
+    layers = tuple(
+        (name, int(val)) if ":" in tok else tok
+        for tok in mc.layers.split(",")
+        for name, _, val in [tok.partition(":")]
+    )
 
     model = VideoTokenizer(
         image_size=args.image_size,
-        init_dim=args.init_dim,
-        codebook_size=args.codebook_size,
+        init_dim=init_dim,
+        channels=args.num_palette_colors,
+        codebook_size=codebook_size,
         layers=layers,
         use_gan=False,
         perceptual_loss_weight=0.0,
@@ -161,7 +187,7 @@ def main() -> None:
 
     sample = torch.randn(
         args.batch_size,
-        3,
+        args.num_palette_colors,
         args.sequence_length,
         args.image_size,
         args.image_size,
@@ -180,8 +206,9 @@ def main() -> None:
     print(f"batch_size: {args.batch_size}")
     print(f"image_size: {args.image_size}")
     print(f"sequence_length: {args.sequence_length}")
-    print(f"codebook_size: {args.codebook_size}")
-    print(f"init_dim: {args.init_dim}")
+    print(f"model: {args.model}")
+    print(f"codebook_size: {codebook_size}")
+    print(f"init_dim: {init_dim}")
     print(f"layers: {layers}")
     print()
 
@@ -228,8 +255,9 @@ def main() -> None:
         "batch_size": args.batch_size,
         "image_size": args.image_size,
         "sequence_length": args.sequence_length,
-        "codebook_size": args.codebook_size,
-        "init_dim": args.init_dim,
+        "model": args.model,
+        "codebook_size": codebook_size,
+        "init_dim": init_dim,
         "layers": list(layers),
         "tokenizer_parameters": optimizer_total_params,
         "tokenizer_trainable_parameters": optimizer_trainable_params,

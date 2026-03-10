@@ -5,7 +5,7 @@
 - [Single Sample Overfit Baseline](#single-sample-overfit-baseline)
 - [Which Tokens Correspond To Which World And Stages](#which-tokens-correspond-to-which-world-and-stages)
 - [Uniform Data Collection](#uniform-data-collection)
-- [Initial Micro-Genie Parameter Sweep](#initial-micro-genie-parameter-sweep)
+- [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 
 <br>
@@ -54,7 +54,7 @@ This is not fully solved — some bins remain under represented — but the dist
 <br>
 <br>
 
-# Initial Micro-Genie Parameter Sweep
+# Initial Video Tokenizer Parameter Sweep
 
 **Context:**
 
@@ -101,7 +101,7 @@ Two of the attention models failed to utilize the codebook, and their loss remai
 
 Given the downward trend, I expect that significantly longer training would bring the models much closer to convergence.
 
-But I would rather not run this experiment for 6 days because $$$ :'( and I'm concerned the reconstructions would be more blury than I'd like.
+But I would rather not run this experiment for 6 days because $$$ :'( and I'm concerned the reconstructions would be more blurry than I'd like.
 Chatting with AI I found that using a different loss function would likely help.
 
 <br>
