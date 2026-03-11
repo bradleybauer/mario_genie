@@ -261,6 +261,46 @@ class EpisodeTracker:
 # JSONL writer
 # ---------------------------------------------------------------------------
 
+def remove_rollout_from_jsonl(
+    jsonl_path: str | Path,
+    world: int,
+    stage: int,
+    actions: list[int],
+) -> bool:
+    """Remove the first matching rollout from a JSONL file on disk.
+
+    Matches on ``(world, stage, actions)``.  Returns ``True`` if a line was
+    removed, ``False`` if no match was found.
+    """
+    path = Path(jsonl_path)
+    if not path.exists():
+        return False
+    lines = path.read_text(encoding="utf-8").splitlines()
+    target_actions = json.dumps(actions, separators=(",", ":"))
+    new_lines: list[str] = []
+    removed = False
+    for line in lines:
+        if not line.strip():
+            continue
+        if not removed:
+            try:
+                r = Rollout.from_json_line(line)
+            except (json.JSONDecodeError, TypeError, KeyError):
+                new_lines.append(line)
+                continue
+            if (
+                r.world == world
+                and r.stage == stage
+                and json.dumps(r.actions, separators=(",", ":")) == target_actions
+            ):
+                removed = True
+                continue
+        new_lines.append(line)
+    if removed:
+        path.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+    return removed
+
+
 class RolloutWriter:
     """Append-only JSONL writer for :class:`Rollout` objects."""
 
@@ -344,6 +384,29 @@ class RolloutIndex:
                 return i + 1
         return None
 
+    @staticmethod
+    def _terminal_death_bin(
+        rollout: Rollout,
+        bin_size: int,
+    ) -> Optional[int]:
+        if rollout.outcome != "death" or not rollout.x_positions:
+            return None
+        return int(rollout.x_positions[-1]) // bin_size
+
+    @classmethod
+    def _supports_target_bin(
+        cls,
+        rollout: Rollout,
+        target_x_bin: int,
+        bin_size: int,
+    ) -> Optional[int]:
+        target_step = cls._first_step_in_bin(rollout, target_x_bin, bin_size)
+        if target_step is None:
+            return None
+        if cls._terminal_death_bin(rollout, bin_size) == target_x_bin:
+            return None
+        return target_step
+
     def find_rollout(
         self,
         world: int,
@@ -354,7 +417,8 @@ class RolloutIndex:
         """Find the shortest-prefix rollout that actually visits *target_x_bin*.
 
         Every rollout stores a full from-level-start trajectory, so any record
-        that reaches the target bin is a valid replay source.
+        that reaches the target bin is a valid replay source, except for the
+        terminal bin of a death rollout.
 
         Returns ``None`` if no suitable rollout exists.
         """
@@ -367,7 +431,7 @@ class RolloutIndex:
         for ri in candidates:
             r = self._rollouts[ri]
             if r.max_x >= target_x:
-                target_step = self._first_step_in_bin(r, target_x_bin, bin_size)
+                target_step = self._supports_target_bin(r, target_x_bin, bin_size)
                 if target_step is None:
                     continue
                 if (
@@ -416,7 +480,8 @@ class RolloutIndex:
 
         Like :meth:`find_replay_actions` but returns multiple candidates so
         the replay pool can sample uniformly across every known rollout that
-        reaches the requested bin.
+        reaches the requested bin. Death rollouts do not support their
+        terminal bin.
         """
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
@@ -426,7 +491,7 @@ class RolloutIndex:
         for ri in candidates:
             r = self._rollouts[ri]
             if r.max_x >= target_x:
-                target_step = self._first_step_in_bin(r, target_x_bin, bin_size)
+                target_step = self._supports_target_bin(r, target_x_bin, bin_size)
                 if target_step is not None:
                     valid.append((target_step, r))
             else:
@@ -460,11 +525,17 @@ class RolloutIndex:
         self,
         bin_size: int = PROGRESSION_BIN_SIZE,
     ) -> set[tuple[int, int, int]]:
-        """Return the set of ``(world, stage, x_bin)`` tuples we can replay to."""
+        """Return the set of ``(world, stage, x_bin)`` tuples we can replay to.
+
+        Death rollouts contribute support for bins they pass through, but not
+        for their terminal death bin.
+        """
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
         result: set[tuple[int, int, int]] = set()
         for r in self._rollouts:
             for b in self._visited_bins(r, bin_size):
+                if self._terminal_death_bin(r, bin_size) == b:
+                    continue
                 result.add((r.world, r.stage, b))
         return result

@@ -34,13 +34,14 @@ from mario_world_model.coverage import (
     scan_progression_coverage,
     validate_progression_bin_size,
 )
-from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env
+from mario_world_model.envs import RandomLevelMarioEnv, make_shimmed_env, ROLLOUT_PREFIX_INFO_KEY, decode_rollout_prefix
 from mario_world_model.palette_mapper import PaletteMapper
 from mario_world_model.preprocess import preprocess_frame
 from mario_world_model.rollouts import (
     EpisodeTracker,
     RolloutIndex,
     RolloutWriter,
+    remove_rollout_from_jsonl,
 )
 from mario_world_model.storage import ChunkWriter
 
@@ -73,10 +74,38 @@ class VectorActionPolicy:
         self._sticky_until = [0 for _ in range(num_envs)]
         self._t = [0 for _ in range(num_envs)]
 
+        self._right_index = self._lookup_action("right")
+        self._right_jump_index = self._lookup_action("right", "a")
+        self._right_sprint_index = self._lookup_action("right", "b")
+        self._right_jump_sprint_index = self._lookup_action("right", "a", "b")
+        self._left_index = self._lookup_action("left")
+        self._left_sprint_index = self._lookup_action("left", "b")
+        self._jump_index = self._lookup_action("a")
+        self._down_index = self._lookup_action("down")
+
         self._heuristic_candidates = self._build_heuristic_candidates()
+        self._last_x = [0 for _ in range(num_envs)]
+        self._last_time: list[Optional[int]] = [None for _ in range(num_envs)]
+        self._last_level: list[Optional[tuple[int, int]]] = [None for _ in range(num_envs)]
+        self._stuck_steps = [0 for _ in range(num_envs)]
+        self._jump_until = [0 for _ in range(num_envs)]
+        self._sprint_until = [0 for _ in range(num_envs)]
+        self._backtrack_until = [0 for _ in range(num_envs)]
 
         # Action balance weights (None → use default policy)
         self._action_weights: Optional[list[float]] = None
+
+    def _lookup_action(self, *buttons: str) -> int:
+        return self._action_to_index.get(frozenset(token.lower() for token in buttons), self._noop_index)
+
+    def _reset_heuristic_state(self, idx: int) -> None:
+        self._last_x[idx] = 0
+        self._last_time[idx] = None
+        self._last_level[idx] = None
+        self._stuck_steps[idx] = 0
+        self._jump_until[idx] = self._t[idx]
+        self._sprint_until[idx] = self._t[idx]
+        self._backtrack_until[idx] = self._t[idx]
 
     def _build_heuristic_candidates(self) -> list[int]:
         preferred = [
@@ -111,6 +140,80 @@ class VectorActionPolicy:
         else:
             self._action_weights = [w / total for w in raw]
 
+    def _get_info_value(self, info: Optional[dict], key: str, idx: int, default: int) -> int:
+        if info is None:
+            return default
+        value = info.get(key)
+        if value is None:
+            return default
+        return int(value[idx])
+
+    def _plan_jump_recovery(self, idx: int, *, long: bool) -> None:
+        jump_frames = self.rng.randint(8, 14) if long else self.rng.randint(4, 8)
+        sprint_frames = jump_frames + self.rng.randint(8, 20)
+        self._jump_until[idx] = max(self._jump_until[idx], self._t[idx] + jump_frames)
+        self._sprint_until[idx] = max(self._sprint_until[idx], self._t[idx] + sprint_frames)
+
+    def _update_heuristic_state(self, idx: int, info: Optional[dict]) -> None:
+        world = self._get_info_value(info, "world", idx, 1)
+        stage = self._get_info_value(info, "stage", idx, 1)
+        x_pos = self._get_info_value(info, "x_pos", idx, 0)
+        time_left = self._get_info_value(info, "time", idx, 0)
+
+        current_level = (world, stage)
+        prev_level = self._last_level[idx]
+        prev_time = self._last_time[idx]
+        prev_x = self._last_x[idx]
+
+        level_changed = prev_level is not None and current_level != prev_level
+        timer_reset = prev_time is not None and time_left > prev_time + 1
+        x_reset = prev_level == current_level and x_pos <= 8 and prev_x > 96
+        if level_changed or timer_reset or x_reset:
+            self._reset_heuristic_state(idx)
+            prev_level = None
+            prev_time = None
+            prev_x = 0
+
+        if prev_level == current_level and prev_time is not None:
+            progress = x_pos - prev_x
+            if progress <= 0:
+                self._stuck_steps[idx] += 1
+            elif progress >= 3:
+                self._stuck_steps[idx] = max(0, self._stuck_steps[idx] - 3)
+            else:
+                self._stuck_steps[idx] = max(0, self._stuck_steps[idx] - 1)
+
+            if self._stuck_steps[idx] >= 12 and self._t[idx] >= self._jump_until[idx]:
+                self._plan_jump_recovery(idx, long=True)
+                if self._left_index != self._noop_index and self.rng.random() < 0.2:
+                    self._backtrack_until[idx] = max(
+                        self._backtrack_until[idx],
+                        self._t[idx] + self.rng.randint(3, 6),
+                    )
+            elif self._stuck_steps[idx] >= 5 and self._t[idx] >= self._jump_until[idx] and self.rng.random() < 0.2:
+                self._plan_jump_recovery(idx, long=False)
+        else:
+            self._stuck_steps[idx] = 0
+            self._sprint_until[idx] = max(self._sprint_until[idx], self._t[idx] + self.rng.randint(10, 24))
+
+        self._last_x[idx] = x_pos
+        self._last_time[idx] = time_left
+        self._last_level[idx] = current_level
+
+    def _base_heuristic_action(self) -> int:
+        p = self.rng.random()
+        if p < 0.58:
+            return self._right_sprint_index
+        if p < 0.76:
+            return self._right_jump_sprint_index
+        if p < 0.88:
+            return self._right_index
+        if p < 0.95:
+            return self._right_jump_index
+        if p < 0.98:
+            return self._jump_index
+        return self._down_index
+
     def _sample_random(self, idx: int) -> int:
         if self._t[idx] >= self._sticky_until[idx]:
             if self._action_weights is not None:
@@ -124,37 +227,40 @@ class VectorActionPolicy:
         self._t[idx] += 1
         return self._sticky_actions[idx]
 
-    def _sample_heuristic(self) -> int:
-        # If action balance weights are active, blend with heuristic
-        if self._action_weights is not None:
-            # 50% heuristic, 50% balance-weighted
-            if self.rng.random() < 0.5:
-                return self.rng.choices(
-                    range(self.num_actions), weights=self._action_weights, k=1
-                )[0]
+    def _sample_heuristic(self, idx: int, info: Optional[dict]) -> int:
+        self._update_heuristic_state(idx, info)
 
-        p = self.rng.random()
-        if p < 0.55 and len(self._heuristic_candidates) >= 1:
-            return self._heuristic_candidates[0]
-        if p < 0.75 and len(self._heuristic_candidates) >= 2:
-            return self._heuristic_candidates[1]
-        if p < 0.88 and len(self._heuristic_candidates) >= 3:
-            return self._heuristic_candidates[2]
-        if p < 0.95 and len(self._heuristic_candidates) >= 4:
-            return self._heuristic_candidates[3]
-        if p < 0.98 and len(self._heuristic_candidates) >= 5:
-            return self._heuristic_candidates[4]
-        if len(self._heuristic_candidates) >= 6:
-            return self._heuristic_candidates[5]
-        return self._heuristic_candidates[0]
+        if self._backtrack_until[idx] > self._t[idx]:
+            action = self._left_sprint_index if self._left_sprint_index != self._noop_index else self._left_index
+        elif self._jump_until[idx] > self._t[idx]:
+            action = (
+                self._right_jump_sprint_index
+                if self._sprint_until[idx] > self._t[idx]
+                else self._right_jump_index
+            )
+        elif self._action_weights is not None and self.rng.random() < 0.3:
+            action = self.rng.choices(
+                range(self.num_actions), weights=self._action_weights, k=1
+            )[0]
+        elif self._sprint_until[idx] > self._t[idx]:
+            action = self._right_sprint_index if self.rng.random() < 0.85 else self._right_index
+        else:
+            if self.rng.random() < 0.08:
+                self._plan_jump_recovery(idx, long=False)
+                action = self._right_jump_sprint_index
+            else:
+                action = self._base_heuristic_action()
 
-    def sample(self) -> np.ndarray:
+        self._t[idx] += 1
+        return action
+
+    def sample(self, info: Optional[dict] = None) -> np.ndarray:
         actions = np.zeros((self.num_envs,), dtype=np.int64)
         for idx in range(self.num_envs):
             if self.mode == "random":
                 actions[idx] = self._sample_random(idx)
             else:
-                actions[idx] = self._sample_heuristic()
+                actions[idx] = self._sample_heuristic(idx, info)
         return actions
 
 
@@ -443,12 +549,17 @@ def build_vector_env(
     seed: int,
     vector_mode: str,
     level_mode: str,
+    initial_level: Optional[tuple[int, int]] = None,
+    max_episode_steps: Optional[int] = None,
 ):
     def thunk(rank: int):
         def _make():
             if level_mode == "random":
-                return RandomLevelMarioEnv(seed=seed + rank)
-            return make_shimmed_env(world=world, stage=stage, seed=seed + rank)
+                return RandomLevelMarioEnv(initial_level=initial_level, seed=seed + rank, max_episode_steps=max_episode_steps)
+            env = make_shimmed_env(world=world, stage=stage, seed=seed + rank)
+            if max_episode_steps is not None:
+                env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+            return env
 
         return _make
 
@@ -541,11 +652,36 @@ def _do_action_rebalance(
     print(f"[actions] Rebalanced action weights ({act_rpt.total_frames} total frames)")
 
 
+def _make_replay_renderer(fps: int = 30):
+    """Return a callback ``(obs_hwc,) -> None`` that renders replay frames."""
+    screen = [None]
+    clock = pygame.time.Clock()
+
+    def render(obs_hwc: np.ndarray) -> None:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise KeyboardInterrupt("Replay window closed.")
+        h, w = obs_hwc.shape[:2]
+        if screen[0] is None:
+            scale = min(512 / max(w, 1), 480 / max(h, 1))
+            screen[0] = pygame.display.set_mode((int(w * scale), int(h * scale)))
+            pygame.display.set_caption("Mario Replay Visualization")
+        surface = pygame.surfarray.make_surface(np.transpose(obs_hwc, (1, 0, 2)))
+        if surface.get_size() != screen[0].get_size():
+            surface = pygame.transform.scale(surface, screen[0].get_size())
+        screen[0].blit(surface, (0, 0))
+        pygame.display.flip()
+        clock.tick(max(1, fps))
+
+    return render
+
+
 def run_collection(
     output_dir: Path,
     mode: str,
     world: int,
     stage: int,
+    initial_level: Optional[tuple[int, int]],
     seed: int,
     sequence_length: int,
     sequences_per_chunk: int,
@@ -557,10 +693,12 @@ def run_collection(
     max_pending_writes: int,
     visualize: bool = False,
     visualize_fps: int = 30,
+    visualize_replays: bool = False,
     balance: bool = False,
     rebalance_interval: int = 5,
     balance_actions: bool = False,
     progression_bin_size: int = PROGRESSION_BIN_SIZE,
+    max_episode_steps: Optional[int] = None,
 ):
     progression_bin_size = validate_progression_bin_size(progression_bin_size)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -579,6 +717,7 @@ def run_collection(
 
     print(
         f"[config] mode={mode} level_mode={level_mode} world={world} stage={stage} "
+        f"initial_level={initial_level} "
         f"num_envs={num_envs} balance={balance} "
         f"balance_actions={balance_actions}"
     )
@@ -593,6 +732,7 @@ def run_collection(
             output_dir=output_dir,
             world=world,
             stage=stage,
+            initial_level=initial_level,
             seed=seed,
             sequence_length=sequence_length,
             sequences_per_chunk=sequences_per_chunk,
@@ -601,11 +741,14 @@ def run_collection(
             action_meanings=action_meanings,
             level_mode=level_mode,
             max_pending_writes=max_pending_writes,
+            visualize_replays=visualize_replays,
+            visualize_fps=visualize_fps,
             balance=balance,
             rebalance_interval=rebalance_interval,
             balance_actions=balance_actions,
             progression_bin_size=progression_bin_size,
             palette_mapper=palette_mapper,
+            max_episode_steps=max_episode_steps,
         )
 
     env = build_vector_env(
@@ -615,6 +758,8 @@ def run_collection(
         seed=seed,
         vector_mode=vector_mode,
         level_mode=level_mode,
+        initial_level=initial_level,
+        max_episode_steps=max_episode_steps,
     )
     writer = ChunkWriter(
         output_dir=output_dir,
@@ -631,11 +776,30 @@ def run_collection(
         else None
     )
 
+    # --- Replay visualization callback for sub-envs ---
+    if visualize_replays and level_mode == "random":
+        replay_renderer = _make_replay_renderer(fps=visualize_fps)
+        for sub_env in env.envs:  # type: ignore[attr-defined]
+            if hasattr(sub_env, "replay_render_callback"):
+                sub_env.replay_render_callback = replay_renderer
+
+    # --- Wire failed-replay removal to JSONL for sub-envs ---
+    # Skip in random mode to avoid modifying rollouts at all.
+    if level_mode == "random" and mode != "random":
+        jsonl_path = output_dir / "rollouts.jsonl"
+        def _on_replay_failed(w: int, s: int, actions: list[int]) -> None:
+            if remove_rollout_from_jsonl(jsonl_path, w, s, actions):
+                print(f"[replay] Removed failed rollout W{w}-{s} from {jsonl_path.name}")
+        for sub_env in env.envs:  # type: ignore[attr-defined]
+            if hasattr(sub_env, "on_replay_failed"):
+                sub_env.on_replay_failed = _on_replay_failed
+
     # --- Episode tracking (for progression balance) ---
+    # Skip rollout recording in automated (random / heuristic) modes.
     tracker: EpisodeTracker | None = None
     rollout_writer: RolloutWriter | None = None
     total_rollouts_saved = 0
-    if balance:
+    if balance and mode not in ("random", "heuristic"):
         tracker = EpisodeTracker(num_envs)
         rollout_writer = RolloutWriter(output_dir)
         try:
@@ -660,11 +824,18 @@ def run_collection(
             w_val = info.get("world")
             s_val = info.get("stage")
             l_val = info.get("life")
+            prefix_json = info.get(ROLLOUT_PREFIX_INFO_KEY)
+            if prefix_json is not None:
+                pa, px = decode_rollout_prefix({ROLLOUT_PREFIX_INFO_KEY: prefix_json[env_idx]})
+            else:
+                pa, px = [], []
             tracker.set_initial_info(
                 env_idx,
                 world=int(w_val[env_idx]) if w_val is not None else 1,
                 stage=int(s_val[env_idx]) if s_val is not None else 1,
                 life=int(l_val[env_idx]) if l_val is not None else 2,
+                prefix_actions=pa,
+                prefix_x_positions=px,
             )
 
     INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
@@ -683,7 +854,7 @@ def run_collection(
             if visualizer is not None:
                 visualizer.draw_frames(obs)
 
-            actions = policy.sample()
+            actions = policy.sample(info)
             next_obs, _, terminated, truncated, next_info = env.step(actions)
 
             done_flags = np.logical_or(terminated, truncated)
@@ -738,11 +909,18 @@ def run_collection(
                         nw_val = next_info.get("world")
                         ns_val = next_info.get("stage")
                         nnl_val = next_info.get("life")
+                        nprefix_json = next_info.get(ROLLOUT_PREFIX_INFO_KEY)
+                        if nprefix_json is not None:
+                            npa, npx = decode_rollout_prefix({ROLLOUT_PREFIX_INFO_KEY: nprefix_json[env_idx]})
+                        else:
+                            npa, npx = [], []
                         tracker.set_initial_info(
                             env_idx,
                             world=int(nw_val[env_idx]) if nw_val is not None else 1,
                             stage=int(ns_val[env_idx]) if ns_val is not None else 1,
                             life=int(nnl_val[env_idx]) if nnl_val is not None else 2,
+                            prefix_actions=npa,
+                            prefix_x_positions=npx,
                         )
 
                 if len(seq_frames[env_idx]) == sequence_length:
@@ -820,6 +998,7 @@ def run_human_collection(
     output_dir: Path,
     world: int,
     stage: int,
+    initial_level: Optional[tuple[int, int]],
     seed: int,
     sequence_length: int,
     sequences_per_chunk: int,
@@ -828,19 +1007,37 @@ def run_human_collection(
     action_meanings: list[list[str]],
     level_mode: str,
     max_pending_writes: int,
+    visualize_replays: bool = False,
+    visualize_fps: int = 30,
     balance: bool = False,
     rebalance_interval: int = 5,
     balance_actions: bool = False,
     progression_bin_size: int = PROGRESSION_BIN_SIZE,
     palette_mapper: PaletteMapper | None = None,
+    max_episode_steps: Optional[int] = None,
 ):
     progression_bin_size = validate_progression_bin_size(progression_bin_size)
     num_actions = get_num_actions()
 
     if level_mode == "random":
-        env = RandomLevelMarioEnv(seed=seed)
+        env = RandomLevelMarioEnv(initial_level=initial_level, seed=seed, max_episode_steps=max_episode_steps)
     else:
         env = make_shimmed_env(world=world, stage=stage, seed=seed)
+        if max_episode_steps is not None:
+            env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+
+    # --- Replay visualization for human mode ---
+    if visualize_replays and hasattr(env, "replay_render_callback"):
+        env.replay_render_callback = _make_replay_renderer(fps=visualize_fps)
+
+    # --- Wire failed-replay removal to JSONL ---
+    if hasattr(env, "on_replay_failed"):
+        jsonl_path = output_dir / "rollouts.jsonl"
+        def _on_replay_failed(w: int, s: int, actions: list[int]) -> None:
+            if remove_rollout_from_jsonl(jsonl_path, w, s, actions):
+                print(f"[replay] Removed failed rollout W{w}-{s} from {jsonl_path.name}")
+        env.on_replay_failed = _on_replay_failed
+
     writer = ChunkWriter(
         output_dir=output_dir,
         sequence_length=sequence_length,
@@ -874,11 +1071,14 @@ def run_human_collection(
 
     # Seed the episode tracker
     if tracker is not None:
+        pa, px = decode_rollout_prefix(info)
         tracker.set_initial_info(
             0,
             world=int(info.get("world", 1)),
             stage=int(info.get("stage", 1)),
             life=int(info.get("life", 2)),
+            prefix_actions=pa,
+            prefix_x_positions=px,
         )
 
     INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
@@ -972,11 +1172,14 @@ def run_human_collection(
             if done:
                 obs, info = env.reset()
                 if tracker is not None:
+                    pa, px = decode_rollout_prefix(info)
                     tracker.set_initial_info(
                         0,
                         world=int(info.get("world", 1)),
                         stage=int(info.get("stage", 1)),
                         life=int(info.get("life", 2)),
+                        prefix_actions=pa,
+                        prefix_x_positions=px,
                     )
                 if balance and hasattr(env, '_current_level') and env._current_level:
                     w, s = env._current_level
@@ -1022,9 +1225,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mario vectorized data collection")
     parser.add_argument("--output-dir", type=Path, default=Path("data/vector"))
     parser.add_argument("--mode", type=str, default="random", choices=["random", "heuristic", "human"])
-    parser.add_argument("--world", type=int, default=1)
-    parser.add_argument("--stage", type=int, default=1)
+    parser.add_argument("--world", type=int, default=1, help="World for --level-mode fixed")
+    parser.add_argument("--stage", type=int, default=1, help="Stage for --level-mode fixed")
     parser.add_argument("--level-mode", type=str, default="random", choices=["random", "fixed"])
+    parser.add_argument("--initial-world", type=int, default=None, help="World for the first episode when --level-mode random")
+    parser.add_argument("--initial-stage", type=int, default=None, help="Stage for the first episode when --level-mode random")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--sequences-per-chunk", type=int, default=256)
     parser.add_argument("--num-envs", type=int, default=8)
@@ -1034,6 +1239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pending-writes", type=int, default=8)
     parser.add_argument("--visualize", action="store_true", help="Render live vector collection frames in a pygame window")
     parser.add_argument("--visualize-fps", type=int, default=30, help="Target FPS for vector visualization; this also throttles collection speed when --visualize is enabled")
+    parser.add_argument("--visualize-replays", action="store_true", help="Render replay fast-forward frames in a pygame window so you can watch the replay")
     parser.add_argument("--balance", action="store_true", help="Enable progression-aware balanced collection via action replay")
     parser.add_argument("--rebalance-interval", type=int, default=5, help="Re-scan data and update weights every N chunks (default: 5)")
     parser.add_argument("--balance-actions", action="store_true", help="Balance action distribution via dynamic policy weights (implies --balance)")
@@ -1043,18 +1249,38 @@ def parse_args() -> argparse.Namespace:
         default=PROGRESSION_BIN_SIZE,
         help="Progression coverage bin width in pixels; default is 64",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help="Truncate episodes after this many steps (post-replay). "
+             "Useful for random/heuristic modes to prevent getting stuck.",
+    )
+    args = parser.parse_args()
+
+    initial_world_set = args.initial_world is not None
+    initial_stage_set = args.initial_stage is not None
+    if initial_world_set != initial_stage_set:
+        parser.error("--initial-world and --initial-stage must be provided together")
+    if initial_world_set and args.level_mode != "random":
+        parser.error("--initial-world/--initial-stage are only valid with --level-mode random")
+
+    return args
 
 
 def main():
     args = parse_args()
     started = time.time()
+    initial_level = None
+    if args.initial_world is not None and args.initial_stage is not None:
+        initial_level = (args.initial_world, args.initial_stage)
 
     run_collection(
         output_dir=args.output_dir,
         mode=args.mode,
         world=args.world,
         stage=args.stage,
+        initial_level=initial_level,
         seed=args.seed,
         sequence_length=SEQUENCE_LENGTH,
         sequences_per_chunk=args.sequences_per_chunk,
@@ -1066,10 +1292,12 @@ def main():
         max_pending_writes=args.max_pending_writes,
         visualize=args.visualize,
         visualize_fps=args.visualize_fps,
+        visualize_replays=args.visualize_replays,
         balance=args.balance,
         rebalance_interval=args.rebalance_interval,
         balance_actions=args.balance_actions,
         progression_bin_size=args.progression_bin_size,
+        max_episode_steps=args.max_episode_steps,
     )
 
     elapsed = time.time() - started
