@@ -33,7 +33,7 @@ def setup_worker(worker):
     )
     ssh(worker, (
         "set -e && "
-        "apt-get install -y build-essential htop && "
+        "apt-get install -y build-essential htop vim && "
         "conda init bash 2>/dev/null && "
         f"cd {worker.project_dir} && "
         "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml)"

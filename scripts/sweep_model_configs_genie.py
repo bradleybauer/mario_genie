@@ -288,7 +288,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Single-pass sweep: train each model config once on the full dataset."
     )
-    parser.add_argument("--data-dir", default="data/")
+    parser.add_argument("--data-dir", default="data/nes")
     parser.add_argument("--output-dir", default="checkpoints/model_config_sweep_genie")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")

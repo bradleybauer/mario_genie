@@ -95,14 +95,17 @@ class MarioVideoDataset(Dataset):
         self.seq_len = seq_len
         self.samples = []
         
-        print(f"Indexing {len(self.chunk_files)} chunks (lazy loading)...")
+        n_chunks = len(self.chunk_files)
+        print(f"Indexing {n_chunks} chunks (lazy loading)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
                 pool.submit(_index_chunk, idx, f, seq_len): idx
                 for idx, f in enumerate(self.chunk_files)
             }
-            for future in concurrent.futures.as_completed(futures):
-                self.samples.extend(future.result())
+            with tqdm(total=n_chunks, desc="Indexing chunks", unit="chunk") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    self.samples.extend(future.result())
+                    pbar.update(1)
 
         if subset_n > 0 and subset_n < len(self.samples):
             total = len(self.samples)
@@ -342,9 +345,13 @@ def train():
     )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
 
-    # ── Palette mode: auto-detect from palette.json in data dir ────────
-    palette_path = os.path.join(args.data_dir, "palette.json")
-    palette_mode = os.path.exists(palette_path)
+    # ── Palette mode: auto-detect from palette.json in data dir or subdirs ──
+    palette_path = None
+    for _root, _dirs, _files in os.walk(args.data_dir):
+        if "palette.json" in _files:
+            palette_path = os.path.join(_root, "palette.json")
+            break
+    palette_mode = palette_path is not None
     palette = torch.empty(0, 3)  # overwritten below when palette_mode is True
     num_palette_colors = 0
     if palette_mode:
