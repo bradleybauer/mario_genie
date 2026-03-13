@@ -32,9 +32,8 @@ def setup_worker(worker):
         capture=True,
     )
     ssh(worker, (
-        "set -e && "
         "apt-get install -y build-essential htop vim && "
-        "conda init bash 2>/dev/null && "
+        ". /opt/miniforge3/etc/profile.d/conda.sh && "
         f"cd {worker.project_dir} && "
         "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml)"
     ), capture=True)

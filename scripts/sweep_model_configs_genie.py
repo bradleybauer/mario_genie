@@ -121,10 +121,6 @@ def read_best_recon(metrics_path: str) -> float:
     return float("inf")
 
 
-def run_name_for(model_name: str) -> str:
-    return f"{model_name}_full"
-
-
 def build_train_cmd(
     model: ModelConfig,
     *,
@@ -140,7 +136,7 @@ def build_train_cmd(
     num_workers: int,
     threshold: float = 0.0,
 ) -> list[str]:
-    rname = run_name_for(model.name)
+    rname = model.name
     cmd = [
         sys.executable, "scripts/train_magvit.py",
         "--data-dir", data_dir,
@@ -173,7 +169,7 @@ def run_model(
     **train_kwargs,
 ) -> ModelRunResult:
     """Train one model configuration on the full dataset."""
-    rname = run_name_for(model.name)
+    rname = model.name
     metrics_path = os.path.join(train_kwargs["output_dir"], rname, "metrics.json")
 
     if resume and os.path.exists(metrics_path):
@@ -260,7 +256,7 @@ def load_completed_results(
             total_samples=item.get("total_samples", total_samples),
             best_recon=item.get("best_recon", float("inf")),
             passed=item.get("passed", False),
-            run_name=item.get("run_name", run_name_for(name)),
+            run_name=item.get("run_name", name),
             elapsed_s=item.get("elapsed_s", 0.0),
         )
     return results

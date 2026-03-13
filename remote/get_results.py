@@ -31,7 +31,7 @@ def main():
     workers = load_workers(parse_worker_names(args.workers))
 
     remote_suffix = "checkpoints/"
-    local_base = str(PROJECT_ROOT / "results" / "newsweep")
+    local_base = str(PROJECT_ROOT / "results" / "model_config_sweep_genie")
     if args.subdir:
         remote_suffix += args.subdir + "/"
         local_base = os.path.join(local_base, args.subdir)
@@ -43,7 +43,7 @@ def main():
         ]
 
     def fetch(worker):
-        local_dst = os.path.join(local_base, worker.name) + "/"
+        local_dst = local_base + "/"
         os.makedirs(local_dst, exist_ok=True)
         rsync_from(
             worker,

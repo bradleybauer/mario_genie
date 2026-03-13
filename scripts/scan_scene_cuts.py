@@ -15,7 +15,6 @@ during normal gameplay:
 Usage:
     python scripts/scan_scene_cuts.py data/nes
     python scripts/scan_scene_cuts.py data/nes --verbose
-    python scripts/scan_scene_cuts.py data/nes --cross-sequence
 """
 from __future__ import annotations
 
@@ -63,6 +62,10 @@ for dest in [(2, 1), (3, 1), (4, 1)]:
 for dest in [(5, 1), (6, 1), (7, 1), (8, 1)]:
     NATURAL_SUCCESSORS[(4, 2)].add(dest)
 
+for k,v in NATURAL_SUCCESSORS.items():
+    print(f"{k} → {v}")
+print()
+
 # Mid-level x_pos threshold: if after a done the new x_pos is above this,
 # it's suspicious (normal respawn starts near x=0..~40).
 MID_LEVEL_X_THRESHOLD = 80
@@ -72,7 +75,6 @@ def scan_chunk(
     filepath: str,
     *,
     verbose: bool = False,
-    cross_sequence: bool = False,
 ) -> dict:
     """Scan one .npz chunk for unnatural scene cuts.
 
@@ -177,21 +179,6 @@ def scan_chunk(
                                   f"seq {seq_idx} t={t}→{t+1}",
                                   seq_idx=seq_idx)
 
-    # --- Cross-sequence transitions (last frame of seq N → first frame of seq N+1) ---
-    if cross_sequence and num_seqs > 1:
-        for seq_idx in range(num_seqs - 1):
-            w_b = int(world[seq_idx, -1])
-            s_b = int(stage[seq_idx, -1])
-            w_a = int(world[seq_idx + 1, 0])
-            s_a = int(stage[seq_idx + 1, 0])
-            x_a = int(x_pos[seq_idx + 1, 0])
-            d_b = bool(dones[seq_idx, -1])
-            fg_b = int(flag_get[seq_idx, -1]) if flag_get is not None else 0
-
-            if d_b or (w_b, s_b) != (w_a, s_a):
-                _check_transition(w_b, s_b, w_a, s_a, x_a, d_b, fg_b,
-                                  f"seq {seq_idx}→{seq_idx+1} (cross)")
-
     stats["jump_counter"] = jump_counter
     stats["mid_respawn_counter"] = mid_respawn_counter
     stats["total_sequences"] = num_seqs
@@ -209,11 +196,6 @@ def main():
     parser = argparse.ArgumentParser(description="Scan dataset for unnatural scene cuts")
     parser.add_argument("data_dirs", nargs="+", type=Path, help="Data directories to scan")
     parser.add_argument("--verbose", action="store_true", help="Print every unnatural cut")
-    parser.add_argument(
-        "--cross-sequence", action="store_true",
-        help="Also check transitions between consecutive sequences within a chunk "
-             "(these don't affect training but indicate collection patterns)",
-    )
     args = parser.parse_args()
 
     all_chunks: list[str] = []
@@ -245,7 +227,7 @@ def main():
     global_mid_counter: Counter[tuple[int, int]] = Counter()
 
     for filepath in all_chunks:
-        result = scan_chunk(filepath, verbose=args.verbose, cross_sequence=args.cross_sequence)
+        result = scan_chunk(filepath, verbose=args.verbose)
         if result.get("skipped"):
             skipped += 1
             print(f"  SKIP {filepath}: {result['reason']}")
