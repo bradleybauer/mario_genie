@@ -1,0 +1,1 @@
+Use the conda environment named 'mario' for all Python development and usage.
