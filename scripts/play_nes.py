@@ -276,23 +276,22 @@ def main():
     print(f"Loading {name} (backend: {backend}) ...")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc=Quit")
 
-    if backend == 'nes_py':
-        from nes_py.nes_env import NESEnv
-        env = NESEnv(path)
-        obs = env.reset()
-        use_retro = False
+    if backend == 'retro':
+        _run_retro(name, path)
     else:
-        game_id = ensure_retro_game(path)
-        env = retro.make(game_id, state=retro.State.NONE, render_mode='rgb_array',
-                         use_restricted_actions=retro.Actions.ALL)
-        obs, _info = env.reset()
-        use_retro = True
+        _run_nes_py(name, path)
 
+
+def _run_nes_py(name, path):
+    """Game loop using nes_py + pygame."""
+    from nes_py.nes_env import NESEnv
+    env = NESEnv(path)
+    obs = env.reset()
     h, w, _ = obs.shape
 
     pygame.init()
     screen = pygame.display.set_mode((w * SCALE_FACTOR, h * SCALE_FACTOR))
-    pygame.display.set_caption(f"{name} ({backend})")
+    pygame.display.set_caption(f"{name} (nes_py)")
     clock = pygame.time.Clock()
     controller = GamepadController()
 
@@ -305,18 +304,10 @@ def main():
                 running = False
             controller.process_event(event)
 
-        action_byte = controller.get_action()
-
-        if use_retro:
-            obs, reward, terminated, truncated, info = env.step(
-                nes_byte_to_retro_action(action_byte)
-            )
-            if terminated or truncated:
-                obs, _info = env.reset()
-        else:
-            obs, reward, done, info = env.step(action_byte)
-            if done:
-                obs = env.reset()
+        action = controller.get_action()
+        obs, reward, done, info = env.step(action)
+        if done:
+            obs = env.reset()
 
         surface = pygame.surfarray.make_surface(np.swapaxes(obs, 0, 1))
         screen.blit(
@@ -328,6 +319,100 @@ def main():
 
     env.close()
     pygame.quit()
+
+
+def _run_retro(name, path):
+    """Game loop using stable-retro's native viewer (pyglet) at SCALE_FACTOR."""
+    import pyglet.window.key as pkey
+
+    # Pyglet key -> NES button name (same bindings as pygame KEY_MAP)
+    PYGLET_KEY_MAP = {
+        pkey.RIGHT: 'RIGHT', pkey.D: 'RIGHT',
+        pkey.LEFT: 'LEFT',   pkey.A: 'LEFT',
+        pkey.UP: 'UP',       pkey.W: 'UP',
+        pkey.DOWN: 'DOWN',   pkey.S: 'DOWN',
+        pkey.X: 'A',         pkey.O: 'A',
+        pkey.Z: 'B',         pkey.P: 'B',
+        pkey.RETURN: 'START', pkey.SPACE: 'START',
+        pkey.RSHIFT: 'SELECT',
+    }
+
+    game_id = ensure_retro_game(path)
+    env = retro.make(game_id, state=retro.State.NONE, render_mode='human',
+                     use_restricted_actions=retro.Actions.ALL)
+    obs, _info = env.reset()
+    h, w, _ = obs.shape
+
+    # First step triggers viewer creation
+    obs, *_ = env.step(np.zeros(9, dtype=np.int8))
+
+    # Resize the viewer window (GL stretches the texture to fill)
+    env.viewer.window.set_size(w * SCALE_FACTOR, h * SCALE_FACTOR)
+    env.viewer.window.set_caption(f"{name} (retro)")
+
+    # Hook keyboard events on the pyglet viewer window
+    held: set[str] = set()
+    quit_requested = False
+
+    @env.viewer.window.event
+    def on_key_press(symbol, modifiers):
+        nonlocal quit_requested
+        if symbol in (pkey.ESCAPE, pkey.Q):
+            quit_requested = True
+            return
+        btn = PYGLET_KEY_MAP.get(symbol)
+        if btn:
+            held.add(btn)
+
+    @env.viewer.window.event
+    def on_key_release(symbol, modifiers):
+        btn = PYGLET_KEY_MAP.get(symbol)
+        if btn:
+            held.discard(btn)
+
+    # Gamepad via evdev / USB (does not need pygame)
+    gamepad = GamepadState(extended_button_codes=True)
+
+    import time
+    target_dt = 1.0 / FPS
+
+    while env.viewer.isopen and not quit_requested:
+        t0 = time.monotonic()
+        gamepad.poll()
+        gp = gamepad.read_buttons()
+
+        right = 'RIGHT' in held or gp.right
+        left = 'LEFT' in held or gp.left
+        up = 'UP' in held or gp.up
+        down = 'DOWN' in held or gp.down
+        a_btn = 'A' in held or gp.a_btn
+        b_btn = 'B' in held or gp.b_btn
+        start = 'START' in held or gp.start
+        sel = 'SELECT' in held or gp.select
+
+        if right and left:
+            right = left = False
+        if up and down:
+            up = down = False
+
+        byte = 0
+        for btn_name, pressed in [('A', a_btn), ('B', b_btn), ('SELECT', sel),
+                                   ('START', start), ('UP', up), ('DOWN', down),
+                                   ('LEFT', left), ('RIGHT', right)]:
+            if pressed:
+                byte |= (1 << BUTTON_BITS[btn_name])
+
+        obs, reward, terminated, truncated, info = env.step(
+            nes_byte_to_retro_action(byte)
+        )
+        if terminated or truncated:
+            obs, _info = env.reset()
+
+        elapsed = time.monotonic() - t0
+        if elapsed < target_dt:
+            time.sleep(target_dt - elapsed)
+
+    env.close()
 
 
 if __name__ == "__main__":
