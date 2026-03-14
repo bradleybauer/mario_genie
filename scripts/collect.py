@@ -54,6 +54,8 @@ from mario_world_model.coverage import (
     scan_progression_coverage,
     validate_progression_bin_size,
 )
+
+from mario_world_model.config import SEQUENCE_LENGTH
 from mario_world_model.envs import make_shimmed_env
 from mario_world_model.palette_mapper import PaletteMapper
 from mario_world_model.preprocess import preprocess_frame
@@ -517,10 +519,12 @@ def find_balance_target(
     output_dir: Path,
     progression_bin_size: int,
     rng: random.Random,
-) -> Optional[tuple[int, int, list[int], int]]:
+) -> Optional[tuple[int, int, list[tuple[list[int], int]]]]:
     """Scan existing data, find most underrepresented region, return replay info.
 
-    Returns ``(world, stage, replay_actions, target_step)`` or ``None``.
+    Returns ``(world, stage, replay_candidates)`` or ``None``, where each
+    candidate is a ``(actions, target_step)`` pair.  An empty list means
+    start from the beginning of the level.
     """
     prog_cov = scan_progression_coverage(str(output_dir), bin_size=progression_bin_size)
     try:
@@ -545,14 +549,14 @@ def find_balance_target(
     w, s, b = rng.choices(keys, weights=weights, k=1)[0]
 
     if b == 0:
-        return (w, s, [], 0)
+        return (w, s, [])
 
     replays = ri.find_all_replay_actions(w, s, b, bin_size=progression_bin_size)
     if not replays:
-        return (w, s, [], 0)
+        return (w, s, [])
 
-    actions_list, target_step = rng.choice(replays)
-    return (w, s, actions_list, target_step)
+    rng.shuffle(replays)
+    return (w, s, replays)
 
 
 def _make_replay_renderer(fps: int = 30):
@@ -603,56 +607,72 @@ def _select_balance_target(
     output_dir: Path,
     progression_bin_size: int,
     rng: random.Random,
-) -> tuple[Optional[int], Optional[int], list[int], int]:
-    """Run balance selection.  Returns (world, stage, replay_actions, target_step)."""
+) -> tuple[Optional[int], Optional[int], list[tuple[list[int], int]]]:
+    """Run balance selection.  Returns (world, stage, replay_candidates)."""
     bin_size = validate_progression_bin_size(progression_bin_size)
     result = find_balance_target(output_dir, bin_size, rng)
     if result is not None:
-        w, s, actions, step = result
-        if step > 0:
-            print(f"[balance] Target: World {w}-{s}, replay {step} steps")
+        w, s, candidates = result
+        if candidates:
+            print(f"[balance] Target: World {w}-{s}, {len(candidates)} replay candidate(s)")
         else:
             print(f"[balance] Target: World {w}-{s} from level start")
-        return w, s, actions, step
+        return w, s, candidates
     print("[balance] No balance target found, using default")
-    return None, None, [], 0
+    return None, None, []
+
+
+_MAX_REPLAY_RETRIES = 10
 
 
 def _build_env_and_replay(
     world: Optional[int],
     stage: Optional[int],
     seed: int,
-    replay_actions: list[int],
-    target_step: int,
+    replay_candidates: list[tuple[list[int], int]],
     max_episode_steps: Optional[int],
     output_dir: Path,
     visualize_replays: bool,
     visualize_fps: int,
 ) -> tuple[gym.Env, np.ndarray, dict, int, list[int]]:
-    """Build env, run replay fast-forward.
+    """Build env, run replay fast-forward with retries.
+
+    Tries each candidate replay in order (up to ``_MAX_REPLAY_RETRIES``).
+    Failed replays are removed from ``rollouts.jsonl``.  If all candidates
+    fail, falls back to level start.
 
     Returns (env, obs, info, replay_prefix_length, replay_x_positions).
     """
     if (world is None) != (stage is None):
         raise ValueError("--world and --stage must both be specified, or both omitted")
 
-    # Always use natural progression (lock_level=False) so deaths
-    # decrement lives instead of resetting the entire episode.
-    env = make_shimmed_env(world=world, stage=stage, seed=seed, lock_level=False)
-    if max_episode_steps is not None:
-        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+    def _make_env() -> gym.Env:
+        env = make_shimmed_env(world=world, stage=stage, seed=seed, lock_level=False)
+        if max_episode_steps is not None:
+            env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
+        return env
 
-    obs, info = env.reset(seed=seed)
-    replay_prefix_length = 0
-    replay_x_positions: list[int] = []
+    replay_render = None
+    if visualize_replays and replay_candidates:
+        pygame.init()
+        replay_render = _make_replay_renderer(fps=visualize_fps)
 
-    if replay_actions and target_step > 0:
-        replay_render = None
-        if visualize_replays:
-            pygame.init()
-            replay_render = _make_replay_renderer(fps=visualize_fps)
+    candidates_to_try = replay_candidates[:_MAX_REPLAY_RETRIES]
+    env = _make_env()
 
-        print(f"[replay] Fast-forwarding {target_step} steps on World {world}-{stage}...")
+    for attempt, (replay_actions, target_step) in enumerate(candidates_to_try):
+        if target_step <= 0 or not replay_actions:
+            continue
+
+        obs, info = env.reset(seed=seed)
+        replay_prefix_length = 0
+        replay_x_positions: list[int] = []
+        failed = False
+
+        print(
+            f"[replay] Attempt {attempt + 1}/{len(candidates_to_try)}: "
+            f"fast-forwarding {target_step} steps on World {world}-{stage}..."
+        )
         for i in range(min(target_step, len(replay_actions))):
             obs, _, term, trunc, info = env.step(replay_actions[i])
             replay_prefix_length += 1
@@ -660,18 +680,25 @@ def _build_env_and_replay(
             if replay_render is not None:
                 replay_render(obs)
             if term or trunc:
-                print(f"[replay] FAILED at step {i+1}/{target_step} — falling back to level start")
+                print(f"[replay] FAILED at step {i+1}/{target_step}")
                 remove_rollout_from_jsonl(
                     output_dir / "rollouts.jsonl", world, stage, replay_actions,
                 )
-                obs, info = env.reset(seed=seed)
-                replay_prefix_length = 0
-                replay_x_positions = []
+                # Rebuild env to get a clean state for the next attempt
+                env.close()
+                env = _make_env()
+                failed = True
                 break
-        else:
-            print(f"[replay] OK — x={info.get('x_pos', '?')} after {replay_prefix_length} steps")
 
-    return env, obs, info, replay_prefix_length, replay_x_positions
+        if not failed:
+            print(f"[replay] OK — x={info.get('x_pos', '?')} after {replay_prefix_length} steps")
+            return env, obs, info, replay_prefix_length, replay_x_positions
+
+    # All candidates failed (or none provided) — start from level beginning
+    if candidates_to_try:
+        print(f"[replay] All {len(candidates_to_try)} candidate(s) failed, falling back to level start")
+    obs, info = env.reset(seed=seed)
+    return env, obs, info, 0, []
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +721,7 @@ def run_collection(
     progression_bin_size: int,
     max_episode_steps: Optional[int],
     max_session_seconds: Optional[float],
+    game_over_frames: int = SEQUENCE_LENGTH-1,
 ):
     run_started = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -734,11 +762,10 @@ def run_collection(
 
             # --- Determine starting position ---
             cur_world, cur_stage = world, stage
-            replay_actions: list[int] = []
-            target_step = 0
+            replay_candidates: list[tuple[list[int], int]] = []
 
-            if balance or (session_num > 0 and max_session_seconds is not None):
-                bw, bs, replay_actions, target_step = _select_balance_target(
+            if balance or session_num > 0:
+                bw, bs, replay_candidates = _select_balance_target(
                     output_dir, progression_bin_size, rng,
                 )
                 if bw is not None and bs is not None:
@@ -764,7 +791,7 @@ def run_collection(
                 env.close()
             env, obs, info, replay_prefix_length, replay_x_positions = (
                 _build_env_and_replay(
-                    cur_world, cur_stage, seed, replay_actions, target_step,
+                    cur_world, cur_stage, seed, replay_candidates,
                     max_episode_steps, output_dir, visualize_replays, visualize_fps,
                 )
             )
@@ -775,6 +802,17 @@ def run_collection(
             prev_life = int(info.get("life", 2))
 
             # --- Episode tracker (per session) ---
+            # If replay succeeded, seed the tracker with the replayed
+            # trajectory so rollouts remain replayable from level start.
+            replay_actions: list[int] = []
+            if replay_prefix_length > 0 and replay_candidates:
+                # The successful candidate is the one whose prefix_length
+                # matched — recover its actions for tracker seeding.
+                for cand_actions, cand_step in replay_candidates:
+                    if len(cand_actions) >= replay_prefix_length:
+                        replay_actions = cand_actions
+                        break
+
             tracker = EpisodeTracker(1)
             tracker.set_initial_info(
                 0,
@@ -789,6 +827,8 @@ def run_collection(
             writer = SessionWriter(output_dir)
             steps_this_session = 0
             rollout: Optional[object] = None
+            game_over_countdown: Optional[int] = None
+            session_ended_by_game_over = False
 
             # --- Collection loop ---
             for _ in range(remaining_steps):
@@ -923,6 +963,10 @@ def run_collection(
                         if max_episode_steps is not None:
                             env = gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
                         print("[game over] Restarting from W1-1")
+                        # Start countdown: record a few frames of the 1-1
+                        # restart, then end the session so the next one can
+                        # balance-select a new starting position.
+                        game_over_countdown = game_over_frames
 
                     obs, info = env.reset()
                     prev_life = int(info.get("life", 2))
@@ -936,6 +980,18 @@ def run_collection(
                         stage=int(info.get("stage", 1)),
                         life=prev_life,
                     )
+
+                # Game-over countdown: record a few post-reset frames then
+                # end the session so the outer loop can balance-select.
+                if game_over_countdown is not None:
+                    game_over_countdown -= 1
+                    if game_over_countdown <= 0:
+                        session_ended_by_game_over = True
+                        print(
+                            f"[session {session_num}] Game-over rotation "
+                            f"({game_over_frames} post-reset frames captured)"
+                        )
+                        break
 
                 if steps_this_session % 500 == 0:
                     print(
@@ -973,8 +1029,10 @@ def run_collection(
 
             session_num += 1
 
-            # Without a session duration limit, only one session per run
-            if max_session_seconds is None:
+            # Continue looping if session ended by game-over (balance-select
+            # next starting position) or by duration limit.  Otherwise the
+            # run produced a single uninterrupted session — stop.
+            if not session_ended_by_game_over and max_session_seconds is None:
                 break
 
     except KeyboardInterrupt:
@@ -1065,6 +1123,11 @@ def parse_args() -> argparse.Namespace:
         help="Max duration per session in seconds.  When reached, the current "
              "session is saved and a new one starts at a balance-selected position.",
     )
+    parser.add_argument(
+        "--game-over-frames", type=int, default=SEQUENCE_LENGTH-1,
+        help="Number of post-reset frames to record after a game-over before "
+             "ending the session (default: %(default)s, ~0.25s at 60 FPS)",
+    )
     return parser.parse_args()
 
 
@@ -1086,6 +1149,7 @@ def main():
         progression_bin_size=args.progression_bin_size,
         max_episode_steps=args.max_episode_steps,
         max_session_seconds=args.max_session_seconds,
+        game_over_frames=args.game_over_frames,
     )
     # Force-exit to avoid segfault from nes-py C++ cleanup during Python GC
     os._exit(0)
