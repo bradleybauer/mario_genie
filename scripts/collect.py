@@ -55,7 +55,6 @@ from mario_world_model.coverage import (
     validate_progression_bin_size,
 )
 
-from mario_world_model.config import SEQUENCE_LENGTH
 from mario_world_model.envs import make_shimmed_env
 from mario_world_model.palette_mapper import PaletteMapper
 from mario_world_model.preprocess import preprocess_frame
@@ -769,7 +768,7 @@ def run_collection(
     progression_bin_size: int,
     max_episode_steps: Optional[int],
     max_session_seconds: Optional[float],
-    game_over_frames: int = SEQUENCE_LENGTH-1,
+    game_over_frames: int = 180,
 ):
     run_started = time.time()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1188,7 +1187,7 @@ def parse_args() -> argparse.Namespace:
              "session is saved and a new one starts at a balance-selected position.",
     )
     parser.add_argument(
-        "--game-over-frames", type=int, default=SEQUENCE_LENGTH-1,
+        "--game-over-frames", type=int, default=180,
         help="Number of post-reset frames to record after a game-over before "
              "ending the session (default: %(default)s, ~0.25s at 60 FPS)",
     )

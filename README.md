@@ -123,7 +123,7 @@ It clearly has a much better grasp of spatial layout within the image.
 <br>
 <br>
 
-# Dataset Refactor #32515123
+# Dataset Refactor Number 32515123
 
 **Context:** 
 All previous data designs were fundamentally flawed — they used random level selection and even included completely random scene cuts mid-sequence. This project demands a dataset that reflects real game mechanics: contiguous gameplay with natural transitions only.
@@ -133,6 +133,30 @@ The old pipeline ran multiple environments in parallel, writing fixed-length chu
 
 **Result:**
 Data collection now produces sessions that faithfully represent real gameplay. Training code is simpler and no longer needs to detect and skip corrupted sequences at load time.
+
+<br>
+<br>
+
+# Hidden State
+
+**Context:** 
+If mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training.
+
+**Approach:** 
+Potentially add a temporal embedding of the NES 2kb's of ram to the latent space.
+Wonder how that would effect what the encoder learns to encode. Probably a shift toward more visual features?
+An idea is you could side-step the image encoder all together. Just predict pixels based on RAM embeddings.
+Talking with AI about it leads me to believe using both images & ram will perform better than either alone.
+The image embeddings are a 16x16 grid of features where that grid is a spatial "bias". It may be easier
+to disentagnle certain spatial information from the image than it is from RAM?
+
+I added a really neat NES ram visualizer
+![alt text](pictures/ram.png)
+
+TODO
+
+**Result:** 
+TODO
 
 <!-- Template -->
 
