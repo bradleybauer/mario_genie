@@ -5,6 +5,8 @@
 - [Uniform Data Collection](#uniform-data-collection)
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
+- [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
+- [Hidden State](#hidden-state)
 
 <br>
 
