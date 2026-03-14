@@ -127,7 +127,7 @@ def _write_output_json(output_path: Optional[Path], payload: dict[str, object]) 
 
 
 def _data_fingerprint(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
-    paths = sorted(data_dir.glob("session_*.meta.json"))
+    paths = sorted(data_dir.rglob("session_*.meta.json"))
     rollout_path = data_dir / "rollouts.jsonl"
     if rollout_path.exists():
         paths.append(rollout_path)

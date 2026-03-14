@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -68,7 +69,6 @@ from mario_world_model.storage import _compute_summaries
 # Constants
 # ---------------------------------------------------------------------------
 
-INFO_KEYS = ["coins", "flag_get", "life", "score", "stage", "time", "world", "x_pos", "y_pos"]
 STATUS_MAP = {"small": 0, "tall": 1, "fireball": 2}
 
 
@@ -92,7 +92,13 @@ class SessionMeta:
 
 
 class SessionWriter:
-    """Accumulates frames and metadata, writes a single session ``.npz``."""
+    """Accumulates frames and metadata, writes a single session ``.npz``.
+
+    Uses a pre-allocated numpy buffer that doubles in capacity when full,
+    avoiding the 2x peak-memory hit of list-of-arrays + np.stack.
+    """
+
+    _INITIAL_CAPACITY = 8192
 
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -105,10 +111,26 @@ class SessionWriter:
         else:
             self._session_index = 0
         self.session_id = f"{self._session_index:06d}"
-        self._frames: list[np.ndarray] = []
+        self._frames: np.ndarray | None = None  # allocated on first append
+        self._capacity = 0
+        self._size = 0
         self._actions: list[int] = []
         self._dones: list[bool] = []
         self._metadata: dict[str, list[int]] = {}
+
+    def _ensure_capacity(self, frame_chw: np.ndarray) -> None:
+        if self._frames is None:
+            self._capacity = self._INITIAL_CAPACITY
+            self._frames = np.empty(
+                (self._capacity, *frame_chw.shape), dtype=frame_chw.dtype
+            )
+        elif self._size >= self._capacity:
+            self._capacity *= 2
+            new_buf = np.empty(
+                (self._capacity, *frame_chw.shape), dtype=frame_chw.dtype
+            )
+            new_buf[: self._size] = self._frames[: self._size]
+            self._frames = new_buf
 
     def append(
         self,
@@ -117,7 +139,10 @@ class SessionWriter:
         done: bool,
         **metadata: int,
     ) -> None:
-        self._frames.append(frame_chw)
+        self._ensure_capacity(frame_chw)
+        assert self._frames is not None
+        self._frames[self._size] = frame_chw
+        self._size += 1
         self._actions.append(action)
         self._dones.append(done)
         for k, v in metadata.items():
@@ -127,17 +152,17 @@ class SessionWriter:
 
     @property
     def num_frames(self) -> int:
-        return len(self._frames)
+        return self._size
 
     def write(self, meta: SessionMeta) -> Path:
-        """Stack all accumulated data and write to a compressed ``.npz``."""
+        """Write accumulated data to a compressed ``.npz``."""
         npz_path = self.output_dir / f"session_{self.session_id}.npz"
         meta_path = self.output_dir / f"session_{self.session_id}.meta.json"
 
-        if not self._frames:
+        if self._size == 0 or self._frames is None:
             raise ValueError("No frames to write")
 
-        frames = np.stack(self._frames, axis=0)   # (N, C, H, W)
+        frames = self._frames[: self._size]  # view, no copy
         actions = np.asarray(self._actions, dtype=np.uint8)
         dones = np.asarray(self._dones, dtype=bool)
 
@@ -191,7 +216,6 @@ class ActionPolicy:
         self._jump_index = self._lookup_action("a")
         self._down_index = self._lookup_action("down")
 
-        self._heuristic_candidates = self._build_heuristic_candidates()
         self._last_x = 0
         self._last_time: Optional[int] = None
         self._last_level: Optional[tuple[int, int]] = None
@@ -213,25 +237,6 @@ class ActionPolicy:
         self._jump_until = self._t
         self._sprint_until = self._t
         self._backtrack_until = self._t
-
-    def _build_heuristic_candidates(self) -> list[int]:
-        preferred = [
-            frozenset({"right"}),
-            frozenset({"right", "a"}),
-            frozenset({"right", "b"}),
-            frozenset({"right", "a", "b"}),
-            frozenset({"left"}),
-            frozenset({"a"}),
-            frozenset({"down"}),
-        ]
-        out: list[int] = []
-        for key in preferred:
-            idx = self._action_to_index.get(key)
-            if idx is not None and idx not in out:
-                out.append(idx)
-        if not out:
-            out.append(self._noop_index)
-        return out
 
     def update_action_weights(self, weights: dict[int, float]) -> None:
         raw = [max(0.0, weights.get(a, 0.0)) for a in range(self.num_actions)]
@@ -933,7 +938,6 @@ def run_collection(
                     )
 
                 if steps_this_session % 500 == 0:
-                    elapsed_total = remaining_steps - steps_this_session
                     print(
                         f"[step {total_steps - remaining_steps + steps_this_session}/{total_steps}] "
                         f"session_frames={writer.num_frames}"
@@ -1083,6 +1087,8 @@ def main():
         max_episode_steps=args.max_episode_steps,
         max_session_seconds=args.max_session_seconds,
     )
+    # Force-exit to avoid segfault from nes-py C++ cleanup during Python GC
+    os._exit(0)
 
 
 if __name__ == "__main__":

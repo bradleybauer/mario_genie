@@ -92,8 +92,8 @@ def _scan_progression_from_meta(
 
 
 def _find_data_files(data_dir: Path) -> list[Path]:
-    """Find all session .npz files in a data directory."""
-    return sorted(data_dir.glob("session_*.npz"))
+    """Find all session .npz files in a data directory, recursively."""
+    return sorted(data_dir.rglob("session_*.npz"))
 
 
 def scan_progression_coverage(
