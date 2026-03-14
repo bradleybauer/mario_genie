@@ -8,6 +8,8 @@
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
 - [Hidden State](#hidden-state)
 
+![meme](pictures/meme.png)
+
 <br>
 
 # Single Sample Overfit Baseline
@@ -161,13 +163,15 @@ For embedding purposes, **Zero Page + Game Data (1,536 bytes)** captures all mea
 The NES CPU runs at ~1.79 MHz (~29,781 cycles per frame), but the game loop is frame-synchronized: the PPU fires a Vertical Blank NMI at 60 Hz, the game logic runs atomically within that window, then idles until the next NMI. The emulator's `env.step()` advances one full NMI-to-NMI cycle and then exposes RAM — this is the only coherent snapshot where all variables agree with each other. One RAM snapshot per frame = zero information loss.
 
 **Approach:** 
-Add a learned embedding of the NES RAM to the latent space via feature concatenation. A small encoder (2–3 FC layers) maps the 1,536-byte RAM vector to a D-dim embedding matching the latent channel dimension, which is then broadcast spatially to 16×16 and concatenated with the image latent. The RAM encoder trains jointly with the rest of the model.
+Potentially add a temporal embedding of the NES 2KB of RAM to the latent space.
+Wonder how that would affect what the encoder learns to encode. Probably a shift toward more visual features?
+An idea is you could side-step the image encoder altogether. Just predict pixels based on RAM embeddings.
+Talking with AI about it leads me to believe using both images & RAM will perform better than either alone.
+The image embeddings are a 16x16 grid of features where that grid is a spatial "bias". It may be easier
+to disentangle certain spatial information from the image than it is from RAM.
 
-Using both images and RAM should perform better than either alone. The image embeddings are a 16×16 grid of features with inherent spatial bias — it may be easier to disentangle certain spatial information from the image than from RAM, and vice versa.
-
-For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well.
-
-I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
+- **ai slop**
+For storage, the RAM can be delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. The stack and OAM regions could also be excluded entirely (saving ~37% raw) since they're either noise or redundant with the image. Add a learned embedding of the NES RAM to the latent space via feature concatenation. A small encoder (2–3 FC layers) maps the 1,536-byte RAM vector to a D-dim embedding matching the latent channel dimension, which is then broadcast spatially to 16×16 and concatenated with the image latent. The RAM encoder trains jointly with the rest of the model. Using both images and RAM should perform better than either alone. The image embeddings are a 16×16 grid of features with inherent spatial bias — it may be easier to disentangle certain spatial information from the image than from RAM, and vice versa. For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
 ![alt text](pictures/ram.png)
 
 **Result:** 
