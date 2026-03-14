@@ -12,7 +12,7 @@ Controls:
     Arrow keys / WASD  - D-Pad
     X / O              - A (jump / confirm)
     Z / P              - B (run / back)
-    Enter              - Start
+    Enter / Space      - Start
     Right Shift        - Select
     Escape / Q         - Quit
     Gamepad also supported via evdev.
@@ -20,15 +20,16 @@ Controls:
 import sys
 import os
 import glob
-import select
 
 import numpy as np
 import pygame
 
-try:
-    import evdev
-except ImportError:
-    evdev = None
+PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
+SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+from mario_world_model.gamepad import GamepadState
 
 # --- Configuration ---
 ROM_DIR = os.path.join(os.path.dirname(__file__), '..', 'nes')
@@ -94,116 +95,59 @@ def choose_rom(roms):
         print("Invalid choice, try again.")
 
 
+# Keyboard keys tracked via KEYDOWN/KEYUP events for reliable detection.
+# Maps pygame key constant -> NES button name.
+KEY_MAP = {
+    pygame.K_RIGHT: 'RIGHT', pygame.K_d: 'RIGHT',
+    pygame.K_LEFT: 'LEFT',   pygame.K_a: 'LEFT',
+    pygame.K_UP: 'UP',       pygame.K_w: 'UP',
+    pygame.K_DOWN: 'DOWN',   pygame.K_s: 'DOWN',
+    pygame.K_x: 'A',         pygame.K_o: 'A',
+    pygame.K_z: 'B',         pygame.K_p: 'B',
+    pygame.K_RETURN: 'START', pygame.K_KP_ENTER: 'START', pygame.K_SPACE: 'START',
+    pygame.K_RSHIFT: 'SELECT',
+}
+
+
 class GamepadController:
-    """Reads keyboard + evdev gamepad and returns an NES controller byte."""
+    """Reads keyboard + gamepad and returns an NES controller byte."""
     def __init__(self):
-        self._evdev_device = None
-        self._evdev_axes = {"ABS_X": 128, "ABS_Y": 128}
-        self._evdev_buttons = set()
-        self._evdev_axis_ranges = {}
-        self._init_evdev()
+        self._gamepad = GamepadState(extended_button_codes=True)
+        self._held: set[str] = set()  # NES button names currently held
 
-    def _init_evdev(self):
-        if evdev is None:
-            return
-        try:
-            for path in evdev.list_devices():
-                try:
-                    dev = evdev.InputDevice(path)
-                except PermissionError:
-                    continue
-                caps = dev.capabilities(verbose=False)
-                if evdev.ecodes.EV_ABS in caps or evdev.ecodes.EV_KEY in caps:
-                    self._evdev_device = dev
-                    for abs_code, abs_info in caps.get(evdev.ecodes.EV_ABS, []):
-                        name = evdev.ecodes.ABS.get(abs_code, f"ABS_{abs_code}")
-                        if isinstance(name, list):
-                            name = name[0]
-                        mid = (abs_info.min + abs_info.max) // 2
-                        self._evdev_axes[name] = mid
-                        self._evdev_axis_ranges[name] = (abs_info.min, abs_info.max)
-                    print(f"Gamepad: {dev.name} ({dev.path})")
-                    return
-        except Exception as exc:
-            print(f"Gamepad probe failed: {exc}")
+    def process_event(self, event: pygame.event.Event) -> None:
+        """Track key presses/releases via events (more reliable than get_pressed)."""
+        if event.type == pygame.KEYDOWN:
+            btn = KEY_MAP.get(event.key)
+            if btn:
+                self._held.add(btn)
+        elif event.type == pygame.KEYUP:
+            btn = KEY_MAP.get(event.key)
+            if btn:
+                self._held.discard(btn)
 
-    def _poll_evdev(self):
-        dev = self._evdev_device
-        if dev is None:
-            return
-        try:
-            while select.select([dev.fd], [], [], 0)[0]:
-                for event in dev.read():
-                    if event.type == evdev.ecodes.EV_ABS:
-                        name = evdev.ecodes.ABS.get(event.code, f"ABS_{event.code}")
-                        if isinstance(name, list):
-                            name = name[0]
-                        # print(f"  [axis] {name}={event.value}")
-                        self._evdev_axes[name] = event.value
-                    elif event.type == evdev.ecodes.EV_KEY:
-                        btn_name = evdev.ecodes.BTN.get(event.code) or evdev.ecodes.KEY.get(event.code) or '???'
-                        if isinstance(btn_name, list):
-                            btn_name = btn_name[0]
-                        state = 'PRESSED' if event.value >= 1 else 'released'
-                        # print(f"  [btn] code={event.code}  name={btn_name}  {state}")
-                        if event.value >= 1:
-                            self._evdev_buttons.add(event.code)
-                        else:
-                            self._evdev_buttons.discard(event.code)
-        except (OSError, IOError):
-            print("Gamepad disconnected!")
-            self._evdev_device = None
-
-    def get_action(self, keys) -> int:
+    def get_action(self) -> int:
         """Return an NES controller byte (0-255) from keyboard + gamepad state."""
-        self._poll_evdev()
+        self._gamepad.poll()
 
-        right = keys[pygame.K_RIGHT] or keys[pygame.K_d]
-        left = keys[pygame.K_LEFT] or keys[pygame.K_a]
-        up = keys[pygame.K_UP] or keys[pygame.K_w]
-        down = keys[pygame.K_DOWN] or keys[pygame.K_s]
-        a_btn = keys[pygame.K_x] or keys[pygame.K_o]
-        b_btn = keys[pygame.K_z] or keys[pygame.K_p]
-        start = keys[pygame.K_RETURN]
-        sel = keys[pygame.K_RSHIFT]
+        right = 'RIGHT' in self._held
+        left = 'LEFT' in self._held
+        up = 'UP' in self._held
+        down = 'DOWN' in self._held
+        a_btn = 'A' in self._held
+        b_btn = 'B' in self._held
+        start = 'START' in self._held
+        sel = 'SELECT' in self._held
 
-        if self._evdev_device is not None:
-            def _norm(axis):
-                lo, hi = self._evdev_axis_ranges.get(axis, (0, 255))
-                mid = (lo + hi) / 2.0
-                half = max((hi - lo) / 2.0, 1)
-                return (self._evdev_axes.get(axis, mid) - mid) / half
-
-            x, y = _norm("ABS_X"), _norm("ABS_Y")
-            right = right or x > 0.5
-            left = left or x < -0.5
-            up = up or y < -0.5
-            down = down or y > 0.5
-
-            hx, hy = _norm("ABS_HAT0X"), _norm("ABS_HAT0Y")
-            right = right or hx > 0.5
-            left = left or hx < -0.5
-            up = up or hy < -0.5
-            down = down or hy > 0.5
-
-            btns = self._evdev_buttons
-            a_btn = a_btn or any(b in btns for b in [
-                getattr(evdev.ecodes, 'BTN_SOUTH', 304),
-                getattr(evdev.ecodes, 'BTN_THUMB', 289),
-            ])
-            b_btn = b_btn or any(b in btns for b in [
-                getattr(evdev.ecodes, 'BTN_WEST', 308),
-                getattr(evdev.ecodes, 'BTN_EAST', 305),
-                getattr(evdev.ecodes, 'BTN_TRIGGER', 288),
-            ])
-            start = start or any(b in btns for b in [
-                getattr(evdev.ecodes, 'BTN_START', 315),
-                297,  # BTN_BASE4 on generic USB gamepads
-            ])
-            sel = sel or any(b in btns for b in [
-                getattr(evdev.ecodes, 'BTN_SELECT', 314),
-                296,  # BTN_BASE3 on generic USB gamepads
-            ])
+        gp = self._gamepad.read_buttons()
+        right = right or gp.right
+        left = left or gp.left
+        up = up or gp.up
+        down = down or gp.down
+        a_btn = a_btn or gp.a_btn
+        b_btn = b_btn or gp.b_btn
+        start = start or gp.start
+        sel = sel or gp.select
 
         if right and left:
             right = left = False
@@ -216,11 +160,6 @@ class GamepadController:
                                ('LEFT', left), ('RIGHT', right)]:
             if pressed:
                 byte |= (1 << BUTTON_BITS[name])
-        if byte:
-            active = [n for n, p in [('A', a_btn), ('B', b_btn), ('SEL', sel),
-                      ('START', start), ('UP', up), ('DOWN', down),
-                      ('LEFT', left), ('RIGHT', right)] if p]
-            # print(f"  -> action={byte} ({'+'.join(active)})")
         return byte
 
 
@@ -237,6 +176,7 @@ def main():
         return
 
     print(f"Loading {name} ...")
+    print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc=Quit")
     from nes_py.nes_env import NESEnv
     env = NESEnv(path)
     obs = env.reset()
@@ -255,9 +195,9 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
+            controller.process_event(event)
 
-        keys = pygame.key.get_pressed()
-        action = controller.get_action(keys)
+        action = controller.get_action()
 
         obs, reward, done, info = env.step(action)
         if done:

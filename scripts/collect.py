@@ -33,9 +33,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-import select
-
-import evdev
 import gymnasium as gym
 import numpy as np
 import pygame
@@ -46,6 +43,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from mario_world_model.actions import get_action_meanings, get_num_actions
+from mario_world_model.gamepad import GamepadState
 from mario_world_model.coverage import (
     PROGRESSION_BIN_SIZE,
     compute_action_balance,
@@ -373,69 +371,7 @@ class HumanActionPolicy:
         self.clock = pygame.time.Clock()
         self._action_to_index = {frozenset(token.lower() for token in action): idx for idx, action in enumerate(action_meanings)}
         self._noop_index = self._action_to_index.get(frozenset({"noop"}), 0)
-
-        self._evdev_device: evdev.InputDevice | None = None
-        self._evdev_axes = {"ABS_X": 128, "ABS_Y": 128}
-        self._evdev_buttons: set[int] = set()
-        self._init_evdev_gamepad()
-
-    def _init_evdev_gamepad(self) -> None:
-        try:
-            paths = evdev.list_devices()
-            if not paths:
-                print("No evdev input devices found. Falling back to keyboard.")
-                return
-            for path in paths:
-                try:
-                    dev = evdev.InputDevice(path)
-                except PermissionError:
-                    print(f"Permission denied: {path}")
-                    print(f"  Fix: sudo chmod 666 {path}")
-                    print(f"  Permanent: sudo usermod -aG input $(whoami)  (then restart WSL)")
-                    continue
-                caps = dev.capabilities(verbose=False)
-                has_abs = evdev.ecodes.EV_ABS in caps
-                has_key = evdev.ecodes.EV_KEY in caps
-                if has_abs and has_key:
-                    self._evdev_device = dev
-                    self._evdev_axis_ranges: dict[str, tuple[int, int]] = {}
-                    for abs_code, abs_info in caps.get(evdev.ecodes.EV_ABS, []):
-                        name = evdev.ecodes.ABS.get(abs_code, f"ABS_{abs_code}")
-                        if isinstance(name, list):
-                            name = name[0]
-                        mid = (abs_info.min + abs_info.max) // 2
-                        self._evdev_axes[name] = mid
-                        self._evdev_axis_ranges[name] = (abs_info.min, abs_info.max)
-                        if name in ("ABS_X", "ABS_Y"):
-                            self._evdev_axis_range = (abs_info.min, abs_info.max)
-                    print(f"Initialized evdev gamepad: {dev.name} ({dev.path})")
-                    print(f"  Axes: {list(self._evdev_axis_ranges.keys())}")
-                    return
-        except Exception as exc:
-            print(f"evdev gamepad probe failed: {exc}")
-        print("No gamepad found via evdev. Falling back to keyboard.")
-        print("  Hint: ensure /dev/input/event* is readable (sudo chmod 666 /dev/input/event*)")
-
-    def _poll_evdev(self) -> None:
-        dev = self._evdev_device
-        if dev is None:
-            return
-        try:
-            while select.select([dev.fd], [], [], 0)[0]:
-                for event in dev.read():
-                    if event.type == evdev.ecodes.EV_ABS:
-                        name = evdev.ecodes.ABS.get(event.code, f"ABS_{event.code}")
-                        if isinstance(name, list):
-                            name = name[0]
-                        self._evdev_axes[name] = event.value
-                    elif event.type == evdev.ecodes.EV_KEY:
-                        if event.value >= 1:
-                            self._evdev_buttons.add(event.code)
-                        else:
-                            self._evdev_buttons.discard(event.code)
-        except (OSError, IOError):
-            print("Gamepad disconnected!")
-            self._evdev_device = None
+        self._gamepad = GamepadState()
 
     def draw_frame(self, frame_hwc: np.ndarray) -> None:
         surface = pygame.surfarray.make_surface(np.transpose(frame_hwc, (1, 0, 2)))
@@ -478,32 +414,14 @@ class HumanActionPolicy:
         jump = keys[pygame.K_o]
         sprint = keys[pygame.K_p]
 
-        self._poll_evdev()
-        if self._evdev_device is not None:
-            axis_ranges = getattr(self, '_evdev_axis_ranges', {})
-
-            def _axis_norm(axis_name: str) -> float:
-                ax_min, ax_max = axis_ranges.get(axis_name, (0, 255))
-                ax_mid = (ax_min + ax_max) / 2.0
-                ax_half = max((ax_max - ax_min) / 2.0, 1)
-                return (self._evdev_axes.get(axis_name, ax_mid) - ax_mid) / ax_half
-
-            x_val = _axis_norm("ABS_X")
-            y_val = _axis_norm("ABS_Y")
-            right = right or x_val > 0.5
-            left = left or x_val < -0.5
-            up = up or y_val < -0.5
-            down = down or y_val > 0.5
-
-            hat_x = _axis_norm("ABS_HAT0X")
-            hat_y = _axis_norm("ABS_HAT0Y")
-            right = right or hat_x > 0.5
-            left = left or hat_x < -0.5
-            up = up or hat_y < -0.5
-            down = down or hat_y > 0.5
-
-            jump = jump or (evdev.ecodes.BTN_THUMB in self._evdev_buttons)
-            sprint = sprint or (evdev.ecodes.BTN_TRIGGER in self._evdev_buttons)
+        self._gamepad.poll()
+        gp = self._gamepad.read_buttons()
+        right = right or gp.right
+        left = left or gp.left
+        up = up or gp.up
+        down = down or gp.down
+        jump = jump or gp.a_btn
+        sprint = sprint or gp.b_btn
         return self._compose_action(
             right=right, left=left, up=up, down=down, jump=jump, sprint=sprint,
         )

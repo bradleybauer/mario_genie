@@ -17,6 +17,10 @@ from pathlib import Path
 
 import numpy as np
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from mario_world_model.config import SEQUENCE_LENGTH
+
 
 def gather_stats(data_dir: Path) -> dict:
     """Scan all session meta.json + npz files and return aggregate stats."""
@@ -31,12 +35,17 @@ def gather_stats(data_dir: Path) -> dict:
     dtype = None
     disk_bytes = 0
 
+    total_sequences = 0
+
     # Fast path: use meta.json when available
     for mf in meta_files:
         with open(mf) as f:
             meta = json.load(f)
         total_sessions += 1
-        total_frames += meta.get("num_frames", 0)
+        nf = meta.get("num_frames", 0)
+        total_frames += nf
+        if nf >= SEQUENCE_LENGTH:
+            total_sequences += (nf - SEQUENCE_LENGTH) // SEQUENCE_LENGTH + 1
         for act, cnt in meta.get("action_summary", {}).items():
             action_counts[int(act)] += cnt
         for key, cnt in meta.get("exact_progression_summary", {}).items():
@@ -52,6 +61,8 @@ def gather_stats(data_dir: Path) -> dict:
             actions = npz["actions"]
             total_sessions += 1
             total_frames += frames.shape[0]
+            if frames.shape[0] >= SEQUENCE_LENGTH:
+                total_sequences += (frames.shape[0] - SEQUENCE_LENGTH) // SEQUENCE_LENGTH + 1
             if frame_shape is None:
                 frame_shape = list(frames.shape)
                 dtype = str(frames.dtype)
@@ -68,6 +79,8 @@ def gather_stats(data_dir: Path) -> dict:
         "data_dir": str(data_dir),
         "num_sessions": total_sessions,
         "total_frames": total_frames,
+        "total_sequences": total_sequences,
+        "sequence_length": SEQUENCE_LENGTH,
         "frame_shape": frame_shape,
         "dtype": dtype,
         "disk_size_mb": round(disk_bytes / 1e6, 1),
@@ -84,6 +97,7 @@ def print_stats(stats: dict) -> None:
     print(f"{'='*60}")
     print(f"  Sessions:        {stats['num_sessions']}")
     print(f"  Total frames:    {stats['total_frames']:,}")
+    print(f"  Video sequences: {stats['total_sequences']:,}  (length {stats['sequence_length']})")
     if stats["frame_shape"]:
         shape = stats["frame_shape"]
         print(f"  Frame shape:     {shape}  (N, C, H, W)")
@@ -112,8 +126,18 @@ def print_stats(stats: dict) -> None:
 
 
 def main() -> None:
-    dirs = [Path(d) for d in sys.argv[1:]] if len(sys.argv) > 1 else [Path("data/nes")]
-    for d in dirs:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Quick dataset statistics summary.")
+    parser.add_argument(
+        "dirs",
+        nargs="*",
+        default=["data/nes"],
+        help="One or more data directories to scan (default: data/nes)",
+    )
+    args = parser.parse_args()
+
+    for d in [Path(p) for p in args.dirs]:
         if not d.exists():
             print(f"Warning: {d} does not exist, skipping.", file=sys.stderr)
             continue

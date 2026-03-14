@@ -31,12 +31,12 @@ from mario_world_model.coverage import (
     PROGRESSION_BIN_SIZE,
     compute_action_balance,
     compute_progression_balance,
+    print_progression_report,
     ProgressionBalanceReport,
     scan_action_coverage,
     scan_progression_coverage,
 )
 from mario_world_model.envs import default_level_pool
-from mario_world_model.rollouts import RolloutIndex
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
         help="Show action distribution balance",
     )
     parser.add_argument(
+        "--text",
+        action="store_true",
+        help="Print the progression report as text to stdout",
+    )
+    parser.add_argument(
         "--plot",
         action="store_true",
         help="Show a live matplotlib chart of progression distribution",
@@ -88,10 +93,10 @@ def parse_args() -> argparse.Namespace:
 
 def build_progression_report(data_dir: Path, progression_bin_size: int) -> ProgressionBalanceReport:
     prog_cov = scan_progression_coverage(data_dir, bin_size=progression_bin_size)
-    reachable = RolloutIndex(data_dir).reachable_bins(bin_size=progression_bin_size)
+    observed_bins = set(prog_cov.keys())
     return compute_progression_balance(
         prog_cov,
-        reachable,
+        observed_bins,
         all_levels=default_level_pool(),
         bin_size=progression_bin_size,
     )
@@ -265,6 +270,8 @@ def main() -> None:
 
     print(f"Scanning {args.data_dir} ...")
     prog_report = build_progression_report(args.data_dir, args.progression_bin_size)
+    if args.text:
+        print_progression_report(prog_report, top_n=args.top)
     output_payload = build_output_payload(args, prog_report)
     _write_output_json(args.output, output_payload)
     if args.output:
