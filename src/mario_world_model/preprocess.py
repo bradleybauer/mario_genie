@@ -9,7 +9,6 @@ from mario_world_model.config import IMAGE_SIZE
 _NES_H, _NES_W = 240, 256
 _PAD_H = max(0, 256 - _NES_H)
 _PAD_TOP = _PAD_H // 2
-_PAD_BOTTOM = _PAD_H - _PAD_TOP
 # Width padding is 0 for 256-wide frames, so no horizontal pad needed.
 
 # Reusable output buffer for the standard case (256×256×3)
