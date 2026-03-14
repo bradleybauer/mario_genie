@@ -6,7 +6,7 @@
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
-- [Hidden State](#hidden-state)
+- [Disentangling Hidden State From RAM](#disentangling-hidden-state-from-ram)
 
 <br>
 
@@ -149,7 +149,7 @@ Data collection now produces sessions that faithfully represent real gameplay. T
 <br>
 <br>
 
-# Hidden State
+# Disentangling Hidden State From RAM
 
 **Context:** 
 If Mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training. The game's "hidden state" — which blocks have been hit, which items collected, which enemies defeated — lives in the NES's 2KB of internal RAM and is not fully recoverable from the image alone.
@@ -183,9 +183,12 @@ Using both images and RAM should perform better than either alone. The image emb
 For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well.
 
 **Result:** 
-I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
+Added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
 <p align="center">
-  <img src="pictures/ram.png" alt="nes ram in game visualization">
+  <img src="pictures/smb1ram.png" alt="nes ram in game visualization">
+</p>
+<p align="center">
+  <img src="pictures/smb3ram.png" alt="smb3">
 </p>
 
 TODO

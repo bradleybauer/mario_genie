@@ -2,9 +2,11 @@
 
 Usage:
     python scripts/play_nes.py              # interactive menu
-    python scripts/play_nes.py pacman       # partial name match
-    python scripts/play_nes.py 3            # pick by number
-    python scripts/play_nes.py --ram mario  # with RAM visualizer
+    python scripts/play_nes.py --rom mario  # partial name match
+    python scripts/play_nes.py --rom 3      # pick by number
+    python scripts/play_nes.py --ram --rom mario  # with RAM visualizer
+    python scripts/play_nes.py --scale 4     # 4x game frame
+    python scripts/play_nes.py --ram --ram-scale 2 --rom mario  # 2x RAM grid size
 
 nes_py (LaiNES core) is used for mappers 0, 1, 2, 3.
 stable-retro (FCEUmm core) is used as a fallback for all other mappers.
@@ -45,7 +47,7 @@ except ImportError:
 
 # --- Configuration ---
 ROM_DIR = os.path.join(os.path.dirname(__file__), '..', 'nes')
-SCALE_FACTOR = 3
+DEFAULT_SCALE = 3
 FPS = 60
 # Mappers supported by nes_py's LaiNES core
 SUPPORTED_MAPPERS = {0, 1, 2, 3}
@@ -58,190 +60,15 @@ BUTTON_BITS = {
     'UP': 4, 'DOWN': 5, 'LEFT': 6, 'RIGHT': 7,
 }
 
-# ---------------------------------------------------------------------------
-# RAM visualization
-# ---------------------------------------------------------------------------
-
-RAM_SIZE = 2048
-RAM_COLS = 64
-RAM_ROWS = 32   # 64 * 32 = 2048
-RAM_CELL = 6    # pixels per cell
-
-REGION_ZERO_PAGE = (0x0000, 0x00FF)
-REGION_STACK     = (0x0100, 0x01FF)
-REGION_OAM       = (0x0200, 0x02FF)
-REGION_GAME_DATA = (0x0300, 0x07FF)
-
-REGION_TINTS = {
-    "zero_page": np.array([80, 110, 220], dtype=np.int16),
-    "stack":     np.array([90, 90, 90],   dtype=np.int16),
-    "oam":       np.array([210, 80, 210],  dtype=np.int16),
-    "game_data": np.array([70, 200, 90],   dtype=np.int16),
-}
-
-REGION_ROWS = {
-    "zero_page": (0, 3),
-    "stack":     (4, 7),
-    "oam":       (8, 11),
-    "game_data": (12, 31),
-}
-
-REGION_SEP_COLOURS = {
-    "zero_page": (100, 130, 255),
-    "stack":     (130, 130, 130),
-    "oam":       (240, 110, 240),
-    "game_data": (100, 230, 120),
-}
-
-FADE_FRAMES = 15
-ACTIVITY_WINDOW = 30
-NES_W, NES_H = 256, 240
-OAM_MAP_SCALE = 1
-
-
-def _build_value_colormap():
-    cmap = np.zeros((256, 3), dtype=np.uint8)
-    cmap[0] = (20, 20, 20)
-    for v in range(1, 256):
-        t = v / 255.0
-        if t < 0.25:
-            s = t / 0.25
-            r, g, b = 0, int(255 * s), 255
-        elif t < 0.5:
-            s = (t - 0.25) / 0.25
-            r, g, b = 0, 255, int(255 * (1 - s))
-        elif t < 0.75:
-            s = (t - 0.5) / 0.25
-            r, g, b = int(255 * s), 255, 0
-        else:
-            s = (t - 0.75) / 0.25
-            r, g, b = 255, int(255 * (1 - s)), 0
-        cmap[v] = (r, g, b)
-    return cmap
-
-
-def _build_activity_colormap():
-    cmap = np.zeros((256, 3), dtype=np.uint8)
-    for v in range(256):
-        t = v / 255.0
-        if t < 0.33:
-            s = t / 0.33
-            cmap[v] = (0, 0, int(180 * s))
-        elif t < 0.66:
-            s = (t - 0.33) / 0.33
-            cmap[v] = (int(255 * s), 80, 180)
-        else:
-            s = (t - 0.66) / 0.34
-            cmap[v] = (255, int(80 + 175 * s), int(180 + 75 * s))
-    return cmap
-
-
-def _build_region_tint_array():
-    tints = np.zeros((RAM_SIZE, 3), dtype=np.int16)
-    for name, (s, e) in [("zero_page", REGION_ZERO_PAGE), ("stack", REGION_STACK),
-                          ("oam", REGION_OAM), ("game_data", REGION_GAME_DATA)]:
-        tints[s:e + 1] = REGION_TINTS[name]
-    return tints
-
-
-VALUE_CMAP = _build_value_colormap()
-ACTIVITY_CMAP = _build_activity_colormap()
-REGION_TINT_ARRAY = _build_region_tint_array()
-
-
-class RAMGridRenderer:
-    def __init__(self):
-        self._fade = np.zeros(RAM_SIZE, dtype=np.float32)
-        self._activity_ring = np.zeros((ACTIVITY_WINDOW, RAM_SIZE), dtype=np.uint8)
-        self._ring_idx = 0
-        self._prev_ram = None
-
-    def update(self, ram):
-        if self._prev_ram is not None:
-            changed = ram != self._prev_ram
-            self._fade[changed] = 1.0
-            self._fade[~changed] = np.maximum(self._fade[~changed] - 1.0 / FADE_FRAMES, 0.0)
-            self._activity_ring[self._ring_idx] = changed.astype(np.uint8)
-        self._ring_idx = (self._ring_idx + 1) % ACTIVITY_WINDOW
-        self._prev_ram = ram.copy()
-
-    def activity_map(self):
-        return self._activity_ring.mean(axis=0).astype(np.float32)
-
-    def render(self, ram, *, activity_mode=False):
-        cell = RAM_CELL
-        w = RAM_COLS * cell
-        h = RAM_ROWS * cell
-        if activity_mode:
-            act = self.activity_map()
-            act_u8 = np.clip(act * 255, 0, 255).astype(np.uint8)
-            colours = ACTIVITY_CMAP[act_u8].reshape(RAM_ROWS, RAM_COLS, 3).astype(np.int16)
-        else:
-            base = VALUE_CMAP[ram].astype(np.int16)
-            region = REGION_TINT_ARRAY
-            is_zero = (ram == 0)
-            blended = np.where(
-                is_zero[:, np.newaxis],
-                region // 3,
-                (base + region) // 2,
-            )
-            colours = blended.reshape(RAM_ROWS, RAM_COLS, 3)
-        fade_2d = self._fade.reshape(RAM_ROWS, RAM_COLS)
-        flash = (fade_2d[..., np.newaxis] * 180).astype(np.int16)
-        colours = np.clip(colours + flash, 0, 255).astype(np.uint8)
-        expanded = np.repeat(np.repeat(colours, cell, axis=0), cell, axis=1)
-        expanded[::cell, :] = (30, 30, 30)
-        expanded[:, ::cell] = (30, 30, 30)
-        for rname, (r0, r1) in REGION_ROWS.items():
-            sep_colour = REGION_SEP_COLOURS[rname]
-            y_top = r0 * cell
-            y_bot = min((r1 + 1) * cell, h - 1)
-            if y_top > 0:
-                expanded[max(0, y_top - 1):y_top + 1, :] = sep_colour
-            if y_bot < h - 1:
-                expanded[y_bot:min(y_bot + 2, h), :] = sep_colour
-        return pygame.surfarray.make_surface(expanded.transpose(1, 0, 2))
-
-
-def _render_oam_minimap(ram):
-    w, h = NES_W * OAM_MAP_SCALE, NES_H * OAM_MAP_SCALE
-    pixels = np.zeros((w, h, 3), dtype=np.uint8)
-    pixels[:, :] = (15, 15, 25)
-    for sy in range(0, NES_H, 16):
-        pixels[:, sy * OAM_MAP_SCALE] = (25, 25, 35)
-    for i in range(64):
-        base = 0x200 + i * 4
-        sprite_y = ram[base]
-        attr = ram[base + 2]
-        sprite_x = ram[base + 3]
-        if sprite_y >= 0xEF or sprite_y == 0:
-            continue
-        sx = sprite_x * OAM_MAP_SCALE
-        sy = sprite_y * OAM_MAP_SCALE
-        sz = max(6 * OAM_MAP_SCALE, 4)
-        palette = attr & 0x03
-        pal_colours = [(255, 100, 100), (100, 255, 100), (100, 100, 255), (255, 255, 100)]
-        colour = pal_colours[palette]
-        x0 = max(0, min(sx, w - sz))
-        y0 = max(0, min(sy, h - sz))
-        pixels[x0:min(x0 + sz, w), y0:min(y0 + sz, h)] = colour
-    pixels[0, :] = pixels[-1, :] = (60, 60, 60)
-    pixels[:, 0] = pixels[:, -1] = (60, 60, 60)
-    return pygame.surfarray.make_surface(pixels)
-
-
-def _draw_ram_region_labels(surface, font, x_offset, y_offset):
-    cell = RAM_CELL
-    for name, colour, (r0, r1) in [
-        ("Zero Page",  REGION_SEP_COLOURS["zero_page"], REGION_ROWS["zero_page"]),
-        ("Stack",      REGION_SEP_COLOURS["stack"],     REGION_ROWS["stack"]),
-        ("OAM",        REGION_SEP_COLOURS["oam"],       REGION_ROWS["oam"]),
-        ("Game Data",  REGION_SEP_COLOURS["game_data"],  REGION_ROWS["game_data"]),
-    ]:
-        mid_row = (r0 + r1) / 2
-        ly = y_offset + int(mid_row * cell) - 6
-        label = font.render(name, True, colour)
-        surface.blit(label, (x_offset - label.get_width() - 6, ly))
+from mario_world_model.ram_viz import (
+    RAM_SIZE, RAM_COLS, RAM_ROWS, RAM_CELL,
+    WRAM_SIZE, WRAM_COLS, WRAM_ROWS, WRAM_CELL,
+    RAMGridRenderer, WRAMGridRenderer,
+    render_oam_minimap, draw_ram_region_labels,
+)
+from mario_world_model.game_decoders import (
+    get_decoder, draw_decoded_sections, WRAM_OFFSET,
+)
 
 # stable-retro MultiBinary(9) button layout:
 # index: 0=B, 1=None, 2=SELECT, 3=START, 4=UP, 5=DOWN, 6=LEFT, 7=RIGHT, 8=A
@@ -342,10 +169,9 @@ def discover_roms():
     return roms
 
 
-def choose_rom(roms):
-    """Pick a ROM from CLI arg or interactive menu."""
-    if len(sys.argv) > 1:
-        query = sys.argv[1]
+def choose_rom(roms, query=None):
+    """Pick a ROM by query string or interactive menu."""
+    if query is not None:
         # Try as a number first
         if query.isdigit():
             idx = int(query) - 1
@@ -448,17 +274,37 @@ class GamepadController:
 
 
 def main():
-    # Check for --ram flag before ROM selection
+    # Extract optional flags before ROM selection (choose_rom reads sys.argv[1])
     show_ram = '--ram' in sys.argv
     if show_ram:
         sys.argv.remove('--ram')
+
+    rom_query = None
+    if '--rom' in sys.argv:
+        idx = sys.argv.index('--rom')
+        rom_query = sys.argv[idx + 1]
+        del sys.argv[idx:idx + 2]
+
+    scale = DEFAULT_SCALE
+    if '--scale' in sys.argv:
+        idx = sys.argv.index('--scale')
+        scale = int(sys.argv[idx + 1])
+        del sys.argv[idx:idx + 2]
+
+    ram_scale = 1
+    if '--ram-scale' in sys.argv:
+        idx = sys.argv.index('--ram-scale')
+        ram_scale = int(sys.argv[idx + 1])
+        del sys.argv[idx:idx + 2]
+
+    ram_cell = RAM_CELL * ram_scale
 
     roms = discover_roms()
     if not roms:
         print(f"No .nes files found in {ROM_DIR}")
         return
 
-    name, path, mapper, backend = choose_rom(roms)
+    name, path, mapper, backend = choose_rom(roms, rom_query)
     if backend is None:
         print(f"\n'{name}' uses mapper {mapper} which nes_py doesn't support.")
         print("Install stable-retro (`pip install stable-retro`) for broader mapper support.")
@@ -467,26 +313,30 @@ def main():
     print(f"Loading {name} (backend: {backend}) ...")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc=Quit")
 
+    decoder = get_decoder(name) if show_ram else None
+    if decoder:
+        print(f"Game decoder: {decoder.__name__}")
+
     if backend == 'retro':
         if show_ram:
-            _run_retro_pygame(name, path)
+            _run_retro_pygame(name, path, scale=scale, ram_cell=ram_cell, decoder=decoder)
         else:
-            _run_retro(name, path)
+            _run_retro(name, path, scale=scale)
     else:
-        _run_nes_py(name, path, show_ram=show_ram)
+        _run_nes_py(name, path, show_ram=show_ram, scale=scale, ram_cell=ram_cell, decoder=decoder)
 
 
-def _run_nes_py(name, path, show_ram=False):
+def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decoder=None):
     """Game loop using nes_py + pygame."""
     from nes_py.nes_env import NESEnv
     env = NESEnv(path)
     obs = env.reset()
     h, w, _ = obs.shape
-    game_w = w * SCALE_FACTOR
-    game_h = h * SCALE_FACTOR
+    game_w = w * scale
+    game_h = h * scale
 
     if show_ram:
-        win_w, win_h, layout = _ram_layout(game_w, game_h)
+        win_w, win_h, layout = _ram_layout(game_w, game_h, ram_cell, has_decoder=decoder is not None)
     else:
         win_w, win_h = game_w, game_h
 
@@ -517,8 +367,9 @@ def _run_nes_py(name, path, show_ram=False):
         screen.blit(pygame.transform.scale(surface, (game_w, game_h)), (0, 0))
 
         if show_ram:
-            ram = np.array(env.ram, dtype=np.uint8)[:RAM_SIZE]
-            _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h)
+            full_ram = np.array(env.ram, dtype=np.uint8)
+            ram = full_ram[:RAM_SIZE]
+            _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h, ram_cell, decoder, full_ram=full_ram)
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -527,17 +378,23 @@ def _run_nes_py(name, path, show_ram=False):
     pygame.quit()
 
 
-def _run_retro_pygame(name, path):
+def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decoder=None):
     """Game loop using stable-retro rendered via pygame (for RAM viz)."""
     game_id = ensure_retro_game(path)
     env = retro.make(game_id, state=retro.State.NONE, render_mode=None,
                      use_restricted_actions=retro.Actions.ALL)
     obs, _info = env.reset()
     h, w, _ = obs.shape
-    game_w = w * SCALE_FACTOR
-    game_h = h * SCALE_FACTOR
+    game_w = w * scale
+    game_h = h * scale
 
-    win_w, win_h, layout = _ram_layout(game_w, game_h)
+    # Check for WRAM support
+    show_wram = len(env.get_ram()) > WRAM_OFFSET + WRAM_SIZE // 2
+    wram_renderer = WRAMGridRenderer() if show_wram else None
+
+    win_w, win_h, layout = _ram_layout(game_w, game_h, ram_cell,
+                                       has_decoder=decoder is not None,
+                                       has_wram=show_wram)
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
@@ -567,9 +424,11 @@ def _run_retro_pygame(name, path):
         surface = pygame.surfarray.make_surface(np.swapaxes(obs, 0, 1))
         screen.blit(pygame.transform.scale(surface, (game_w, game_h)), (0, 0))
 
-        full_ram = env.get_ram()
-        ram = np.array(full_ram, dtype=np.uint8)[:RAM_SIZE]
-        _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h)
+        full_ram = np.array(env.get_ram(), dtype=np.uint8)
+        ram = full_ram[:RAM_SIZE]
+        _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
+                        ram_cell, decoder, full_ram=full_ram,
+                        wram_renderer=wram_renderer)
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -578,64 +437,122 @@ def _run_retro_pygame(name, path):
     pygame.quit()
 
 
-def _ram_layout(game_w, game_h):
-    """Compute layout metrics for the RAM panel.  Returns (win_w, win_h, layout_dict)."""
-    ram_grid_w = RAM_COLS * RAM_CELL
-    ram_grid_h = RAM_ROWS * RAM_CELL
-    label_margin = 80
+def _ram_layout(game_w, game_h, cell_size=RAM_CELL, has_decoder=False,
+                wram_cell=WRAM_CELL, has_wram=False):
+    """Compute layout metrics for the RAM panel.  Returns (win_w, win_h, layout_dict).
+
+    Layout (right panel):
+        Row 1:  [labels 80px]  RAM VALUES  [gap]  RAM ACTIVITY
+        Row 2:  [labels 80px]  WRAM VALUES [gap]  WRAM ACTIVITY   (if has_wram)
+        Below:  [decoded col1] [decoded col2] [OAM minimap]
+    """
+    ram_grid_w = RAM_COLS * cell_size
+    ram_grid_h = RAM_ROWS * cell_size
+    wram_grid_w = WRAM_COLS * wram_cell
+    wram_grid_h = WRAM_ROWS * wram_cell
+
+    label_margin = 88
     grid_gap = 20
     top_margin = 20
+    row_gap = 24          # vertical gap between grid rows
 
-    two_grids_h = ram_grid_h * 2 + grid_gap + 16 * 2
-    panel_w = label_margin + ram_grid_w + 16
-    panel_h = top_margin + two_grids_h + 20
+    # Right panel: two grids side-by-side per row
+    pair_w = max(ram_grid_w, wram_grid_w if has_wram else 0)
+    panel_w = label_margin + pair_w + grid_gap + pair_w + 16
 
-    oam_section_h = 16 + NES_H * OAM_MAP_SCALE + 8
-    left_col_h = game_h + oam_section_h
+    # Right panel height: grids + decoded/OAM below
+    ram_row_h = 16 + ram_grid_h        # title + grid
+    wram_row_h = (16 + wram_grid_h) if has_wram else 0
+    decoded_h = 250 if has_decoder else 0
+    panel_h = top_margin + ram_row_h + (row_gap + wram_row_h if has_wram else 0) + 20 + decoded_h
 
     win_w = game_w + panel_w
-    win_h = max(left_col_h, panel_h)
+    win_h = max(game_h, panel_h)
 
     layout = dict(
         label_margin=label_margin,
         grid_gap=grid_gap,
         top_margin=top_margin,
+        row_gap=row_gap,
+        ram_grid_w=ram_grid_w,
         ram_grid_h=ram_grid_h,
+        wram_grid_w=wram_grid_w,
+        wram_grid_h=wram_grid_h,
+        wram_cell=wram_cell,
+        pair_w=pair_w,
     )
     return win_w, win_h, layout
 
 
-def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h):
-    """Draw value grid, activity grid, region labels, and OAM minimap."""
+def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
+                    cell_size=RAM_CELL, decoder=None, full_ram=None,
+                    wram_renderer=None):
+    """Draw RAM grids, WRAM grids, OAM minimap, and decoded vars."""
     ram_renderer.update(ram)
     gx = game_w + layout['label_margin']
     cy = layout['top_margin']
+    gap = layout['grid_gap']
+    pair_w = layout['pair_w']
 
-    # Value grid
+    # --- Row 1: RAM VALUES | RAM ACTIVITY (side by side) ---
     val_title = font.render('RAM VALUES', True, (200, 200, 200))
-    screen.blit(val_title, (gx, cy))
-    cy += 16
-    screen.blit(ram_renderer.render(ram, activity_mode=False), (gx, cy))
-    _draw_ram_region_labels(screen, font, gx, cy)
-    cy += layout['ram_grid_h'] + layout['grid_gap']
-
-    # Activity grid
     act_title = font.render('RAM ACTIVITY', True, (200, 200, 200))
-    screen.blit(act_title, (gx, cy))
+    screen.blit(val_title, (gx, cy))
+    screen.blit(act_title, (gx + pair_w + gap, cy))
     cy += 16
-    screen.blit(ram_renderer.render(ram, activity_mode=True), (gx, cy))
-    _draw_ram_region_labels(screen, font, gx, cy)
 
-    # OAM minimap below game frame
-    oam_y = game_h
-    oam_label = font.render('-- OAM SPRITES --', True, (200, 200, 100))
-    screen.blit(oam_label, (4, oam_y))
-    oam_y += 16
-    screen.blit(_render_oam_minimap(ram), (4, oam_y))
+    screen.blit(ram_renderer.render(ram, activity_mode=False, cell_size=cell_size), (gx, cy))
+    draw_ram_region_labels(screen, font, gx, cy, cell_size=cell_size, x_min=game_w + 4)
+
+    ax = gx + pair_w + gap
+    screen.blit(ram_renderer.render(ram, activity_mode=True, cell_size=cell_size), (ax, cy))
+
+    cy += layout['ram_grid_h']
+
+    # --- Row 2: WRAM VALUES | WRAM ACTIVITY (side by side, if available) ---
+    if wram_renderer is not None and full_ram is not None and len(full_ram) > WRAM_OFFSET:
+        wram = full_ram[WRAM_OFFSET:WRAM_OFFSET + WRAM_SIZE]
+        if len(wram) == WRAM_SIZE:
+            wram_renderer.update(wram)
+            wc = layout['wram_cell']
+            cy += layout['row_gap']
+
+            wt = font.render('WRAM VALUES', True, (200, 200, 200))
+            wat = font.render('WRAM ACTIVITY', True, (200, 200, 200))
+            screen.blit(wt, (gx, cy))
+            screen.blit(wat, (gx + pair_w + gap, cy))
+            cy += 16
+
+            screen.blit(wram_renderer.render(wram, activity_mode=False, cell_size=wc), (gx, cy))
+
+            screen.blit(wram_renderer.render(wram, activity_mode=True, cell_size=wc), (gx + pair_w + gap, cy))
+            cy += layout['wram_grid_h']
+
+    # --- Decoded vars (col1 + col2) + OAM minimap (col3) below the grids ---
+    if decoder is not None:
+        cy += 12
+        sections = decoder(full_ram if full_ram is not None else ram)
+        # Split: PLAYER+STATUS in col1, GAME+WRAM in col2
+        oam_surface = render_oam_minimap(ram)
+        oam_w = oam_surface.get_width()
+        col_w = (pair_w * 2 + gap - oam_w - 12) // 2
+        col2_x = gx + col_w + 8
+        col2_start = min(2, len(sections))  # first 2 sections in col1
+        draw_decoded_sections(screen, font, sections, gx, cy,
+                              col2_x=col2_x, col2_after=col2_start)
+    else:
+        oam_surface = render_oam_minimap(ram)
+        oam_w = oam_surface.get_width()
+
+    # OAM minimap as third column
+    oam_x = gx + pair_w * 2 + gap - oam_w
+    oam_label = font.render('OAM SPRITES', True, (200, 200, 100))
+    screen.blit(oam_label, (oam_x, cy if decoder else cy + 12))
+    screen.blit(oam_surface, (oam_x, (cy if decoder else cy + 12) + 14))
 
 
-def _run_retro(name, path):
-    """Game loop using stable-retro's native viewer (pyglet) at SCALE_FACTOR."""
+def _run_retro(name, path, scale=DEFAULT_SCALE):
+    """Game loop using stable-retro's native viewer (pyglet) at given scale."""
     import pyglet.window.key as pkey
 
     # Pyglet key -> NES button name (same bindings as pygame KEY_MAP)
@@ -660,7 +577,7 @@ def _run_retro(name, path):
     obs, *_ = env.step(np.zeros(9, dtype=np.int8))
 
     # Resize the viewer window (GL stretches the texture to fill)
-    env.viewer.window.set_size(w * SCALE_FACTOR, h * SCALE_FACTOR)
+    env.viewer.window.set_size(w * scale, h * scale)
     env.viewer.window.set_caption(f"{name} (retro)")
 
     # Hook keyboard events on the pyglet viewer window
