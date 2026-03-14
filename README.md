@@ -8,7 +8,11 @@
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
 - [Hidden State](#hidden-state)
 
-![meme](pictures/meme.png)
+<br>
+
+<p align="center">
+  <img src="pictures/meme.png" alt="meme">
+</p>
 
 <br>
 
@@ -50,7 +54,9 @@ During collection, every episode's actions and x-positions are recorded as rollo
 
 **Result:** 
 This is not fully solved — some bins remain under represented — but the distribution is significantly more uniform than naive sequential play.
-![Progression distribution across world-stage bins](pictures/data_balance.png)
+<p align="center">
+  <img src="pictures/data_balance.png" alt="Progression distribution across world-stage bins">
+</p>
 
 <br>
 <br>
@@ -65,7 +71,9 @@ Initial training runs for small models (<2M params) trained for an hour or two w
 24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule. Each run trained for 4 hours on an RTX 4090, across 8 machines.
 
 **Result:** 
-![Training curves](pictures/sweep.png)
+<p align="center">
+  <img src="pictures/sweep.png" alt="Training curves">
+</p>
 
 | name | params | best MSE | final MSE | max CB usage | steps |
 |------|-------:|---------:|----------:|-------------:|------:|
@@ -146,8 +154,7 @@ Data collection now produces sessions that faithfully represent real gameplay. T
 **Context:** 
 If Mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training. The game's "hidden state" — which blocks have been hit, which items collected, which enemies defeated — lives in the NES's 2KB of internal RAM and is not fully recoverable from the image alone.
 
-**NES RAM Layout:**
-The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`. It is divided into four regions:
+The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`, divided into four regions:
 
 - **Zero Page** (`$0000`–`$00FF`, 256 bytes) — The 6502 CPU's fast-access page. Games store their most frequently-read variables here because zero-page addressing modes are shorter and faster. In SMB1 this includes player position (`$0086` X, `$00CE` Y), velocity (`$0057` X speed, `$001D` Y speed), player state machine (`$000E`), moving direction (`$0045`), and the five enemy type slots (`$0016`–`$001A`). Contains some hidden state: off-screen enemy positions, scroll offsets, and physics state that may be ambiguous from a single frame.
 
@@ -159,8 +166,7 @@ The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`. It is 
 
 For embedding purposes, **Zero Page + Game Data (1,536 bytes)** captures all meaningful state. Stack and OAM (512 bytes) can be dropped — they're either noise or redundant with the image.
 
-**RAM Sampling Rate:**
-The NES CPU runs at ~1.79 MHz (~29,781 cycles per frame), but the game loop is frame-synchronized: the PPU fires a Vertical Blank NMI at 60 Hz, the game logic runs atomically within that window, then idles until the next NMI. The emulator's `env.step()` advances one full NMI-to-NMI cycle and then exposes RAM — this is the only coherent snapshot where all variables agree with each other. One RAM snapshot per frame = zero information loss.
+The NES CPU runs at ~1.79 MHz (~29,781 cycles per frame), but the game loop is frame-synchronized: the PPU fires a Vertical Blank NMI (Non-Maskable Interrupt) at 60 Hz, the game logic runs atomically within that window, then idles until the next NMI. The emulator's `env.step()` advances one full NMI-to-NMI cycle and then exposes RAM — this is the only coherent snapshot where all variables agree with each other. One RAM snapshot per frame = zero information loss.
 
 **Approach:** 
 Potentially add a temporal embedding of the NES 2KB of RAM to the latent space.
@@ -170,12 +176,18 @@ Talking with AI about it leads me to believe using both images & RAM will perfor
 The image embeddings are a 16x16 grid of features where that grid is a spatial "bias". It may be easier
 to disentangle certain spatial information from the image than it is from RAM.
 
-- **ai slop**
-For storage, the RAM can be delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. The stack and OAM regions could also be excluded entirely (saving ~37% raw) since they're either noise or redundant with the image. Add a learned embedding of the NES RAM to the latent space via feature concatenation. A small encoder (2–3 FC layers) maps the 1,536-byte RAM vector to a D-dim embedding matching the latent channel dimension, which is then broadcast spatially to 16×16 and concatenated with the image latent. The RAM encoder trains jointly with the rest of the model. Using both images and RAM should perform better than either alone. The image embeddings are a 16×16 grid of features with inherent spatial bias — it may be easier to disentangle certain spatial information from the image than from RAM, and vice versa. For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
+Add a learned embedding of the NES RAM to the latent space via feature concatenation. A small encoder (2–3 FC layers) maps the 1,536-byte RAM vector to a D-dim embedding matching the latent channel dimension, which is then broadcast spatially to 16×16 and concatenated with the image latent. The RAM encoder trains jointly with the rest of the model.
 
-![nes ram in game visualization](pictures/ram.png)
+Using both images and RAM should perform better than either alone. The image embeddings are a 16×16 grid of features with inherent spatial bias — it may be easier to disentangle certain spatial information from the image than from RAM, and vice versa.
+
+For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well.
 
 **Result:** 
+I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
+<p align="center">
+  <img src="pictures/ram.png" alt="nes ram in game visualization">
+</p>
+
 TODO
 
 <!-- Template -->
