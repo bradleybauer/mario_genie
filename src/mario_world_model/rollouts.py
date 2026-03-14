@@ -407,68 +407,6 @@ class RolloutIndex:
             return None
         return target_step
 
-    def find_rollout(
-        self,
-        world: int,
-        stage: int,
-        target_x_bin: int,
-        bin_size: int = PROGRESSION_BIN_SIZE,
-    ) -> Optional[Rollout]:
-        """Find the shortest-prefix rollout that actually visits *target_x_bin*.
-
-        Every rollout stores a full from-level-start trajectory, so any record
-        that reaches the target bin is a valid replay source, except for the
-        terminal bin of a death rollout.
-
-        Returns ``None`` if no suitable rollout exists.
-        """
-        self._ensure_loaded()
-        bin_size = validate_progression_bin_size(bin_size)
-        target_x = target_x_bin * bin_size
-        candidates = self._by_level.get((world, stage), [])
-        best: Optional[Rollout] = None
-        best_target_step: Optional[int] = None
-        for ri in candidates:
-            r = self._rollouts[ri]
-            if r.max_x >= target_x:
-                target_step = self._supports_target_bin(r, target_x_bin, bin_size)
-                if target_step is None:
-                    continue
-                if (
-                    best is None
-                    or best_target_step is None
-                    or target_step < best_target_step
-                    or (target_step == best_target_step and r.num_steps < best.num_steps)
-                ):
-                    best = r
-                    best_target_step = target_step
-            else:
-                # List is sorted by max_x desc, so no more candidates can reach target
-                break
-        return best
-
-    def find_replay_actions(
-        self,
-        world: int,
-        stage: int,
-        target_x_bin: int,
-        bin_size: int = PROGRESSION_BIN_SIZE,
-    ) -> Optional[tuple[list[int], int]]:
-        """Return ``(actions, target_step)`` to replay up to *target_x_bin*.
-
-        *target_step* is the index of the first action where the recorded
-        x_pos entered the target bin, so replaying ``actions[:target_step]``
-        positions Mario near the desired x.
-        """
-        bin_size = validate_progression_bin_size(bin_size)
-        rollout = self.find_rollout(world, stage, target_x_bin, bin_size)
-        if rollout is None:
-            return None
-        target_step = self._first_step_in_bin(rollout, target_x_bin, bin_size)
-        if target_step is None:
-            return None
-        return rollout.actions, target_step
-
     def find_all_replay_actions(
         self,
         world: int,
@@ -478,10 +416,9 @@ class RolloutIndex:
     ) -> list[tuple[list[int], int]]:
         """Return all ``(actions, target_step)`` pairs that visit *target_x_bin*.
 
-        Like :meth:`find_replay_actions` but returns multiple candidates so
-        the replay pool can sample uniformly across every known rollout that
-        reaches the requested bin. Death rollouts do not support their
-        terminal bin.
+        Returns multiple candidates so the replay pool can sample uniformly
+        across every known rollout that reaches the requested bin.  Death
+        rollouts do not support their terminal bin.
         """
         self._ensure_loaded()
         bin_size = validate_progression_bin_size(bin_size)
@@ -502,24 +439,6 @@ class RolloutIndex:
         for target_step, r in valid:
             results.append((list(r.actions), target_step))
         return results
-
-    def progression_coverage(
-        self,
-        bin_size: int = PROGRESSION_BIN_SIZE,
-    ) -> dict[tuple[int, int, int], int]:
-        """Return ``{(world, stage, x_bin): rollout_count}``.
-
-        A rollout covers exactly the bins whose x-positions it actually visits.
-        This avoids inferring support across discontinuous pipe jumps.
-        """
-        self._ensure_loaded()
-        bin_size = validate_progression_bin_size(bin_size)
-        cov: dict[tuple[int, int, int], int] = {}
-        for r in self._rollouts:
-            for b in self._visited_bins(r, bin_size):
-                key = (r.world, r.stage, b)
-                cov[key] = cov.get(key, 0) + 1
-        return cov
 
     def reachable_bins(
         self,

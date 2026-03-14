@@ -29,13 +29,19 @@ def _compute_exact_progression_summary(
     """
     if "world" not in arrays or "stage" not in arrays or "x_pos" not in arrays:
         return None
-    world = arrays["world"].flatten()
-    stage = arrays["stage"].flatten()
-    x_pos = arrays["x_pos"].astype(np.int32, copy=False).flatten()
-    coords = np.stack((world.astype(np.int32), stage.astype(np.int32), x_pos), axis=1)
-    unique, counts = np.unique(coords, axis=0, return_counts=True)
+    world = arrays["world"].astype(np.int64, copy=False).ravel()
+    stage = arrays["stage"].astype(np.int64, copy=False).ravel()
+    x_pos = arrays["x_pos"].astype(np.int64, copy=False).ravel()
+    # Encode (w, s, x) into a single int64 for fast 1-D np.unique.
+    # world/stage fit in 8 bits; x_pos fits in 16 bits.
+    keys = (world << 32) | (stage << 16) | x_pos
+    unique, counts = np.unique(keys, return_counts=True)
     result: dict[str, int] = {}
-    for (w, s, x), cnt in zip(unique, counts):
+    for k, cnt in zip(unique, counts):
+        k = int(k)
+        w = k >> 32
+        s = (k >> 16) & 0xFFFF
+        x = k & 0xFFFF
         result[f"{w}:{s}:{x}"] = int(cnt)
     return result
 

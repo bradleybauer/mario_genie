@@ -24,6 +24,13 @@ class PaletteMapper:
         Created if it does not exist; updated whenever new colours appear.
     """
 
+    # Dense LUT: maps packed RGB (r<<16|g<<8|b) → uint8 index.
+    # Max packed value for uint8 RGB is 0xFFFFFF (~16M), but NES palettes
+    # have ≤64 unique colours so we use a sparse→dense approach:
+    # a fixed-size numpy array covering the full 24-bit RGB space would be
+    # 16 MB — acceptable.  Rebuilt only when new colours appear.
+    _LUT_SIZE = (1 << 24)  # 16,777,216
+
     def __init__(self, palette_path: str | Path):
         self._path = Path(palette_path)
         self._lock = threading.Lock()
@@ -32,12 +39,17 @@ class PaletteMapper:
         self._rgb_to_idx: dict[int, int] = {}
         # palette: list of [r, g, b] for serialisation
         self._palette: list[list[int]] = []
+        # Dense vectorised LUT (rebuilt when palette changes)
+        self._lut: np.ndarray | None = None
+        # Counter for frames since last new colour — enables fast path
+        self._frames_since_new: int = 0
 
         if self._path.exists():
             with open(self._path, "r") as f:
                 stored = json.load(f)
             for rgb in stored:
                 self._register_color(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+            self._rebuild_lut()
             print(f"[palette] Loaded {len(self._palette)} colours from {self._path}")
         else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,6 +59,13 @@ class PaletteMapper:
     @property
     def num_colors(self) -> int:
         return len(self._palette)
+
+    def _rebuild_lut(self) -> None:
+        """Rebuild the dense numpy LUT from the current palette dict."""
+        lut = np.zeros(self._LUT_SIZE, dtype=np.uint8)
+        for packed, idx in self._rgb_to_idx.items():
+            lut[packed] = idx
+        self._lut = lut
 
     def map_frame(self, frame_hwc: np.ndarray) -> np.ndarray:
         """Convert an RGB ``(H, W, 3)`` uint8 frame to ``(H, W)`` uint8 indices."""
@@ -58,39 +77,47 @@ class PaletteMapper:
             | flat[:, 1].astype(np.int32) << 8
             | flat[:, 2].astype(np.int32)
         )
-        unique_packed = np.unique(packed)
 
-        # Fast path: check for new colours
-        new_colors = []
-        with self._lock:
-            for p in unique_packed:
-                if int(p) not in self._rgb_to_idx:
-                    r = (int(p) >> 16) & 0xFF
-                    g = (int(p) >> 8) & 0xFF
-                    b = int(p) & 0xFF
-                    new_colors.append((r, g, b, int(p)))
+        if self._lut is not None and self._frames_since_new > 60:
+            # Fast path: palette is settled, skip np.unique entirely
+            return self._lut[packed].reshape(h, w)
 
-            if new_colors:
-                for r, g, b, p in new_colors:
-                    self._register_color(r, g, b)
+        # Check for new colours (rare after warmup)
+        if self._lut is not None:
+            unique_packed = np.unique(packed)
+            new_colors = []
+            with self._lock:
+                for p in unique_packed:
+                    if int(p) not in self._rgb_to_idx:
+                        pi = int(p)
+                        new_colors.append(((pi >> 16) & 0xFF, (pi >> 8) & 0xFF, pi & 0xFF))
+
+                if new_colors:
+                    self._frames_since_new = 0
+                    for r, g, b in new_colors:
+                        self._register_color(r, g, b)
+                    self._save()
+                    self._rebuild_lut()
+                    print(
+                        f"[palette] +{len(new_colors)} new colours → "
+                        f"{len(self._palette)} total"
+                    )
+                else:
+                    self._frames_since_new += 1
+        else:
+            # First frame — register all colours and build LUT
+            unique_packed = np.unique(packed)
+            with self._lock:
+                for p in unique_packed:
+                    pi = int(p)
+                    if pi not in self._rgb_to_idx:
+                        self._register_color((pi >> 16) & 0xFF, (pi >> 8) & 0xFF, pi & 0xFF)
                 self._save()
-                print(
-                    f"[palette] +{len(new_colors)} new colours → "
-                    f"{len(self._palette)} total"
-                )
+                self._rebuild_lut()
+                print(f"[palette] Initial scan → {len(self._palette)} colours")
 
-            # Vectorised lookup via a numpy array indexed by packed RGB
-            # Build a lookup table only for the packed values in this frame
-            out = np.empty(len(packed), dtype=np.uint8)
-            for i, p in enumerate(packed):
-                out[i] = self._rgb_to_idx[int(p)]
-
-        return out.reshape(h, w)
-
-    def get_palette_rgb(self) -> np.ndarray:
-        """Return the current palette as ``(K, 3)`` uint8 array."""
-        with self._lock:
-            return np.array(self._palette, dtype=np.uint8)
+        # Vectorised lookup via dense LUT — no Python loop over pixels
+        return self._lut[packed].reshape(h, w)
 
     # ── internals ────────────────────────────────────────────────────
 

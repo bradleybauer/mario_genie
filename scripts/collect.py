@@ -102,6 +102,13 @@ class SessionWriter:
 
     _INITIAL_CAPACITY = 8192
 
+    # Fixed metadata keys in order — avoids dict iteration per frame.
+    _META_KEYS = (
+        "world", "stage", "x_pos", "y_pos",
+        "score", "coins", "life", "time",
+        "flag_get", "status",
+    )
+
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -116,9 +123,12 @@ class SessionWriter:
         self._frames: np.ndarray | None = None  # allocated on first append
         self._capacity = 0
         self._size = 0
-        self._actions: list[int] = []
-        self._dones: list[bool] = []
-        self._metadata: dict[str, list[int]] = {}
+        self._actions: np.ndarray = np.empty(self._INITIAL_CAPACITY, dtype=np.uint8)
+        self._dones: np.ndarray = np.empty(self._INITIAL_CAPACITY, dtype=bool)
+        self._meta_arrays: dict[str, np.ndarray] = {
+            k: np.empty(self._INITIAL_CAPACITY, dtype=np.int32) for k in self._META_KEYS
+        }
+        self._scalar_capacity = self._INITIAL_CAPACITY
 
     def _ensure_capacity(self, frame_chw: np.ndarray) -> None:
         if self._frames is None:
@@ -134,23 +144,56 @@ class SessionWriter:
             new_buf[: self._size] = self._frames[: self._size]
             self._frames = new_buf
 
+    def _ensure_scalar_capacity(self) -> None:
+        if self._size >= self._scalar_capacity:
+            new_cap = self._scalar_capacity * 2
+            new_actions = np.empty(new_cap, dtype=np.uint8)
+            new_actions[:self._size] = self._actions[:self._size]
+            self._actions = new_actions
+            new_dones = np.empty(new_cap, dtype=bool)
+            new_dones[:self._size] = self._dones[:self._size]
+            self._dones = new_dones
+            for k in self._META_KEYS:
+                new_arr = np.empty(new_cap, dtype=np.int32)
+                new_arr[:self._size] = self._meta_arrays[k][:self._size]
+                self._meta_arrays[k] = new_arr
+            self._scalar_capacity = new_cap
+
     def append(
         self,
         frame_chw: np.ndarray,
         action: int,
         done: bool,
-        **metadata: int,
+        *,
+        world: int = 0,
+        stage: int = 0,
+        x_pos: int = 0,
+        y_pos: int = 0,
+        score: int = 0,
+        coins: int = 0,
+        life: int = 0,
+        time: int = 0,
+        flag_get: int = 0,
+        status: int = 0,
     ) -> None:
         self._ensure_capacity(frame_chw)
+        self._ensure_scalar_capacity()
         assert self._frames is not None
-        self._frames[self._size] = frame_chw
+        idx = self._size
+        self._frames[idx] = frame_chw
+        self._actions[idx] = action
+        self._dones[idx] = done
+        self._meta_arrays["world"][idx] = world
+        self._meta_arrays["stage"][idx] = stage
+        self._meta_arrays["x_pos"][idx] = x_pos
+        self._meta_arrays["y_pos"][idx] = y_pos
+        self._meta_arrays["score"][idx] = score
+        self._meta_arrays["coins"][idx] = coins
+        self._meta_arrays["life"][idx] = life
+        self._meta_arrays["time"][idx] = time
+        self._meta_arrays["flag_get"][idx] = flag_get
+        self._meta_arrays["status"][idx] = status
         self._size += 1
-        self._actions.append(action)
-        self._dones.append(done)
-        for k, v in metadata.items():
-            if k not in self._metadata:
-                self._metadata[k] = []
-            self._metadata[k].append(v)
 
     @property
     def num_frames(self) -> int:
@@ -164,17 +207,18 @@ class SessionWriter:
         if self._size == 0 or self._frames is None:
             raise ValueError("No frames to write")
 
-        frames = self._frames[: self._size]  # view, no copy
-        actions = np.asarray(self._actions, dtype=np.uint8)
-        dones = np.asarray(self._dones, dtype=bool)
+        n = self._size
+        frames = self._frames[:n]  # view, no copy
+        actions = self._actions[:n]
+        dones = self._dones[:n]
 
         arrays: dict[str, np.ndarray] = {
             "frames": frames,
             "actions": actions,
             "dones": dones,
         }
-        for k, v in self._metadata.items():
-            arrays[k] = np.asarray(v, dtype=np.int32)
+        for k in self._META_KEYS:
+            arrays[k] = self._meta_arrays[k][:n]
 
         np.savez_compressed(npz_path, **arrays)
 
@@ -508,7 +552,9 @@ def to_chw(frame_hwc: np.ndarray, palette_mapper: PaletteMapper | None = None) -
     if palette_mapper is not None:
         idx_hw = palette_mapper.map_frame(padded)
         return idx_hw[np.newaxis, :, :]
-    return np.transpose(padded, (2, 0, 1)).astype(np.uint8, copy=False)
+    # np.ascontiguousarray on the transposed view is faster than
+    # transpose + astype copy for the common uint8 case.
+    return np.ascontiguousarray(padded.transpose(2, 0, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -681,9 +727,11 @@ def _build_env_and_replay(
                 replay_render(obs)
             if term or trunc:
                 print(f"[replay] FAILED at step {i+1}/{target_step}")
-                remove_rollout_from_jsonl(
+                removed = remove_rollout_from_jsonl(
                     output_dir / "rollouts.jsonl", world, stage, replay_actions,
                 )
+                if not removed:
+                    print(f"[replay] Warning: failed to remove bad replay from rollouts.jsonl!")
                 # Rebuild env to get a clean state for the next attempt
                 env.close()
                 env = _make_env()
@@ -808,7 +856,7 @@ def run_collection(
             if replay_prefix_length > 0 and replay_candidates:
                 # The successful candidate is the one whose prefix_length
                 # matched — recover its actions for tracker seeding.
-                for cand_actions, cand_step in replay_candidates:
+                for cand_actions, _ in replay_candidates:
                     if len(cand_actions) >= replay_prefix_length:
                         replay_actions = cand_actions
                         break
@@ -848,21 +896,33 @@ def run_collection(
                 next_obs, _, terminated, truncated, next_info = env.step(action)
                 done = bool(terminated or truncated)
 
+                # Extract info once to avoid repeated dict lookups
+                i_world = int(info.get("world", 1))
+                i_stage = int(info.get("stage", 1))
+                i_x_pos = int(info.get("x_pos", 0))
+                i_y_pos = int(info.get("y_pos", 0))
+                i_life = int(info.get("life", 2))
+                i_time = int(info.get("time", 0))
+                i_score = int(info.get("score", 0))
+                i_coins = int(info.get("coins", 0))
+                i_flag_get = int(info.get("flag_get", 0))
+                i_status = STATUS_MAP.get(info.get("status", "small"), 0)
+
                 # Record frame + action + metadata
                 writer.append(
                     to_chw(obs, palette_mapper),
                     int(action),
                     done,
-                    world=int(info.get("world", 1)),
-                    stage=int(info.get("stage", 1)),
-                    x_pos=int(info.get("x_pos", 0)),
-                    y_pos=int(info.get("y_pos", 0)),
-                    score=int(info.get("score", 0)),
-                    coins=int(info.get("coins", 0)),
-                    life=int(info.get("life", 2)),
-                    time=int(info.get("time", 0)),
-                    flag_get=int(info.get("flag_get", 0)),
-                    status=STATUS_MAP.get(info.get("status", "small"), 0),
+                    world=i_world,
+                    stage=i_stage,
+                    x_pos=i_x_pos,
+                    y_pos=i_y_pos,
+                    score=i_score,
+                    coins=i_coins,
+                    life=i_life,
+                    time=i_time,
+                    flag_get=i_flag_get,
+                    status=i_status,
                 )
                 steps_this_session += 1
 
@@ -870,10 +930,10 @@ def run_collection(
                 transition_rollout = tracker.record_step(
                     0,
                     action=int(action),
-                    x_pos=int(info.get("x_pos", 0)),
-                    world=int(info.get("world", 1)),
-                    stage=int(info.get("stage", 1)),
-                    life=int(info.get("life", 2)),
+                    x_pos=i_x_pos,
+                    world=i_world,
+                    stage=i_stage,
+                    life=i_life,
                 )
 
                 # Level transition detected (record_step emits rollout)
@@ -1008,8 +1068,8 @@ def run_collection(
             # --- Write session ---
             remaining_steps -= steps_this_session
 
-            if writer.num_frames > 0:
-                session_elapsed = time.time() - session_started
+            session_elapsed = time.time() - session_started
+            if writer.num_frames > 0 and session_elapsed >= 5.0:
                 meta = SessionMeta(
                     session_id=writer.session_id,
                     mode=mode,
@@ -1024,6 +1084,8 @@ def run_collection(
                 path = _write_session(writer, meta, action_meanings, output_dir)
                 total_frames_all += writer.num_frames
                 print(f"[session {session_num}] wrote {path} ({writer.num_frames} frames, {session_elapsed:.1f}s)")
+            elif writer.num_frames > 0:
+                print(f"[session {session_num}] Discarding short session ({writer.num_frames} frames, {session_elapsed:.1f}s < 5s)")
             else:
                 print(f"[session {session_num}] No frames collected.")
 
@@ -1036,9 +1098,9 @@ def run_collection(
                 break
 
     except KeyboardInterrupt:
-        print(f"\n[interrupted] Saving {writer.num_frames} frames collected so far...")
-        if writer.num_frames > 0:
-            session_elapsed = time.time() - session_started
+        session_elapsed = time.time() - session_started
+        print(f"\n[interrupted] {writer.num_frames} frames collected so far...")
+        if writer.num_frames > 0 and session_elapsed >= 5.0:
             meta = SessionMeta(
                 session_id=writer.session_id,
                 mode=mode,
@@ -1054,6 +1116,8 @@ def run_collection(
             total_frames_all += writer.num_frames
             session_num += 1
             print(f"[interrupted] wrote {path} ({writer.num_frames} frames)")
+        elif writer.num_frames > 0:
+            print(f"[interrupted] Discarding short session ({writer.num_frames} frames, {session_elapsed:.1f}s < 5s)")
 
     finally:
         if mode == "human":

@@ -142,7 +142,6 @@ class MarioVideoDataset(Dataset):
 
         num_threads = min(4, len(file_groups))
         print(f"Parallel loading with {num_threads} threads...")
-        loaded = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
             futures = {
                 pool.submit(_load_file, fi, entries): fi
@@ -151,7 +150,6 @@ class MarioVideoDataset(Dataset):
             with tqdm(total=n, desc="Pre-loading samples", unit="samp") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     count = future.result()
-                    loaded += count
                     pbar.update(count)
 
         self.preloaded = True

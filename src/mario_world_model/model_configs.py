@@ -145,15 +145,6 @@ MODEL_CONFIGS: list[ModelConfig] = [
 MODEL_CONFIGS_BY_NAME: dict[str, ModelConfig] = {m.name: m for m in MODEL_CONFIGS}
 
 
-def get_model_config(name: str) -> ModelConfig:
-    """Look up a model config by name, raising ``KeyError`` if not found."""
-    try:
-        return MODEL_CONFIGS_BY_NAME[name]
-    except KeyError:
-        available = ", ".join(sorted(MODEL_CONFIGS_BY_NAME))
-        raise KeyError(f"Unknown model config {name!r}. Available: {available}")
-
-
 if __name__ == "__main__":
     import torch
     from magvit2_pytorch import VideoTokenizer

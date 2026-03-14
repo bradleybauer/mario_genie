@@ -77,6 +77,7 @@ class GamepadState:
         self._usb_device = None
         self._evdev_axes: dict[str, float] = {"ABS_X": 128, "ABS_Y": 128}
         self._evdev_buttons: set[int] = set()
+        self._evdev_buttons_transient: set[int] = set()  # presses since last read
         self._evdev_axis_ranges: dict[str, tuple[int, int]] = {}
         self._usb_lock: threading.Lock | None = None
         self._extended = extended_button_codes
@@ -185,18 +186,22 @@ class GamepadState:
                 self._evdev_axes["ABS_HAT0Y"] = hat_y
                 if btn1 & 0x10:
                     self._evdev_buttons.add(evdev.ecodes.BTN_THUMB)
+                    self._evdev_buttons_transient.add(evdev.ecodes.BTN_THUMB)
                 else:
                     self._evdev_buttons.discard(evdev.ecodes.BTN_THUMB)
                 if btn1 & 0x40 or btn1 & 0x20:
                     self._evdev_buttons.add(evdev.ecodes.BTN_TRIGGER)
+                    self._evdev_buttons_transient.add(evdev.ecodes.BTN_TRIGGER)
                 else:
                     self._evdev_buttons.discard(evdev.ecodes.BTN_TRIGGER)
                 if btn1 & 0x04:  # Menu (Start)
                     self._evdev_buttons.add(getattr(evdev.ecodes, 'BTN_START', 315))
+                    self._evdev_buttons_transient.add(getattr(evdev.ecodes, 'BTN_START', 315))
                 else:
                     self._evdev_buttons.discard(getattr(evdev.ecodes, 'BTN_START', 315))
                 if btn1 & 0x08:  # View (Select)
                     self._evdev_buttons.add(getattr(evdev.ecodes, 'BTN_SELECT', 314))
+                    self._evdev_buttons_transient.add(getattr(evdev.ecodes, 'BTN_SELECT', 314))
                 else:
                     self._evdev_buttons.discard(getattr(evdev.ecodes, 'BTN_SELECT', 314))
 
@@ -220,6 +225,7 @@ class GamepadState:
                     elif event.type == evdev.ecodes.EV_KEY:
                         if event.value >= 1:
                             self._evdev_buttons.add(event.code)
+                            self._evdev_buttons_transient.add(event.code)
                         else:
                             self._evdev_buttons.discard(event.code)
         except (OSError, IOError):
@@ -267,7 +273,8 @@ class GamepadState:
             up = up or hy < -0.5
             down = down or hy > 0.5
 
-            btns = self._evdev_buttons
+            btns = self._evdev_buttons | self._evdev_buttons_transient
+            self._evdev_buttons_transient.clear()
 
             if self._extended:
                 a_btn = any(b in btns for b in [

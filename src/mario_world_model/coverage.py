@@ -77,7 +77,7 @@ def _bin_exact_progression_counts(
 # Progression (x-position) coverage
 # ===================================================================
 
-PROGRESSION_BIN_SIZE: int = 64
+PROGRESSION_BIN_SIZE: int = 256
 
 
 def _scan_progression_from_meta(
@@ -351,40 +351,6 @@ def print_progression_report(
             f"{bi.weight:>8.4f} {reach_str:>6}  {bar}"
         )
     print("=" * 80)
-
-
-def print_action_report(
-    report: ActionBalanceReport,
-    action_meanings: Optional[list[list[str]]] = None,
-    top_n: int = 0,
-) -> None:
-    """Pretty-print the action balance report to stdout."""
-    print()
-    print("=" * 72)
-    print("  ACTION DISTRIBUTION BALANCE REPORT")
-    print("=" * 72)
-    print(f"  Total frames        : {report.total_frames:>10}")
-    print(f"  Distinct actions    : {report.num_actions:>10}")
-    print(f"  Target / action     : {report.target_per_action:>10}")
-    print("-" * 72)
-    print(f"  {'Idx':>4} {'Action':<22} {'Count':>10} {'Target':>10} "
-          f"{'Deficit':>10} {'%Total':>8} {'Weight':>8}")
-    print("-" * 72)
-
-    actions = report.actions
-    if top_n > 0:
-        actions = sorted(actions, key=lambda a: a.deficit, reverse=True)[:top_n]
-
-    for ai in actions:
-        name = "+".join(action_meanings[ai.action_index]) if action_meanings and ai.action_index < len(action_meanings) else str(ai.action_index)
-        bar_len = int(15 * ai.count / report.target_per_action) if report.target_per_action else 0
-        bar = "\u2588" * min(bar_len, 15)
-        print(
-            f"  {ai.action_index:>4} {name:<22} {ai.count:>10} "
-            f"{ai.target:>10} {ai.deficit:>10} {ai.pct_of_total:>7.1f}% "
-            f"{ai.weight:>8.4f}  {bar}"
-        )
-    print("=" * 72)
 
 
 def print_progression_guidance(report: ProgressionBalanceReport, n: int = 5) -> None:
