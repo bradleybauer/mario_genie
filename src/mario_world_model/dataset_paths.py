@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def find_chunk_files(data_dir: str | Path) -> list[str]:
-    """Return .npz chunk files under a data directory, including nested folders."""
+def find_session_files(data_dir: str | Path) -> list[str]:
+    """Return .npz session files under a data directory, including nested folders."""
     data_path = Path(data_dir)
 
     if data_path.is_file():

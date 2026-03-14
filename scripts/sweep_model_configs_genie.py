@@ -33,7 +33,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.dataset_paths import find_chunk_files
+from mario_world_model.dataset_paths import find_session_files
 from mario_world_model.model_configs import MODEL_CONFIGS, ModelConfig
 
 
@@ -47,46 +47,17 @@ class ModelRunResult:
     elapsed_s: float = 0.0
 
 
-def _count_scene_cuts(npz, seq_idx: int, t_start: int, seq_len: int) -> int:
-    if "world" in npz.files and "stage" in npz.files:
-        world_window = np.asarray(npz["world"][seq_idx, t_start : t_start + seq_len])
-        stage_window = np.asarray(npz["stage"][seq_idx, t_start : t_start + seq_len])
-        if len(world_window) <= 1:
-            return 0
-        transitions = (world_window[1:] != world_window[:-1]) | (stage_window[1:] != stage_window[:-1])
-        return int(np.count_nonzero(transitions))
-
-    if "dones" in npz.files:
-        done_window = np.asarray(npz["dones"][seq_idx, t_start : t_start + seq_len], dtype=bool)
-        return int(np.count_nonzero(done_window[:-1]))
-
-    return 0
-
-
-def _count_chunk(filepath: str, seq_len: int) -> int:
-    """Count fixed-length samples with fewer than two scene cuts."""
+def _count_file(filepath: str, seq_len: int) -> int:
+    """Count fixed-length samples in a session file."""
     try:
-        meta_path = filepath.replace(".npz", ".meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as mf:
-                meta = json.load(mf)
-            num_seqs = meta["num_sequences"]
-            total_t = meta["sequence_length"]
-        else:
-            npz = np.load(filepath, mmap_mode="r")
-            num_seqs, total_t = npz["frames"].shape[0], npz["frames"].shape[1]
-
+        npz = np.load(filepath, mmap_mode="r")
+        frames = npz["frames"]
+        if frames.ndim != 4:
+            return 0
+        total_t = frames.shape[0]
         if total_t < seq_len:
             return 0
-
-        npz = np.load(filepath, mmap_mode="r")
-        count = 0
-        for i in range(num_seqs):
-            for t in range(0, total_t - seq_len + 1, seq_len):
-                if _count_scene_cuts(npz, i, t, seq_len) >= 2:
-                    continue
-                count += 1
-        return count
+        return (total_t - seq_len) // seq_len + 1
     except Exception:
         return 0
 
@@ -95,10 +66,10 @@ def get_total_samples(data_dir: str, seq_len: int = 16) -> int:
     """Count samples the same way MarioVideoDataset does."""
     import concurrent.futures
 
-    chunk_files = find_chunk_files(data_dir)
+    session_files = find_session_files(data_dir)
     total = 0
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        futures = [pool.submit(_count_chunk, f, seq_len) for f in chunk_files]
+        futures = [pool.submit(_count_file, f, seq_len) for f in session_files]
         for fut in concurrent.futures.as_completed(futures):
             total += fut.result()
     return total

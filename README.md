@@ -1,5 +1,3 @@
-# Work Log
-
 # Table of Contents
 
 - [Single Sample Overfit Baseline](#single-sample-overfit-baseline)
@@ -8,7 +6,6 @@
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 
-<br>
 <br>
 
 # Single Sample Overfit Baseline
@@ -121,6 +118,21 @@ It was not realistic to change only the VideoTokenizer's output shape, so I prop
 **Result:** 
 The new model trained significantly faster on my 3070, completing ~60k steps in 3 hours.
 It clearly has a much better grasp of spatial layout within the image.
+
+
+<br>
+<br>
+
+# Dataset Refactor #32515123
+
+**Context:** 
+All previous data designs were fundamentally flawed — they used random level selection and even included completely random scene cuts mid-sequence. This project demands a dataset that reflects real game mechanics: contiguous gameplay with natural transitions only.
+
+**Approach:** 
+The old pipeline ran multiple environments in parallel, writing fixed-length chunks `(B, T, C, H, W)` with random level selection and mid-sequence scene cuts. The new pipeline produces contiguous sessions `(N, C, H, W)` — one per collection run — where every frame-to-frame transition is a real gameplay transition. The existing chunk-based dataset was converted into the new session format, and all chunk-related code was removed from the codebase.
+
+**Result:**
+Data collection now produces sessions that faithfully represent real gameplay. Training code is simpler and no longer needs to detect and skip corrupted sequences at load time.
 
 <!-- Template -->
 

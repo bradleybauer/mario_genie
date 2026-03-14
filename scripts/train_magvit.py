@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
 from mario_world_model.auto_batch_sizer import find_max_batch_size
-from mario_world_model.dataset_paths import find_chunk_files
+from mario_world_model.dataset_paths import find_session_files
 from mario_world_model.model_configs import MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
@@ -45,45 +45,24 @@ def _format_elapsed(seconds):
         return f"{minutes}m{secs:02d}s"
     return f"{secs}s"
 
-def _count_scene_cuts(npz, seq_idx, t_start, seq_len):
-    if "world" in npz.files and "stage" in npz.files:
-        world_window = np.asarray(npz["world"][seq_idx, t_start:t_start+seq_len])
-        stage_window = np.asarray(npz["stage"][seq_idx, t_start:t_start+seq_len])
-        if len(world_window) <= 1:
-            return 0
-        transitions = (world_window[1:] != world_window[:-1]) | (stage_window[1:] != stage_window[:-1])
-        return int(np.count_nonzero(transitions))
 
-    if "dones" in npz.files:
-        done_window = np.asarray(npz["dones"][seq_idx, t_start:t_start+seq_len], dtype=bool)
-        return int(np.count_nonzero(done_window[:-1]))
+def _index_file(file_idx, filepath, seq_len):
+    """Index a session file.
 
-    return 0
-
-
-def _index_chunk(chunk_idx, filepath, seq_len):
-    """Index a single chunk file. Returns list of (chunk_idx, seq_idx, t_start) tuples."""
+    Returns list of (file_idx, t_start) tuples.
+    """
     try:
-        meta_path = filepath.replace(".npz", ".meta.json")
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as mf:
-                meta = json.load(mf)
-            num_seqs = meta["num_sequences"]
-            total_t = meta["sequence_length"]
-        else:
-            npz = np.load(filepath, mmap_mode='r')
-            num_seqs, total_t = npz['frames'].shape[0], npz['frames'].shape[1]
+        npz = np.load(filepath, mmap_mode='r')
+        frames = npz['frames']
 
-        if total_t < seq_len:
+        if frames.ndim != 4:
+            print(f"Skipping {filepath}: expected session format (N,C,H,W), got ndim={frames.ndim}")
             return []
 
-        npz = np.load(filepath, mmap_mode='r')
-        samples = []
-        for i in range(num_seqs):
-            for t in range(0, total_t - seq_len + 1, seq_len):
-                if _count_scene_cuts(npz, i, t, seq_len) >= 2:
-                    continue
-                samples.append((chunk_idx, i, t))
+        total_t = frames.shape[0]
+        if total_t < seq_len:
+            return []
+        samples = [(file_idx, t) for t in range(0, total_t - seq_len + 1, seq_len)]
         return samples
     except Exception as e:
         print(f"Skipping {filepath} due to error: {e}")
@@ -91,18 +70,18 @@ def _index_chunk(chunk_idx, filepath, seq_len):
 
 class MarioVideoDataset(Dataset):
     def __init__(self, data_dir, seq_len=4, preload=True, subset_n=0, seed=42):
-        self.chunk_files = find_chunk_files(data_dir)
+        self.data_files = find_session_files(data_dir)
         self.seq_len = seq_len
         self.samples = []
         
-        n_chunks = len(self.chunk_files)
-        print(f"Indexing {n_chunks} chunks (lazy loading)...")
+        n_files = len(self.data_files)
+        print(f"Indexing {n_files} data files (lazy loading)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
-                pool.submit(_index_chunk, idx, f, seq_len): idx
-                for idx, f in enumerate(self.chunk_files)
+                pool.submit(_index_file, idx, f, seq_len): idx
+                for idx, f in enumerate(self.data_files)
             }
-            with tqdm(total=n_chunks, desc="Indexing chunks", unit="chunk") as pbar:
+            with tqdm(total=n_files, desc="Indexing files", unit="file") as pbar:
                 for future in concurrent.futures.as_completed(futures):
                     self.samples.extend(future.result())
                     pbar.update(1)
@@ -121,9 +100,9 @@ class MarioVideoDataset(Dataset):
     def _preload_all(self):
         """Load all samples into a single pinned CPU tensor (parallel I/O)."""
         # Probe shape from first sample
-        chunk_idx, seq_idx, t_start = self.samples[0]
-        npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
-        probe = npz['frames'][seq_idx, t_start:t_start+self.seq_len]
+        file_idx, t_start = self.samples[0]
+        npz = np.load(self.data_files[file_idx], mmap_mode='r')
+        probe = npz['frames'][t_start:t_start+self.seq_len]
         T, C, H, W = probe.shape
         self._palette_index_mode = (C == 1)
 
@@ -138,20 +117,20 @@ class MarioVideoDataset(Dataset):
             print(f"Pre-loading {n} samples into CPU tensor ({total_mb:.0f} MB)...")
             self.data = torch.empty(n, C, T, H, W, dtype=torch.float32)
 
-        print(f"Grouping samples by chunk for efficient loading...")
-        # Group samples by chunk to open each file only once
-        chunk_groups = defaultdict(list)
-        for sample_idx, (chunk_idx, seq_idx, t_start) in enumerate(self.samples):
-            chunk_groups[chunk_idx].append((sample_idx, seq_idx, t_start))
+        print(f"Grouping samples by file for efficient loading...")
+        # Group samples by file to open each file only once
+        file_groups = defaultdict(list)
+        for sample_idx, (file_idx, t_start) in enumerate(self.samples):
+            file_groups[file_idx].append((sample_idx, t_start))
 
         palette_idx = self._palette_index_mode
 
-        def _load_chunk(chunk_idx, entries):
-            """Load one chunk file and write samples into the shared tensor."""
-            npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
+        def _load_file(file_idx, entries):
+            """Load one data file and write samples into the shared tensor."""
+            npz = np.load(self.data_files[file_idx], mmap_mode='r')
             frames_arr = npz['frames']
-            for sample_idx, seq_idx, t_start in entries:
-                frames = np.array(frames_arr[seq_idx, t_start:t_start+self.seq_len])
+            for sample_idx, t_start in entries:
+                frames = np.array(frames_arr[t_start:t_start+self.seq_len])
                 if palette_idx:
                     # (T, 1, H, W) -> (T, H, W) uint8
                     self.data[sample_idx] = torch.from_numpy(frames[:, 0])
@@ -161,13 +140,13 @@ class MarioVideoDataset(Dataset):
                     self.data[sample_idx] = t
             return len(entries)
 
-        num_threads = min(4, len(chunk_groups))
+        num_threads = min(4, len(file_groups))
         print(f"Parallel loading with {num_threads} threads...")
         loaded = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
             futures = {
-                pool.submit(_load_chunk, ci, entries): ci
-                for ci, entries in chunk_groups.items()
+                pool.submit(_load_file, fi, entries): fi
+                for fi, entries in file_groups.items()
             }
             with tqdm(total=n, desc="Pre-loading samples", unit="samp") as pbar:
                 for future in concurrent.futures.as_completed(futures):
@@ -185,11 +164,11 @@ class MarioVideoDataset(Dataset):
         if self.preloaded:
             return self.data[idx]
 
-        chunk_idx, seq_idx, t_start = self.samples[idx]
+        file_idx, t_start = self.samples[idx]
         
         # Load only the slice we need via memory-mapped access
-        npz = np.load(self.chunk_files[chunk_idx], mmap_mode='r')
-        frames = np.array(npz['frames'][seq_idx, t_start:t_start+self.seq_len])
+        npz = np.load(self.data_files[file_idx], mmap_mode='r')
+        frames = np.array(npz['frames'][t_start:t_start+self.seq_len])
         T, C, H, W = frames.shape
 
         if C == 1:
@@ -209,7 +188,7 @@ def train():
         "--data-dir",
         type=str,
         required=True,
-        help="Path to chunk files or a parent directory containing nested chunk folders",
+        help="Path to session files or a parent directory containing nested session folders",
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(

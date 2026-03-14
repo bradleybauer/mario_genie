@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         "--data-dir",
         type=Path,
         default=Path("data/human_play"),
-        help="Directory containing chunk_*.npz files",
+        help="Directory containing session_*.npz files",
     )
     parser.add_argument(
         "--output",
@@ -122,7 +122,7 @@ def _write_output_json(output_path: Optional[Path], payload: dict[str, object]) 
 
 
 def _data_fingerprint(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
-    paths = sorted(data_dir.glob("chunk_*.meta.json"))
+    paths = sorted(data_dir.glob("session_*.meta.json"))
     rollout_path = data_dir / "rollouts.jsonl"
     if rollout_path.exists():
         paths.append(rollout_path)

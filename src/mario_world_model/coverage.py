@@ -1,7 +1,7 @@
 """
 Balanced data-collection utilities.
 
-Scans chunk metadata to compute progression (x-position bin) frame counts and
+Scans session metadata to compute progression (x-position bin) frame counts and
 action distribution, then reports coverage status and produces sampling weights
 from inverse frame counts over the current replay support.
 """
@@ -91,27 +91,32 @@ def _scan_progression_from_meta(
     return None
 
 
+def _find_data_files(data_dir: Path) -> list[Path]:
+    """Find all session .npz files in a data directory."""
+    return sorted(data_dir.glob("session_*.npz"))
+
+
 def scan_progression_coverage(
     data_dir: str | Path,
     bin_size: int = PROGRESSION_BIN_SIZE,
 ) -> dict[tuple[int, int, int], int]:
-    """Return ``{(world, stage, x_bin): frame_count}`` for all chunks.
+    """Return ``{(world, stage, x_bin): frame_count}`` for all data files.
 
-    Chunk metadata must provide exact per-position counts in
+    Metadata must provide exact per-position counts in
     ``exact_progression_summary``; those are rebinned on demand to the
-    requested resolution. Chunks without usable progression metadata are
+    requested resolution. Files without usable progression metadata are
     skipped.
     """
     bin_size = validate_progression_bin_size(bin_size)
     data_dir = Path(data_dir)
-    npz_files = sorted(data_dir.glob("chunk_*.npz"))
+    npz_files = _find_data_files(data_dir)
     totals: dict[tuple[int, int, int], int] = Counter()
     for npz_path in npz_files:
         meta_path = npz_path.with_suffix("").with_suffix(".meta.json")
-        chunk_counts = _scan_progression_from_meta(meta_path, bin_size) if meta_path.exists() else None
-        if chunk_counts is None:
+        counts = _scan_progression_from_meta(meta_path, bin_size) if meta_path.exists() else None
+        if counts is None:
             continue
-        for key, count in chunk_counts.items():
+        for key, count in counts.items():
             totals[key] += count
     return dict(totals)
 
@@ -134,19 +139,19 @@ def _scan_action_from_meta(meta_path: Path) -> Optional[dict[int, int]]:
 
 
 def scan_action_coverage(data_dir: str | Path) -> dict[int, int]:
-    """Return ``{action_index: total_frame_count}`` for all chunks.
+    """Return ``{action_index: total_frame_count}`` for all data files.
 
-    Only chunk metadata is scanned. Chunks without an ``action_summary`` are skipped.
+    Only metadata is scanned. Files without an ``action_summary`` are skipped.
     """
     data_dir = Path(data_dir)
-    npz_files = sorted(data_dir.glob("chunk_*.npz"))
+    npz_files = _find_data_files(data_dir)
     totals: dict[int, int] = Counter()
     for npz_path in npz_files:
         meta_path = npz_path.with_suffix("").with_suffix(".meta.json")
-        chunk_counts = _scan_action_from_meta(meta_path) if meta_path.exists() else None
-        if chunk_counts is None:
+        counts = _scan_action_from_meta(meta_path) if meta_path.exists() else None
+        if counts is None:
             continue
-        for key, count in chunk_counts.items():
+        for key, count in counts.items():
             totals[key] += count
     return dict(totals)
 

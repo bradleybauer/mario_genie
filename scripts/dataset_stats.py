@@ -19,12 +19,11 @@ import numpy as np
 
 
 def gather_stats(data_dir: Path) -> dict:
-    """Scan all chunk meta.json + npz files and return aggregate stats."""
-    meta_files = sorted(data_dir.rglob("chunk_*.meta.json"))
-    npz_files = sorted(data_dir.rglob("chunk_*.npz"))
+    """Scan all session meta.json + npz files and return aggregate stats."""
+    meta_files = sorted(data_dir.rglob("session_*.meta.json"))
+    npz_files = sorted(data_dir.rglob("session_*.npz"))
 
-    total_chunks = 0
-    total_sequences = 0
+    total_sessions = 0
     total_frames = 0
     action_counts: Counter[int] = Counter()
     level_counts: Counter[str] = Counter()
@@ -36,11 +35,8 @@ def gather_stats(data_dir: Path) -> dict:
     for mf in meta_files:
         with open(mf) as f:
             meta = json.load(f)
-        total_chunks += 1
-        total_sequences += meta["num_sequences"]
-        total_frames += meta["total_frames"]
-        if frame_shape is None:
-            frame_shape = meta["frame_shape_btchw"]
+        total_sessions += 1
+        total_frames += meta.get("num_frames", 0)
         for act, cnt in meta.get("action_summary", {}).items():
             action_counts[int(act)] += cnt
         for key, cnt in meta.get("exact_progression_summary", {}).items():
@@ -54,9 +50,8 @@ def gather_stats(data_dir: Path) -> dict:
             npz = np.load(npz_path, mmap_mode="r")
             frames = npz["frames"]
             actions = npz["actions"]
-            total_chunks += 1
-            total_sequences += frames.shape[0]
-            total_frames += frames.shape[0] * frames.shape[1]
+            total_sessions += 1
+            total_frames += frames.shape[0]
             if frame_shape is None:
                 frame_shape = list(frames.shape)
                 dtype = str(frames.dtype)
@@ -71,10 +66,9 @@ def gather_stats(data_dir: Path) -> dict:
 
     return {
         "data_dir": str(data_dir),
-        "num_chunks": total_chunks,
-        "num_sequences": total_sequences,
+        "num_sessions": total_sessions,
         "total_frames": total_frames,
-        "frame_shape_btchw": frame_shape,
+        "frame_shape": frame_shape,
         "dtype": dtype,
         "disk_size_mb": round(disk_bytes / 1e6, 1),
         "action_counts": dict(sorted(action_counts.items())),
@@ -88,12 +82,11 @@ def print_stats(stats: dict) -> None:
     print(f"\n{'='*60}")
     print(f"  Dataset: {stats['data_dir']}")
     print(f"{'='*60}")
-    print(f"  Chunks:          {stats['num_chunks']}")
-    print(f"  Sequences:       {stats['num_sequences']:,}")
+    print(f"  Sessions:        {stats['num_sessions']}")
     print(f"  Total frames:    {stats['total_frames']:,}")
-    if stats["frame_shape_btchw"]:
-        shape = stats["frame_shape_btchw"]
-        print(f"  Chunk shape:     {shape}  (B, T, C, H, W)")
+    if stats["frame_shape"]:
+        shape = stats["frame_shape"]
+        print(f"  Frame shape:     {shape}  (N, C, H, W)")
     if stats["dtype"]:
         print(f"  Dtype:           {stats['dtype']}")
     print(f"  Disk size:       {stats['disk_size_mb']} MB")
