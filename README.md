@@ -172,7 +172,8 @@ to disentangle certain spatial information from the image than it is from RAM.
 
 - **ai slop**
 For storage, the RAM can be delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. The stack and OAM regions could also be excluded entirely (saving ~37% raw) since they're either noise or redundant with the image. Add a learned embedding of the NES RAM to the latent space via feature concatenation. A small encoder (2–3 FC layers) maps the 1,536-byte RAM vector to a D-dim embedding matching the latent channel dimension, which is then broadcast spatially to 16×16 and concatenated with the image latent. The RAM encoder trains jointly with the rest of the model. Using both images and RAM should perform better than either alone. The image embeddings are a 16×16 grid of features with inherent spatial bias — it may be easier to disentangle certain spatial information from the image than from RAM, and vice versa. For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. I added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
-![alt text](pictures/ram.png)
+
+![nes ram in game visualization](pictures/ram.png)
 
 **Result:** 
 TODO
