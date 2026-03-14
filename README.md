@@ -144,15 +144,28 @@ Data collection now produces sessions that faithfully represent real gameplay. T
 **Context:** 
 If mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training.
 
-**Approach:** 
-Potentially add a temporal embedding of the NES 2kb's of ram to the latent space.
-Wonder how that would effect what the encoder learns to encode. Probably a shift toward more visual features?
-An idea is you could side-step the image encoder all together. Just predict pixels based on RAM embeddings.
-Talking with AI about it leads me to believe using both images & ram will perform better than either alone.
-The image embeddings are a 16x16 grid of features where that grid is a spatial "bias". It may be easier
-to disentagnle certain spatial information from the image than it is from RAM?
+**NES RAM Layout:**
+The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`. It is divided into four regions:
 
-I added a really neat NES ram visualizer
+- **Zero Page** (`$0000`–`$00FF`, 256 bytes) — The 6502 CPU's fast-access page. Games store their most frequently-read variables here because zero-page addressing modes are shorter and faster. In SMB1 this includes player position (`$0086` X, `$00CE` Y), velocity (`$0057` X speed, `$001D` Y speed), player state machine (`$000E`), moving direction (`$0045`), and the five enemy type slots (`$0016`–`$001A`).
+
+- **Stack** (`$0100`–`$01FF`, 256 bytes) — The 6502 hardware stack, growing downward from `$01FF`. Contains return addresses and saved registers from subroutine calls. Mostly noise from the model's perspective — the values change rapidly and don't carry meaningful game state. Likely safe to exclude or zero-fill for embedding purposes.
+
+- **OAM Buffer** (`$0200`–`$02FF`, 256 bytes) — Sprite Object Attribute Memory staging area. The game writes 64 sprites × 4 bytes here (Y position, tile index, attributes, X position), then DMA transfers the whole page to the PPU each frame. This data is *derivable from the image* — it's literally what draws the sprites on screen. SMB1 rotates sprite priority every frame to work around the NES's 8-sprites-per-scanline limit, causing visible flickering in the raw data. Could be excluded from the embedding since the image encoder already captures this information.
+
+- **Game Data** (`$0300`–`$07FF`, 1280 bytes) — The bulk of meaningful game state. Includes world/stage (`$075F`/`$075C`), lives (`$075A`), score (`$07DE`–`$07E3` BCD), coins (`$07ED`–`$07EE` BCD), timer (`$07F8`–`$07FA` BCD), gameplay mode (`$0770`), power-up status (`$0756`), level layout data, and enemy state arrays. This is where the "hidden state" lives — things like which blocks have been hit, which items have been collected, and which enemies have been defeated.
+
+**Approach:** 
+Potentially add a temporal embedding of the NES 2KB of RAM to the latent space.
+Wonder how that would affect what the encoder learns to encode. Probably a shift toward more visual features?
+An idea is you could side-step the image encoder altogether. Just predict pixels based on RAM embeddings.
+Talking with AI about it leads me to believe using both images & RAM will perform better than either alone.
+The image embeddings are a 16x16 grid of features where that grid is a spatial "bias". It may be easier
+to disentangle certain spatial information from the image than it is from RAM.
+
+For storage, the RAM can be delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well. The stack and OAM regions could also be excluded entirely (saving ~37% raw) since they're either noise or redundant with the image.
+
+I added a really neat NES RAM visualizer.
 ![alt text](pictures/ram.png)
 
 TODO
