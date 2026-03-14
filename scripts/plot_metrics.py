@@ -8,7 +8,6 @@ import re
 import sys
 
 import matplotlib.pyplot as plt
-import numpy as np
 
 
 def load_metrics(path):
