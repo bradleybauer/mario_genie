@@ -371,7 +371,7 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
         if show_ram:
             full_ram = np.array(env.ram, dtype=np.uint8)
             ram = full_ram[:RAM_SIZE]
-            _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h, ram_cell, decoder, full_ram=full_ram)
+            _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h, ram_cell, decoder, full_ram=full_ram, rom_name=name)
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -430,7 +430,7 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
         ram = full_ram[:RAM_SIZE]
         _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
                         ram_cell, decoder, full_ram=full_ram,
-                        wram_renderer=wram_renderer)
+                        wram_renderer=wram_renderer, rom_name=name)
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -494,7 +494,7 @@ def _ram_layout(game_w, game_h, cell_size=RAM_CELL, has_decoder=False,
 
 def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
                     cell_size=RAM_CELL, decoder=None, full_ram=None,
-                    wram_renderer=None):
+                    wram_renderer=None, rom_name=''):
     """Draw RAM grids, WRAM grids, OAM minimap, and decoded vars."""
     ram_renderer.update(ram)
     gx = game_w + layout['label_margin']
@@ -558,8 +558,9 @@ def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
     screen.blit(oam_label, (oam_x, cy if decoder else cy + 12))
     screen.blit(oam_surface, (oam_x, (cy if decoder else cy + 12) + 14))
 
-    # --- Level / overworld tilemap below the game frame ---
-    if full_ram is not None and len(full_ram) > WRAM_OFFSET + WRAM_SIZE // 2:
+    # --- Level / overworld tilemap below the game frame (SMB3 only) ---
+    _is_smb3 = 'super mario bros. 3' in rom_name.lower() or 'super mario bros 3' in rom_name.lower()
+    if _is_smb3 and full_ram is not None and len(full_ram) > WRAM_OFFSET + WRAM_SIZE // 2:
         # Detect overworld vs in-level
         time_val = (int(full_ram[0x05EE]) * 100
                     + int(full_ram[0x05EF]) * 10
