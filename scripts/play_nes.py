@@ -337,10 +337,11 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
     game_w = w * scale
     game_h = h * scale
 
+    FPS_BAR_H = 18  # height of status bar when no RAM panel
     if show_ram:
         win_w, win_h, layout = _ram_layout(game_w, game_h, ram_cell, has_decoder=decoder is not None)
     else:
-        win_w, win_h = game_w, game_h
+        win_w, win_h = game_w, game_h + FPS_BAR_H
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
@@ -349,6 +350,10 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
     controller = GamepadController()
     font = pygame.font.SysFont('monospace', 13) if show_ram else None
     ram_renderer = RAMGridRenderer() if show_ram else None
+
+    fps_font = pygame.font.SysFont('monospace', 14, bold=True)
+    fps_surface = fps_font.render('-- FPS', True, (0, 255, 0))
+    fps_frame = 0
 
     running = True
     while running:
@@ -372,6 +377,17 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
             full_ram = np.array(env.ram, dtype=np.uint8)
             ram = full_ram[:RAM_SIZE]
             _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h, ram_cell, decoder, full_ram=full_ram, rom_name=name)
+
+        # Discrete FPS indicator (updated every 30 frames)
+        fps_frame += 1
+        if fps_frame >= 30:
+            fps_val = clock.get_fps()
+            fps_surface = fps_font.render(f'{fps_val:.0f} FPS', True, (0, 255, 0))
+            fps_frame = 0
+        if show_ram:
+            screen.blit(fps_surface, (game_w + 4, win_h - fps_surface.get_height() - 4))
+        else:
+            screen.blit(fps_surface, (4, game_h + 2))
 
         pygame.display.flip()
         clock.tick(FPS)
@@ -406,6 +422,10 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
     font = pygame.font.SysFont('monospace', 13)
     ram_renderer = RAMGridRenderer()
 
+    fps_font = pygame.font.SysFont('monospace', 14, bold=True)
+    fps_surface = fps_font.render('-- FPS', True, (0, 255, 0))
+    fps_frame = 0
+
     running = True
     while running:
         for event in pygame.event.get():
@@ -431,6 +451,14 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
         _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
                         ram_cell, decoder, full_ram=full_ram,
                         wram_renderer=wram_renderer, rom_name=name)
+
+        # Discrete FPS indicator (updated every 30 frames)
+        fps_frame += 1
+        if fps_frame >= 30:
+            fps_val = clock.get_fps()
+            fps_surface = fps_font.render(f'{fps_val:.0f} FPS', True, (0, 255, 0))
+            fps_frame = 0
+        screen.blit(fps_surface, (game_w + 4, win_h - fps_surface.get_height() - 4))
 
         pygame.display.flip()
         clock.tick(FPS)
