@@ -14,9 +14,7 @@ Tips:
 
 # fmt: off
 WORKERS = [
-    {"name": "a", "host": "188.36.196.221", "port": 5398, "user": "root"},
-    {"name": "b", "host": "69.143.221.78", "port": 23730, "user": "root"},
-    {"name": "c", "host": "154.57.34.105", "port": 18121, "user": "root"},
+    {"name": "a", "host": "108.255.76.60", "port": 65248 , "user": "root"},
 ]
 # fmt: on
 

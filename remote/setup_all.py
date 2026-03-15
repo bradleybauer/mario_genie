@@ -35,7 +35,10 @@ def setup_worker(worker):
         "apt-get install -y build-essential htop vim && "
         ". /opt/miniforge3/etc/profile.d/conda.sh && "
         f"cd {worker.project_dir} && "
-        "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml)"
+        "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml) && "
+        "grep -qxF 'alias py=python' ~/.bashrc || echo 'alias py=python' >> ~/.bashrc && "
+        "grep -qxF 'conda activate mario' ~/.bashrc || echo 'conda activate mario' >> ~/.bashrc && "
+        f"grep -qxF 'cd {worker.project_dir}' ~/.bashrc || echo 'cd {worker.project_dir}' >> ~/.bashrc"
     ), capture=True)
 
 

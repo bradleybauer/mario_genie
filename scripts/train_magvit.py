@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import math
 import os
+import random
 import time
 from datetime import datetime
 import torch
@@ -26,9 +27,10 @@ from tqdm import tqdm
 from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
 from mario_world_model.auto_batch_sizer import find_max_batch_size
 from mario_world_model.dataset_paths import find_session_files
-from mario_world_model.model_configs import MODEL_CONFIGS_BY_NAME
+from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
+from mario_world_model.system_info import collect_system_info, print_system_info
 
 
 def _format_elapsed(seconds):
@@ -183,7 +185,7 @@ def train():
         required=True,
         help="Path to session files or a parent directory containing nested session folders",
     )
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
         "--auto-batch-size", action="store_true",
         help="Probe GPU to find the largest batch size that fits in VRAM. "
@@ -205,21 +207,23 @@ def train():
     parser.add_argument(
         "--model",
         type=str,
-        required=True,
+        default=None,
         metavar="NAME",
-        help="Named model config. Use --list-models to see available configs.",
+        help="Named model config (random if omitted). Use --list-models to see available configs.",
     )
     parser.add_argument(
         "--list-models",
         action="store_true",
         help="Print available model configs and exit.",
     )
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile on the tokenizer (requires PyTorch 2+)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (enabled by default)")
+    parser.add_argument("--tf32", action="store_true",
+                        help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
-    parser.add_argument("--num-workers", type=int, default=len(os.sched_getaffinity(0)),
-                        help=f"Number of DataLoader workers (default: {len(os.sched_getaffinity(0))})")
+    parser.add_argument("--num-workers", type=int, default=min(len(os.sched_getaffinity(0)), 64),
+                        help=f"Number of DataLoader workers (default: {min(len(os.sched_getaffinity(0)), 64)})")
     parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
     parser.add_argument(
         "--max-patience", type=float, default=None,
@@ -244,6 +248,21 @@ def train():
             "Also sets the cosine-annealing LR schedule duration."
         ),
     )
+    parser.add_argument(
+        "--max-steps", type=int, default=0,
+        help="Stop after this many gradient steps (0 = no limit).",
+    )
+    parser.add_argument(
+        "--total-steps", type=int, default=0,
+        help=(
+            "Total steps for the cosine LR schedule. "
+            "Defaults to --max-steps when set, otherwise estimated from --max-minutes."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from", type=str, default=None,
+        help="Path to training_state.pt to resume training from.",
+    )
     args = parser.parse_args()
 
     if args.list_models:
@@ -251,10 +270,14 @@ def train():
             print(name)
         return
 
-    if args.model not in MODEL_CONFIGS_BY_NAME:
+    if args.model is None:
+        mc = random.choice(MODEL_CONFIGS)
+        args.model = mc.name
+        print(f"[random] Selected model: {args.model}")
+    elif args.model not in MODEL_CONFIGS_BY_NAME:
         parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
-
-    mc = MODEL_CONFIGS_BY_NAME[args.model]
+    else:
+        mc = MODEL_CONFIGS_BY_NAME[args.model]
     tokenizer_layers = tuple(
         (name, int(val)) if ":" in tok else tok
         for tok in mc.layers.split(",")
@@ -277,6 +300,10 @@ def train():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
+    # ── System info ──────────────────────────────────────────────────
+    system_info = collect_system_info()
+    print_system_info(system_info)
 
     dataset = MarioVideoDataset(
         args.data_dir, seq_len=SEQUENCE_LENGTH,
@@ -348,13 +375,13 @@ def train():
         codebook_size=mc.codebook_size,
         layers=tokenizer_layers,
     ).to(device)
-    if args.compile:
-        tokenizer = torch.compile(tokenizer)
-        print("[compile] torch.compile enabled")
+    # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
+    tokenizer.discr = None
+    tokenizer.multiscale_discrs = None
     palette = palette.to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
-    # ── Auto batch-size ──────────────────────────────────────────────
+    # ── Auto batch-size (before compile — compiled graphs cache shapes) ──
     if args.auto_batch_size and device.type == "cuda":
         print("\n[auto-batch] Probing GPU for maximum batch size …")
         ceiling = num_unique_samples
@@ -381,6 +408,19 @@ def train():
           print(f"Capped batch_size {args.batch_size} -> {num_unique_samples} (unique samples)")
           args.batch_size = num_unique_samples
 
+    # ── TF32 ─────────────────────────────────────────────────────────
+    if args.tf32 and torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        print("[tf32] TF32 matmul precision enabled")
+
+    # ── Count parameters (before compile — wrapper can change counts) ──
+    num_parameters = sum(p.numel() for p in tokenizer.parameters())
+
+    # ── Compile (after auto-batch so shape probing isn't cached) ──
+    if not args.no_compile:
+        tokenizer = torch.compile(tokenizer)
+        print("[compile] torch.compile enabled")
+
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
     # ── LR schedule: linear warmup → cosine decay to 10 % of peak ────
@@ -389,7 +429,10 @@ def train():
     warmup_steps = args.warmup_steps
 
     # Estimate total training steps for the cosine T_max
-    if max_seconds > 0:
+    total_steps_for_schedule = args.total_steps or args.max_steps
+    if total_steps_for_schedule > 0:
+        estimated_total = max(total_steps_for_schedule, warmup_steps + 100)
+    elif max_seconds > 0:
         estimated_total = max(int(max_seconds * 5), warmup_steps + 100)
     else:
         estimated_total = 100_000
@@ -414,7 +457,8 @@ def train():
     config["layers"] = [list(l) if isinstance(l, tuple) else l for l in tokenizer_layers]
     config["git_hash"] = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or None
     config["timestamp"] = datetime.now().isoformat()
-    config["num_parameters"] = sum(p.numel() for p in tokenizer.parameters())
+    config["num_parameters"] = num_parameters
+    config["system_info"] = system_info
     config_path = os.path.join(args.output_dir, "config.json")
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
@@ -425,11 +469,68 @@ def train():
     metrics_path = os.path.join(args.output_dir, "metrics.json")
     train_start = time.time()
 
+    # ── Resume from checkpoint ───────────────────────────────────────
+    start_step = 0
+    ckpt = None
+    if args.resume_from:
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
+        unwrapped.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        start_step = ckpt['global_step']
+        print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+
+    # ── Perf tracking ────────────────────────────────────────────────
+    _perf_step_count = start_step
+    _perf_sample_count = 0
+    _perf_window_start = time.time()
+    _perf_window_steps = 0
+    _perf_window_samples = 0
+    _PERF_WINDOW = 20  # rolling window size in steps
+    # Bytes per sample for throughput: one-hot input (B, K, T, H, W) float32
+    _bytes_per_sample = num_palette_colors * SEQUENCE_LENGTH * IMAGE_SIZE * IMAGE_SIZE * 4
+
+    def _gpu_stats():
+        """Return dict of GPU stats, or empty dict if unavailable."""
+        if not torch.cuda.is_available():
+            return {}
+        idx = device.index or 0
+        try:
+            mem_used = torch.cuda.memory_allocated(idx) / 2**30
+            mem_total = torch.cuda.get_device_properties(idx).total_memory / 2**30
+            stats = {
+                "gpu_mem_used_gb": round(mem_used, 2),
+                "gpu_mem_total_gb": round(mem_total, 2),
+                "gpu_mem_pct": round(100 * mem_used / mem_total, 1),
+            }
+        except Exception:
+            stats = {}
+        # nvidia-smi fields via pynvml-free approach
+        try:
+            handle = torch.cuda.current_device()
+            util = torch.cuda.utilization(handle)
+            stats["gpu_util_pct"] = util
+        except Exception:
+            pass
+        try:
+            temp = torch.cuda.temperature(idx)
+            stats["gpu_temp_c"] = temp
+        except Exception:
+            pass
+        return stats
+
     smooth_alpha = 0.95
     smoothed_recon = None
     best_smoothed_recon = float('inf')
     last_improvement_time = time.time()
     last_image_time = 0.0
+
+    if args.resume_from and ckpt is not None:
+        smoothed_recon = ckpt.get('smoothed_recon')
+        best_smoothed_recon = ckpt.get('best_smoothed_recon', float('inf'))
+        metrics_log = ckpt.get('metrics_log', [])
+        _perf_sample_count = ckpt.get('total_samples', 0)
 
     def save_reconstruction(batch, path):
         """Encode → decode a batch and save side-by-side comparison image.
@@ -470,9 +571,14 @@ def train():
         else:
             yield from dataloader
 
-    pbar = tqdm(batch_iter(), desc="Training")
+    pbar_total = args.max_steps if args.max_steps > 0 else None
+    pbar = tqdm(batch_iter(), desc="Training", initial=start_step, total=pbar_total)
 
-    for global_step, batch in enumerate(pbar):
+    global_step = start_step
+    for batch in pbar:
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
+            break
         elapsed = time.time() - train_start
         if max_seconds > 0 and elapsed >= max_seconds:
             print(f"\n[max-time] Reached {elapsed/60:.1f} min. Stopping.")
@@ -500,6 +606,24 @@ def train():
         current_lr = optimizer.param_groups[0]['lr']
         recon = loss_breakdown.recon_loss.item()
 
+        # ── Perf tracking ────────────────────────────────────────────
+        _perf_step_count += 1
+        _perf_sample_count += batch.shape[0]
+        _perf_window_steps += 1
+        _perf_window_samples += batch.shape[0]
+        now_perf = time.time()
+        if _perf_window_steps >= _PERF_WINDOW:
+            _window_elapsed = now_perf - _perf_window_start
+            _samples_per_sec = _perf_window_samples / max(_window_elapsed, 1e-9)
+            _steps_per_sec = _perf_window_steps / max(_window_elapsed, 1e-9)
+            _perf_window_start = now_perf
+            _perf_window_steps = 0
+            _perf_window_samples = 0
+        else:
+            _window_elapsed = now_perf - _perf_window_start
+            _samples_per_sec = _perf_window_samples / max(_window_elapsed, 1e-9)
+            _steps_per_sec = _perf_window_steps / max(_window_elapsed, 1e-9)
+
         # Update EMA of recon loss
         if smoothed_recon is None:
             smoothed_recon = recon
@@ -511,14 +635,24 @@ def train():
             best_smoothed_recon = smoothed_recon
             last_improvement_time = time.time()
 
-        pbar.set_postfix({
+        postfix = {
             'loss': f"{loss.item():.4f}",
             'recon': f"{recon:.4f}",
             'smooth': f"{smoothed_recon:.4f}",
             'best': f"{best_smoothed_recon:.4f}",
             'since_best': _format_elapsed(time.time() - last_improvement_time),
             'lr': f"{current_lr:.2e}",
-        })
+            'samp/s': f"{_samples_per_sec:.0f}",
+            'MB/s': f"{_samples_per_sec * _bytes_per_sample / 2**20:.0f}",
+        }
+        gs = _gpu_stats()
+        if 'gpu_util_pct' in gs:
+            postfix['gpu'] = f"{gs['gpu_util_pct']}%"
+        if 'gpu_mem_pct' in gs:
+            postfix['mem'] = f"{gs['gpu_mem_pct']:.0f}%"
+        if 'gpu_temp_c' in gs:
+            postfix['temp'] = f"{gs['gpu_temp_c']}C"
+        pbar.set_postfix(postfix)
 
         if args.threshold is not None and smoothed_recon < args.threshold:
             print(f"\n[threshold] smoothed_recon={smoothed_recon:.6f} < "
@@ -533,6 +667,7 @@ def train():
 
         # ── Periodic logging & image saves ───────────────────────────
         if global_step % args.val_interval == 0:
+            gs = _gpu_stats()
             step_metrics = {
                 "step": global_step,
                 "loss": loss.item(),
@@ -541,6 +676,11 @@ def train():
                 "best_smoothed_recon": best_smoothed_recon,
                 "lr": current_lr,
                 "elapsed_s": round(time.time() - train_start, 2),
+                "samples_per_sec": round(_samples_per_sec, 1),
+                "data_throughput_mbps": round(_samples_per_sec * _bytes_per_sample / 2**20, 1),
+                "steps_per_sec": round(_steps_per_sec, 2),
+                "total_samples": _perf_sample_count,
+                **gs,
             }
             metrics_log.append(step_metrics)
 
@@ -556,7 +696,11 @@ def train():
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_log, f, indent=2)
 
+        global_step += 1
+
     # Always record the final state so sweep readers see the terminal smoothed_recon
+    total_elapsed = time.time() - train_start
+    gs = _gpu_stats()
     final_metrics = {
         "step": global_step,
         "loss": loss.item(),
@@ -564,7 +708,11 @@ def train():
         "smoothed_recon_loss": smoothed_recon,
         "best_smoothed_recon": best_smoothed_recon,
         "lr": optimizer.param_groups[0]['lr'],
-        "elapsed_s": round(time.time() - train_start, 2),
+        "elapsed_s": round(total_elapsed, 2),
+        "samples_per_sec": round(_perf_sample_count / max(total_elapsed, 1e-9), 1),
+        "total_samples": _perf_sample_count,
+        "total_steps": _perf_step_count,
+        **gs,
     }
     if not metrics_log or metrics_log[-1]["step"] != global_step:
         metrics_log.append(final_metrics)
@@ -574,8 +722,24 @@ def train():
 
     # ── Save checkpoint & final reconstruction ───────────────────────
     ckpt_path = os.path.join(args.output_dir, "magvit2_best.pt")
-    torch.save(tokenizer.state_dict(), ckpt_path)
-    print(f"Checkpoint saved to {ckpt_path}")
+    unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
+    torch.save(unwrapped.state_dict(), ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path} ({len(unwrapped.state_dict())} keys)")
+
+    # Full training state for ASHA / resume
+    training_state = {
+        'model': unwrapped.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
+        'global_step': global_step,
+        'smoothed_recon': smoothed_recon,
+        'best_smoothed_recon': best_smoothed_recon,
+        'metrics_log': metrics_log,
+        'total_samples': _perf_sample_count,
+    }
+    state_path = os.path.join(args.output_dir, "training_state.pt")
+    torch.save(training_state, state_path)
+    print(f"Training state saved to {state_path}")
 
     save_reconstruction(batch, os.path.join(args.output_dir, "final_reconstruction.png"))
     print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")

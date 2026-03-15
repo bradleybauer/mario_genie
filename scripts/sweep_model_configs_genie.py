@@ -94,69 +94,41 @@ def read_best_recon(metrics_path: str) -> float:
 
 def build_train_cmd(
     model: ModelConfig,
-    *,
-    data_dir: str,
-    output_dir: str,
-    max_minutes: float,
-    lr: float,
-    warmup_steps: int,
-    patience: float,
-    val_interval: int,
-    max_batch_size: int,
-    seed: int,
-    num_workers: int,
-    threshold: float = 0.0,
+    args: argparse.Namespace,
+    extra_train_args: list[str],
 ) -> list[str]:
-    rname = model.name
-    cmd = [
+    return [
         sys.executable, "scripts/train_magvit.py",
-        "--data-dir", data_dir,
-        "--run-name", rname,
-        "--init-dim", str(model.init_dim),
-        "--codebook-size", str(model.codebook_size),
-        "--layers", model.layers,
-        "--max-minutes", str(max_minutes),
-        "--lr", str(lr),
-        "--warmup-steps", str(warmup_steps),
-        "--threshold", str(threshold),
-        "--max-patience", str(patience),
-        "--val-interval", str(val_interval),
-        "--seed", str(seed),
-        "--num-workers", str(num_workers),
-        "--output-dir", output_dir,
-        "--auto-batch-size",
-        "--max-batch-size", str(max_batch_size),
-        "--no-preload",
+        "--run-name", model.name,
+        "--model", model.name,
+        *extra_train_args,
     ]
-    return cmd
 
 
 def run_model(
     model: ModelConfig,
     total_samples: int,
-    *,
-    dry_run: bool,
-    resume: bool,
-    **train_kwargs,
+    args: argparse.Namespace,
+    extra_train_args: list[str],
 ) -> ModelRunResult:
     """Train one model configuration on the full dataset."""
     rname = model.name
-    metrics_path = os.path.join(train_kwargs["output_dir"], rname, "metrics.json")
+    metrics_path = os.path.join(args.output_dir, rname, "metrics.json")
 
-    if resume and os.path.exists(metrics_path):
+    if args.resume and os.path.exists(metrics_path):
         best_recon = read_best_recon(metrics_path)
         print(f"  [resume] {rname}: reusing existing metrics (best_recon={best_recon:.6f})")
         return ModelRunResult(
             name=model.name,
             total_samples=total_samples,
             best_recon=best_recon,
-            passed=best_recon < train_kwargs.get("threshold", 0.0005),
+            passed=best_recon < args.threshold,
             run_name=rname,
         )
 
-    cmd = build_train_cmd(model, **train_kwargs)
+    cmd = build_train_cmd(model, args, extra_train_args)
 
-    if dry_run:
+    if args.dry_run:
         print(f"  [dry-run] {' '.join(cmd)}")
         return ModelRunResult(
             name=model.name,
@@ -175,8 +147,7 @@ def run_model(
         print(f"  [WARN] {rname} exited with code {result.returncode}")
 
     best_recon = read_best_recon(metrics_path)
-    threshold = train_kwargs.get("threshold", 0.0005)
-    passed = best_recon < threshold
+    passed = best_recon < args.threshold
     status = "PASS" if passed else "FAIL"
     print(f"  {rname}: best_recon={best_recon:.6f}  [{status}]  ({elapsed:.0f}s)")
 
@@ -259,22 +230,6 @@ def main() -> None:
     parser.add_argument("--output-dir", default="checkpoints/model_config_sweep_genie")
     parser.add_argument("--threshold", type=float, default=0.0008,
                         help="Recon loss threshold for pass/fail (default: 0.0008)")
-    parser.add_argument("--max-patience", type=float, default=60*4,
-                        help="Minutes without improvement before early stop (default: 150)")
-    parser.add_argument("--max-minutes", type=float, default=60*4,
-                        help="Wall-clock minute budget per trial (default: 150)")
-    parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--warmup-steps", type=int, default=1000,
-                        help="Linear warmup steps passed to train_magvit (default: 1000)")
-    parser.add_argument("--val-interval", type=int, default=100)
-    parser.add_argument("--max-batch-size", type=int, default=8,
-                        help="Cap auto-detected batch size (default: 8)")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=32)
-    parser.add_argument("--max-samples", type=int, default=0,
-                        help="Accepted for CLI compatibility; ignored by this script")
-    parser.add_argument("--initial-global-best", type=int, default=0,
-                        help="Accepted for CLI compatibility; ignored by this script")
     parser.add_argument("--filter", type=str, default=None,
                         help="Only run models whose name contains this substring")
     parser.add_argument("--dry-run", action="store_true",
@@ -285,17 +240,12 @@ def main() -> None:
                         help="This worker's shard index for multi-machine sweeps (0-based)")
     parser.add_argument("--num-shards", type=int, default=1,
                         help="Total number of workers sharing the sweep")
-    args = parser.parse_args()
+    # All other args (--lr, --max-minutes, --max-patience, etc.) are
+    # forwarded directly to train_magvit.py.
+    args, extra_train_args = parser.parse_known_args()
 
-    if args.initial_global_best < 0:
-        parser.error("--initial-global-best must be non-negative")
     if args.shard_index < 0 or args.shard_index >= args.num_shards:
         parser.error(f"--shard-index must be in [0, {args.num_shards})")
-
-    if args.initial_global_best > 0:
-        print("[init] --initial-global-best is ignored in single-pass mode")
-    if args.max_samples > 0:
-        print("[init] --max-samples is ignored in single-pass mode")
 
     if args.num_shards > 1:
         configs = sorted(MODEL_CONFIGS, key=lambda c: c.name)
@@ -327,20 +277,6 @@ def main() -> None:
         print("Dataset too small.")
         sys.exit(1)
 
-    train_kwargs = dict(
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        max_minutes=args.max_minutes,
-        lr=args.lr,
-        warmup_steps=args.warmup_steps,
-        patience=args.max_patience * 60,
-        val_interval=args.val_interval,
-        max_batch_size=args.max_batch_size,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        threshold=args.threshold,
-    )
-
     os.makedirs(args.output_dir, exist_ok=True)
     summary_path = os.path.join(args.output_dir, "model_config_sweep_results.json")
     completed_results = load_completed_results(
@@ -365,13 +301,7 @@ def main() -> None:
         print(f"\n{'=' * 64}")
         print(f"Model: {model.name}  (dim={model.init_dim}  cb={model.codebook_size})")
         print(f"{'=' * 64}")
-        result = run_model(
-            model,
-            total_samples,
-            dry_run=args.dry_run,
-            resume=args.resume,
-            **train_kwargs,
-        )
+        result = run_model(model, total_samples, args, extra_train_args)
         all_results.append(result)
         write_summary(summary_path, args.threshold, total_samples, len(configs), all_results)
 
