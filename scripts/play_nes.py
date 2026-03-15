@@ -63,8 +63,10 @@ BUTTON_BITS = {
 from mario_world_model.ram_viz import (
     RAM_SIZE, RAM_COLS, RAM_ROWS, RAM_CELL,
     WRAM_SIZE, WRAM_COLS, WRAM_ROWS, WRAM_CELL,
+    LEVEL_COLS_PER_SCREEN,
     RAMGridRenderer, WRAMGridRenderer,
     render_oam_minimap, draw_ram_region_labels,
+    render_level_tilemap,
 )
 from mario_world_model.game_decoders import (
     get_decoder, draw_decoded_sections, WRAM_OFFSET,
@@ -397,7 +399,7 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
                                        has_wram=show_wram)
 
     pygame.init()
-    screen = pygame.display.set_mode((win_w, win_h))
+    screen = pygame.display.set_mode((win_w, win_h), pygame.DOUBLEBUF)
     pygame.display.set_caption(f"{name} (retro + RAM)")
     clock = pygame.time.Clock()
     controller = GamepadController()
@@ -445,6 +447,7 @@ def _ram_layout(game_w, game_h, cell_size=RAM_CELL, has_decoder=False,
         Row 1:  [labels 80px]  RAM VALUES  [gap]  RAM ACTIVITY
         Row 2:  [labels 80px]  WRAM VALUES [gap]  WRAM ACTIVITY   (if has_wram)
         Below:  [decoded col1] [decoded col2] [OAM minimap]
+    Below game frame: level tilemap (if has_wram)
     """
     ram_grid_w = RAM_COLS * cell_size
     ram_grid_h = RAM_ROWS * cell_size
@@ -466,8 +469,12 @@ def _ram_layout(game_w, game_h, cell_size=RAM_CELL, has_decoder=False,
     decoded_h = 250 if has_decoder else 0
     panel_h = top_margin + ram_row_h + (row_gap + wram_row_h if has_wram else 0) + 20 + decoded_h
 
+    # Level/overworld tilemap below game frame (SMB3 with WRAM)
+    # Overworld auto-scales up, so allocate extra vertical space
+    level_map_h = (16 + 300 + 8) if has_wram else 0  # title + grid + pad
+
     win_w = game_w + panel_w
-    win_h = max(game_h, panel_h)
+    win_h = max(game_h + level_map_h, panel_h)
 
     layout = dict(
         label_margin=label_margin,
@@ -480,6 +487,7 @@ def _ram_layout(game_w, game_h, cell_size=RAM_CELL, has_decoder=False,
         wram_grid_h=wram_grid_h,
         wram_cell=wram_cell,
         pair_w=pair_w,
+        level_map_h=level_map_h,
     )
     return win_w, win_h, layout
 
@@ -549,6 +557,49 @@ def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
     oam_label = font.render('OAM SPRITES', True, (200, 200, 100))
     screen.blit(oam_label, (oam_x, cy if decoder else cy + 12))
     screen.blit(oam_surface, (oam_x, (cy if decoder else cy + 12) + 14))
+
+    # --- Level / overworld tilemap below the game frame ---
+    if full_ram is not None and len(full_ram) > WRAM_OFFSET + WRAM_SIZE // 2:
+        # Detect overworld vs in-level
+        time_val = (int(full_ram[0x05EE]) * 100
+                    + int(full_ram[0x05EF]) * 10
+                    + int(full_ram[0x05F0]))
+        objset = int(full_ram[0x070A])
+        is_overworld = not (time_val > 0 and objset > 0)
+
+        if is_overworld:
+            # Overworld cursor position: $0079 (X px), $0075 (Y px), $0077 (page)
+            # Positions are in NES screen pixels, multiples of 0x20 (32 decimal).
+            # The tile buffer row = y_px/16 + 13 (scroll offset to map area).
+            map_page = int(full_ram[0x0077])
+            map_x_px = int(full_ram[0x0079])
+            map_y_px = int(full_ram[0x0075])
+            OVERWORLD_ROW_OFFSET = 15
+            px = map_page * LEVEL_COLS_PER_SCREEN + map_x_px // 16
+            py = map_y_px // 16 + OVERWORLD_ROW_OFFSET
+            level_surf = render_level_tilemap(full_ram, player_x=px,
+                                              player_y=py, overworld=True)
+            label_text = 'OVERWORLD MAP'
+        else:
+            player_page = int(full_ram[0x0075]) // 2
+            px = int(full_ram[0x0075]) * 256 + int(full_ram[0x0090])
+            py = int(full_ram[0x0087]) * 256 + int(full_ram[0x00A2])
+            enemy_pos = []
+            for i in range(5):
+                ex = int(full_ram[0x0076 + i]) * 256 + int(full_ram[0x0091 + i])
+                ey = int(full_ram[0x0088 + i]) * 256 + int(full_ram[0x00A3 + i])
+                if ex > 0 or ey > 0:
+                    enemy_pos.append((ex, ey))
+            level_surf = render_level_tilemap(full_ram, player_page=player_page,
+                                              player_x=px, player_y=py,
+                                              enemies=enemy_pos)
+            label_text = 'LEVEL TILEMAP'
+
+        if level_surf is not None:
+            ly = game_h + 4
+            level_label = font.render(label_text, True, (200, 200, 100))
+            screen.blit(level_label, (4, ly))
+            screen.blit(level_surf, (4, ly + 14))
 
 
 def _run_retro(name, path, scale=DEFAULT_SCALE):

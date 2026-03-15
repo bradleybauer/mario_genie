@@ -304,6 +304,149 @@ def render_oam_minimap(ram: np.ndarray, *, map_w: int = 192, map_h: int = 180) -
 
 
 # ---------------------------------------------------------------------------
+# Level tilemap renderer (SMB3 Active Block Buffer $6000-$794F)
+# ---------------------------------------------------------------------------
+
+# Level buffer layout: 15 screens × 0x1B0 bytes each (16 cols × 27 rows)
+LEVEL_BUF_START = 0x6000   # NES address
+LEVEL_BUF_SIZE  = 0x1950   # total bytes
+LEVEL_SCREEN_SIZE = 0x1B0  # bytes per screen (432 = 16×27)
+LEVEL_COLS_PER_SCREEN = 16
+LEVEL_ROWS = 27
+LEVEL_NUM_SCREENS = LEVEL_BUF_SIZE // LEVEL_SCREEN_SIZE  # 15
+
+
+def render_level_tilemap(
+    full_ram: np.ndarray,
+    *,
+    cell: int = 6,
+    player_page: int = 0,
+    player_x: int = 0,
+    player_y: int = 0,
+    enemies: list[tuple[int, int]] | None = None,
+    wram_offset: int = 0x0800,
+    overworld: bool = False,
+) -> pygame.Surface | None:
+    """Render the SMB3 tile buffer as a spatial colour grid.
+
+    In level mode: shows all 15 screens side-by-side (240 × 27 tiles).
+    In overworld mode: auto-crops to populated screens/rows and scales up.
+    Returns a pygame Surface or None if WRAM is not available.
+    """
+    buf_start = wram_offset + (LEVEL_BUF_START - 0x6000)
+    buf_end = buf_start + LEVEL_BUF_SIZE
+    if len(full_ram) < buf_end:
+        return None
+
+    buf = full_ram[buf_start:buf_end]
+
+    # Arrange tiles: each screen is 27 rows × 16 cols, stored row-major
+    all_tiles = np.zeros((LEVEL_COLS_PER_SCREEN * LEVEL_NUM_SCREENS, LEVEL_ROWS),
+                         dtype=np.uint8)
+    for scr in range(LEVEL_NUM_SCREENS):
+        offset = scr * LEVEL_SCREEN_SIZE
+        screen_data = buf[offset:offset + LEVEL_SCREEN_SIZE]
+        if len(screen_data) < LEVEL_SCREEN_SIZE:
+            break
+        block = screen_data.reshape(LEVEL_ROWS, LEVEL_COLS_PER_SCREEN)  # (27, 16)
+        col_start = scr * LEVEL_COLS_PER_SCREEN
+        all_tiles[col_start:col_start + LEVEL_COLS_PER_SCREEN, :] = block.T
+
+    # Find the most common tile (sky/empty) to use as background
+    sky_val = int(np.bincount(all_tiles.ravel()).argmax())
+
+    if overworld:
+        # Auto-crop: find screens with actual content (not just border rows).
+        # Rows 16 and 26 are border tiles (0x4E/0x4F) and appear in all screens.
+        last_used_screen = 0
+        for scr in range(LEVEL_NUM_SCREENS):
+            c0 = scr * LEVEL_COLS_PER_SCREEN
+            c1 = c0 + LEVEL_COLS_PER_SCREEN
+            # Check content rows (17-25) only, skip border rows
+            content = all_tiles[c0:c1, 17:26]
+            if np.any(content != sky_val):
+                last_used_screen = scr
+        num_screens = last_used_screen + 1
+        total_cols = LEVEL_COLS_PER_SCREEN * num_screens
+        tiles = all_tiles[:total_cols, :]
+
+        # Auto-crop rows: find the range of rows that have non-sky data
+        row_has_data = np.any(tiles != sky_val, axis=0)
+        used_rows = np.where(row_has_data)[0]
+        if len(used_rows) > 0:
+            row_min = max(0, int(used_rows[0]) - 1)
+            row_max = min(LEVEL_ROWS - 1, int(used_rows[-1]) + 1)
+        else:
+            row_min, row_max = 0, LEVEL_ROWS - 1
+        tiles = tiles[:, row_min:row_max + 1]
+        num_rows = row_max - row_min + 1
+
+        # Scale cell size — fit to both target width and max height
+        target_w = LEVEL_COLS_PER_SCREEN * LEVEL_NUM_SCREENS * 6
+        max_h = 280  # keep overworld map within reasonable vertical space
+        cell_by_w = target_w // total_cols
+        cell_by_h = max_h // num_rows
+        ow_cell = max(cell, min(cell_by_w, cell_by_h))
+    else:
+        total_cols = LEVEL_COLS_PER_SCREEN * LEVEL_NUM_SCREENS
+        tiles = all_tiles
+        num_rows = LEVEL_ROWS
+        row_min = 0
+        ow_cell = cell
+
+    w = total_cols * ow_cell
+    h = num_rows * ow_cell
+
+    # Colour: sky=dark, nonzero/non-sky tiles use VALUE_CMAP
+    colours = VALUE_CMAP[tiles].copy()
+    sky_mask = (tiles == sky_val)
+    colours[sky_mask] = (15, 15, 25)  # dark background for sky
+
+    # Expand to pixel grid
+    expanded = np.repeat(np.repeat(colours, ow_cell, axis=0), ow_cell, axis=1)
+
+    # Grid lines
+    expanded[::ow_cell, :] = (30, 30, 30)
+    expanded[:, ::ow_cell] = (30, 30, 30)
+
+    # Draw player position marker
+    if player_x > 0 or player_y > 0:
+        if overworld:
+            # Overworld: player_x/player_y are already in tile coordinates
+            tile_col = player_x
+            tile_row = player_y - row_min
+            marker_h = 1  # single tile on overworld
+        else:
+            # Level: convert pixel coordinates to tile grid
+            tile_col = player_x // 16
+            tile_row = player_y // 16
+            marker_h = 2  # Mario is roughly 1×2 metatiles
+        for dy in range(marker_h):
+            tc = tile_col
+            tr = tile_row + dy
+            px_x0 = tc * ow_cell + 1
+            px_y0 = tr * ow_cell + 1
+            px_x1 = (tc + 1) * ow_cell
+            px_y1 = (tr + 1) * ow_cell
+            if 0 <= px_x0 < w and 0 <= px_y0 < h:
+                expanded[px_x0:min(px_x1, w), px_y0:min(px_y1, h)] = (255, 255, 255)
+
+    # Draw enemy position markers (red) — level mode only
+    if enemies and not overworld:
+        for ex, ey in enemies:
+            tc = ex // 16
+            tr = ey // 16
+            px_x0 = tc * ow_cell + 1
+            px_y0 = tr * ow_cell + 1
+            px_x1 = (tc + 1) * ow_cell
+            px_y1 = (tr + 1) * ow_cell
+            if 0 <= px_x0 < w and 0 <= px_y0 < h:
+                expanded[px_x0:min(px_x1, w), px_y0:min(px_y1, h)] = (255, 60, 60)
+
+    return pygame.surfarray.make_surface(expanded)
+
+
+# ---------------------------------------------------------------------------
 # Region label drawing
 # ---------------------------------------------------------------------------
 
