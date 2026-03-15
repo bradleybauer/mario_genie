@@ -17,6 +17,7 @@ class Worker:
     port: int
     user: str
     project_name: str
+    instance_id: int | None = None
 
     @property
     def remote(self) -> str:
@@ -53,6 +54,7 @@ def load_workers(names: list[str] | None = None) -> list[Worker]:
             port=w["port"],
             user=w["user"],
             project_name=project_name,
+            instance_id=w.get("instance_id"),
         )
         for w in cfg.WORKERS
     ]
@@ -145,6 +147,12 @@ def run_on_all(
                 suffix = f"  ({remaining} remaining)" if remaining > 0 else ""
                 print(f"  [{w.name}] {desc}: FAILED — {e}{suffix}")
     return results
+
+
+def show_workers():
+    """Run 'provision.py ls' to show available workers."""
+    provision = Path(__file__).resolve().parent / "provision.py"
+    subprocess.run([sys.executable, str(provision), "ls"])
 
 
 def parse_worker_names(raw: str | None) -> list[str] | None:

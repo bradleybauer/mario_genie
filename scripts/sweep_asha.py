@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ASHA Sweep for MAGVIT Tokenizers
-=================================
+ASHA Sweep for MAGVIT Tokenizers (single machine)
+===================================================
 
 Asynchronous Successive Halving Algorithm (ASHA) sweep over model
 configurations and batch sizes.
@@ -10,6 +10,9 @@ ASHA trains all trials for a small step budget (rung), eliminates the
 bottom performers, and continues the survivors to progressively longer
 rungs.  This dramatically reduces compute compared to training every
 configuration to completion.
+
+This script runs on a single machine.  For multi-machine sweeps with
+global ranking, use ``remote/launch_asha.py`` instead.
 
 Typical usage:
 
@@ -233,12 +236,7 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--resume", action="store_true", help="Resume from existing sweep state")
-    parser.add_argument("--shard-index", type=int, default=0)
-    parser.add_argument("--num-shards", type=int, default=1)
     args, extra_train_args = parser.parse_known_args()
-
-    if args.shard_index < 0 or args.shard_index >= args.num_shards:
-        parser.error(f"--shard-index must be in [0, {args.num_shards})")
 
     rungs = sorted(int(x) for x in args.rungs.split(","))
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
@@ -253,13 +251,6 @@ def main() -> None:
         if not configs:
             print(f"No models match filter '{args.filter}'.")
             sys.exit(1)
-
-    if args.num_shards > 1:
-        configs = sorted(configs, key=lambda c: c.name)
-        configs = [c for i, c in enumerate(configs) if i % args.num_shards == args.shard_index]
-        if not configs:
-            print(f"No models assigned to shard {args.shard_index}/{args.num_shards}.")
-            sys.exit(0)
 
     trials: list[Trial] = []
     for mc in configs:

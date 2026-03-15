@@ -10,10 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import (
     PROJECT_ROOT,
     load_workers,
-    parse_worker_names,
     report_results,
     rsync_to,
     run_on_all,
+    show_workers,
     ssh,
 )
 
@@ -36,19 +36,23 @@ def setup_worker(worker):
         ". /opt/miniforge3/etc/profile.d/conda.sh && "
         f"cd {worker.project_dir} && "
         "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml) && "
-        "grep -qxF 'alias py=python' ~/.bashrc || echo 'alias py=python' >> ~/.bashrc && "
+        "grep -qxF '. /opt/miniforge3/etc/profile.d/conda.sh' ~/.bashrc || echo '. /opt/miniforge3/etc/profile.d/conda.sh' >> ~/.bashrc && "
         "grep -qxF 'conda activate mario' ~/.bashrc || echo 'conda activate mario' >> ~/.bashrc && "
+        "grep -qxF 'alias py=python' ~/.bashrc || echo 'alias py=python' >> ~/.bashrc && "
         f"grep -qxF 'cd {worker.project_dir}' ~/.bashrc || echo 'cd {worker.project_dir}' >> ~/.bashrc"
     ), capture=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Setup all remote machines")
-    parser.add_argument("--workers", type=str, default=None,
-                        help="Comma-separated worker names (default: all)")
+    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
     args = parser.parse_args()
 
-    workers = load_workers(parse_worker_names(args.workers))
+    if not args.workers:
+        show_workers()
+        sys.exit(0)
+
+    workers = load_workers(args.workers)
     print(f"Setting up {len(workers)} worker(s): {[w.name for w in workers]}")
     results = run_on_all(workers, setup_worker, desc="setup")
     sys.exit(0 if report_results(results) else 1)

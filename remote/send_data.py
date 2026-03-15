@@ -10,10 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import (
     PROJECT_ROOT,
     load_workers,
-    parse_worker_names,
     report_results,
     rsync_to,
     run_on_all,
+    show_workers,
     ssh,
 )
 
@@ -30,11 +30,14 @@ def send_data(worker):
 
 def main():
     parser = argparse.ArgumentParser(description="Send data to all remotes")
-    parser.add_argument("--workers", type=str, default=None,
-                        help="Comma-separated worker names (default: all)")
+    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
     args = parser.parse_args()
 
-    workers = load_workers(parse_worker_names(args.workers))
+    if not args.workers:
+        show_workers()
+        sys.exit(0)
+
+    workers = load_workers(args.workers)
     print(f"Sending data to {len(workers)} worker(s): {[w.name for w in workers]}")
     results = run_on_all(workers, send_data, desc="send data")
     sys.exit(0 if report_results(results) else 1)

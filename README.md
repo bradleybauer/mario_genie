@@ -226,9 +226,6 @@ A good candidate is Mesen which also emulates sound which would be neat to learn
 Big TODO
 
 
-Random picture of me and my mom (her name is claudette)
-![alt text](pictures/claudette.png)
-
 <!-- Template -->
 
 <br>
@@ -241,3 +238,7 @@ Random picture of me and my mom (her name is claudette)
 **Approach:** 
 
 **Result:** 
+
+
+Random picture of me and my mom (her name is claudette)
+![alt text](pictures/claudette.png)
