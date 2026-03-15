@@ -322,34 +322,61 @@ def compute_action_balance(
 
 def print_progression_report(
     report: ProgressionBalanceReport,
-    top_n: int = 0,
+    total_sequences: int = 0,
+    n: int = 10,
 ) -> None:
-    """Pretty-print the progression balance report to stdout."""
+    """Pretty-print the progression balance report to stdout.
+
+    Shows the *n* highest-coverage and *n* lowest-coverage bins.
+    """
     print()
     print("=" * 80)
     print("  PROGRESSION (X-POSITION) BALANCE REPORT")
     print("=" * 80)
     print(f"  Bin size (px)       : {report.bin_size:>10}")
-    print(f"  Total frames        : {report.total_frames:>10}")
+    print(f"  Total frames        : {report.total_frames:>10,}")
+    if total_sequences:
+        print(f"  Video sequences     : {total_sequences:>10,}")
     print(f"  Distinct bins       : {report.num_bins:>10}")
-    print("-" * 80)
-    print(f"  {'Level':<8} {'Bin':>4} {'Frames':>10} {'%Total':>8} {'Weight':>8} {'Reach':>6}")
-    print("-" * 80)
 
-    bins = report.bins
-    if top_n > 0:
-        bins = sorted(bins, key=lambda b: (b.frame_count, -b.weight, b.world, b.stage, b.x_bin))[:top_n]
+    max_count = max((entry.frame_count for entry in report.bins), default=0)
 
-    for bi in bins:
-        reach_str = "yes" if bi.reachable else " - "
-        max_count = max((entry.frame_count for entry in report.bins), default=0)
-        bar_len = int(15 * bi.frame_count / max_count) if max_count else 0
-        bar = "\u2588" * min(bar_len, 15)
-        print(
-            f"  {bi.world}-{bi.stage:<6} {bi.x_bin:>4} {bi.frame_count:>10} "
-            f"{bi.pct_of_total:>7.1f}% "
-            f"{bi.weight:>8.4f} {reach_str:>6}  {bar}"
-        )
+    def _print_bins(bins: list[ProgressionBinInfo]) -> None:
+        for bi in bins:
+            reach_str = "yes" if bi.reachable else " - "
+            bar_len = int(15 * bi.frame_count / max_count) if max_count else 0
+            bar = "\u2588" * min(bar_len, 15)
+            print(
+                f"  {bi.world}-{bi.stage:<6} {bi.x_bin:>4} {bi.frame_count:>10,} "
+                f"{bi.pct_of_total:>7.1f}% "
+                f"{bi.weight:>8.4f} {reach_str:>6}  {bar}"
+            )
+
+    header = f"  {'Level':<8} {'Bin':>4} {'Frames':>10} {'%Total':>8} {'Weight':>8} {'Reach':>6}"
+    by_count_desc = sorted(
+        report.bins,
+        key=lambda b: (-b.frame_count, b.weight, b.world, b.stage, b.x_bin),
+    )
+    by_count_asc = sorted(
+        report.bins,
+        key=lambda b: (b.frame_count, -b.weight, b.world, b.stage, b.x_bin),
+    )
+
+    top = by_count_desc[:n]
+    bottom = by_count_asc[:n]
+
+    print()
+    print(f"  --- Top {len(top)} (highest coverage) ---")
+    print(header)
+    print("-" * 80)
+    _print_bins(top)
+
+    print()
+    print(f"  --- Bottom {len(bottom)} (lowest coverage) ---")
+    print(header)
+    print("-" * 80)
+    _print_bins(bottom)
+
     print("=" * 80)
 
 

@@ -1,16 +1,13 @@
 import argparse
 import concurrent.futures
-from collections import defaultdict
 import json
 import math
 import os
-import queue as queue_mod
-import threading
 import time
 from datetime import datetime
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader, Subset, RandomSampler
+from torch.utils.data import Dataset, DataLoader, RandomSampler
 import sys
 from pathlib import Path
 
@@ -24,7 +21,6 @@ from torchvision.utils import save_image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 
-from magvit2_pytorch import VideoTokenizer
 from tqdm import tqdm
 
 from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
@@ -46,10 +42,26 @@ def _format_elapsed(seconds):
     return f"{secs}s"
 
 
+def _get_available_memory():
+    """Return available system memory in bytes."""
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+    except (OSError, ValueError):
+        pass
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES')
+    except (ValueError, OSError):
+        return 0
+
+
 def _index_file(file_idx, filepath, seq_len):
     """Index a session file.
 
-    Returns list of (file_idx, t_start) tuples.
+    Returns (file_idx, frame_count, samples) where samples is a list of
+    (file_idx, t_start) tuples.
     """
     try:
         npz = np.load(filepath, mmap_mode='r')
@@ -57,34 +69,50 @@ def _index_file(file_idx, filepath, seq_len):
 
         if frames.ndim != 4:
             print(f"Skipping {filepath}: expected session format (N,C,H,W), got ndim={frames.ndim}")
-            return []
+            return file_idx, 0, []
 
         total_t = frames.shape[0]
         if total_t < seq_len:
-            return []
-        samples = [(file_idx, t) for t in range(0, total_t - seq_len + 1, seq_len)]
-        return samples
+            return file_idx, 0, []
+        samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
+        return file_idx, total_t, samples
     except Exception as e:
         print(f"Skipping {filepath} due to error: {e}")
-        return []
+        return file_idx, 0, []
 
 class MarioVideoDataset(Dataset):
-    def __init__(self, data_dir, seq_len=4, preload=True, subset_n=0, seed=42):
+    def __init__(self, data_dir, seq_len=4, subset_n=0, seed=42, num_workers=None):
+        if num_workers is None:
+            num_workers = len(os.sched_getaffinity(0))
         self.data_files = find_session_files(data_dir)
         self.seq_len = seq_len
         self.samples = []
         
         n_files = len(self.data_files)
-        print(f"Indexing {n_files} data files (lazy loading)...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        print(f"Indexing {n_files} data files (stride=1)...")
+        frame_counts = [0] * n_files
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
             futures = {
                 pool.submit(_index_file, idx, f, seq_len): idx
                 for idx, f in enumerate(self.data_files)
             }
             with tqdm(total=n_files, desc="Indexing files", unit="file") as pbar:
                 for future in concurrent.futures.as_completed(futures):
-                    self.samples.extend(future.result())
+                    file_idx, total_t, samples = future.result()
+                    frame_counts[file_idx] = total_t
+                    self.samples.extend(samples)
                     pbar.update(1)
+
+        # Remove files with no usable frames and remap indices
+        valid = [i for i in range(n_files) if frame_counts[i] > 0]
+        if len(valid) < n_files:
+            skipped = n_files - len(valid)
+            print(f"Dropped {skipped} file(s) with no usable frames")
+            old_to_new = {old: new for new, old in enumerate(valid)}
+            self.data_files = [self.data_files[i] for i in valid]
+            frame_counts = [frame_counts[i] for i in valid]
+            self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
+            n_files = len(self.data_files)
 
         if subset_n > 0 and subset_n < len(self.samples):
             total = len(self.samples)
@@ -93,91 +121,58 @@ class MarioVideoDataset(Dataset):
             self.samples = [self.samples[i] for i in indices]
             print(f"Subset: kept {subset_n} of {total} samples")
 
-        self.preloaded = False
-        if preload and len(self.samples) > 0:
-            self._preload_all()
+        # Decide whether to decompress all frames into RAM or use mmap
+        total_frames = sum(frame_counts)
+        self.frames_by_file = None
+        if total_frames > 0:
+            available = _get_available_memory()
+            probe = np.load(self.data_files[0], mmap_mode='r')['frames']
+            bytes_per_frame = math.prod(probe.shape[1:])  # C*H*W, uint8
+            total_bytes = total_frames * bytes_per_frame
+            headroom = 2 * 2**30  # keep 2 GB free
 
-    def _preload_all(self):
-        """Load all samples into a single pinned CPU tensor (parallel I/O)."""
-        # Probe shape from first sample
-        file_idx, t_start = self.samples[0]
-        npz = np.load(self.data_files[file_idx], mmap_mode='r')
-        probe = npz['frames'][t_start:t_start+self.seq_len]
-        T, C, H, W = probe.shape
-        self._palette_index_mode = (C == 1)
+            if available > 0 and total_bytes < available - headroom:
+                print(f"Loading all frames into RAM ({total_bytes / 2**20:.0f} MB, "
+                      f"{available / 2**20:.0f} MB available)...")
+                self.frames_by_file = [None] * n_files
 
-        n = len(self.samples)
-        if self._palette_index_mode:
-            # Palette indices: store as (N, T, H, W) uint8
-            total_mb = n * T * H * W / 2**20
-            print(f"Pre-loading {n} palette-index samples into CPU tensor ({total_mb:.0f} MB)...")
-            self.data = torch.empty(n, T, H, W, dtype=torch.uint8)
-        else:
-            total_mb = n * C * T * H * W * 4 / 2**20  # float32
-            print(f"Pre-loading {n} samples into CPU tensor ({total_mb:.0f} MB)...")
-            self.data = torch.empty(n, C, T, H, W, dtype=torch.float32)
+                def _load_file(idx):
+                    return idx, np.load(self.data_files[idx])['frames']
 
-        print(f"Grouping samples by file for efficient loading...")
-        # Group samples by file to open each file only once
-        file_groups = defaultdict(list)
-        for sample_idx, (file_idx, t_start) in enumerate(self.samples):
-            file_groups[file_idx].append((sample_idx, t_start))
-
-        palette_idx = self._palette_index_mode
-
-        def _load_file(file_idx, entries):
-            """Load one data file and write samples into the shared tensor."""
-            npz = np.load(self.data_files[file_idx], mmap_mode='r')
-            frames_arr = npz['frames']
-            for sample_idx, t_start in entries:
-                frames = np.array(frames_arr[t_start:t_start+self.seq_len])
-                if palette_idx:
-                    # (T, 1, H, W) -> (T, H, W) uint8
-                    self.data[sample_idx] = torch.from_numpy(frames[:, 0])
-                else:
-                    # [T, C, H, W] -> [C, T, H, W], float32, /255
-                    t = torch.from_numpy(frames).float().div_(255.0).permute(1, 0, 2, 3)
-                    self.data[sample_idx] = t
-            return len(entries)
-
-        num_threads = min(4, len(file_groups))
-        print(f"Parallel loading with {num_threads} threads...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
-            futures = {
-                pool.submit(_load_file, fi, entries): fi
-                for fi, entries in file_groups.items()
-            }
-            with tqdm(total=n, desc="Pre-loading samples", unit="samp") as pbar:
-                for future in concurrent.futures.as_completed(futures):
-                    count = future.result()
-                    pbar.update(count)
-
-        self.preloaded = True
-        print(f"Pre-load complete. Tensor shape: {list(self.data.shape)}")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+                    futures = [pool.submit(_load_file, i) for i in range(n_files)]
+                    with tqdm(total=n_files, desc="Loading into RAM", unit="file") as pbar:
+                        for future in concurrent.futures.as_completed(futures):
+                            idx, frames = future.result()
+                            self.frames_by_file[idx] = frames
+                            pbar.update(1)
+                actual = sum(f.nbytes for f in self.frames_by_file)
+                print(f"Loaded {actual / 2**20:.0f} MB into RAM (COW-shared with workers)")
+            else:
+                print(f"Dataset too large for RAM ({total_bytes / 2**20:.0f} MB, "
+                      f"{available / 2**20:.0f} MB available). Using mmap.")
 
     def __len__(self):
         return len(self.samples)
 
+    def _get_frames_mmap(self, file_idx):
+        """Return the mmap'd frames array for a file, caching the handle."""
+        if not hasattr(self, '_mmap_cache'):
+            self._mmap_cache = {}
+        if file_idx not in self._mmap_cache:
+            self._mmap_cache[file_idx] = np.load(
+                self.data_files[file_idx], mmap_mode='r'
+            )['frames']
+        return self._mmap_cache[file_idx]
+
     def __getitem__(self, idx):
-        if self.preloaded:
-            return self.data[idx]
-
         file_idx, t_start = self.samples[idx]
-        
-        # Load only the slice we need via memory-mapped access
-        npz = np.load(self.data_files[file_idx], mmap_mode='r')
-        frames = np.array(npz['frames'][t_start:t_start+self.seq_len])
-        T, C, H, W = frames.shape
-
-        if C == 1:
-            # Palette indices: (T, 1, H, W) -> (T, H, W) uint8
-            return torch.from_numpy(frames[:, 0])
-
-        # RGB: [T, C, H, W] -> [C, T, H, W] float32, /255
-        frames = torch.from_numpy(frames).float() / 255.0
-        frames = frames.permute(1, 0, 2, 3) 
-        
-        return frames
+        if self.frames_by_file is not None:
+            frames = self.frames_by_file[file_idx]
+        else:
+            frames = self._get_frames_mmap(file_idx)
+        chunk = frames[t_start:t_start+self.seq_len, 0]  # (T, H, W) uint8
+        return torch.from_numpy(chunk.copy())
 
 
 def train():
@@ -207,35 +202,25 @@ def train():
     parser.add_argument("--image-interval-secs", type=float, default=300,
                         help="Minimum seconds between saving reconstruction images (default: 300)")
     parser.add_argument("--overfit-n", type=int, default=0, help="Train on N random samples (overfit sanity check)")
-    parser.add_argument("--codebook-size", type=int, default=256)
-    parser.add_argument("--init-dim", type=int, default=32)
     parser.add_argument(
         "--model",
         type=str,
-        default=None,
+        required=True,
         metavar="NAME",
-        help="Named model config (overrides --init-dim, --codebook-size, --layers). "
-             "Use --list-models to see available configs.",
+        help="Named model config. Use --list-models to see available configs.",
     )
     parser.add_argument(
         "--list-models",
         action="store_true",
         help="Print available model configs and exit.",
     )
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile on the tokenizer (requires PyTorch 2+)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
-    parser.add_argument("--num-workers", type=int, default=16, help="Number of DataLoader workers")
-    parser.add_argument("--no-preload", action="store_true",
-                        help="Disable pre-loading all data into RAM (use lazy per-sample loading)")
+    parser.add_argument("--num-workers", type=int, default=len(os.sched_getaffinity(0)),
+                        help=f"Number of DataLoader workers (default: {len(os.sched_getaffinity(0))})")
     parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
-    parser.add_argument(
-        "--layers", type=str, default=None,
-        help=(
-            "Comma-separated encoder layer spec. "
-            "e.g. 'residual,compress_space,residual,compress_space,residual,compress_space'. "
-            "Use 'consecutive_residual:N' for parameterised layers."
-        ),
-    )
     parser.add_argument(
         "--max-patience", type=float, default=None,
         help=(
@@ -245,10 +230,10 @@ def train():
         ),
     )
     parser.add_argument(
-        "--threshold", type=float, default=0.0,
+        "--threshold", type=float, default=None,
         help=(
             "Stop training once eval recon_loss drops below this value "
-            "(0 = disabled). Checkpoint is saved before exit."
+            "Checkpoint is saved before exit."
         ),
     )
     parser.add_argument(
@@ -266,36 +251,15 @@ def train():
             print(name)
         return
 
-    if args.model is not None and args.model not in MODEL_CONFIGS_BY_NAME:
+    if args.model not in MODEL_CONFIGS_BY_NAME:
         parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
 
-    # Resolve model config: --model overrides --init-dim, --codebook-size, --layers
-    if args.model is not None:
-        mc = MODEL_CONFIGS_BY_NAME[args.model]
-        args.init_dim = mc.init_dim
-        args.codebook_size = mc.codebook_size
-        tokenizer_layers = tuple(
-            (name, int(val)) if ":" in tok else tok
-            for tok in mc.layers.split(",")
-            for name, _, val in [tok.partition(":")]
-        )
-    elif args.layers is not None:
-        parsed = []
-        for tok in args.layers.split(","):
-            tok = tok.strip()
-            if ":" in tok:
-                name, val = tok.split(":", 1)
-                parsed.append((name, int(val)))
-            else:
-                parsed.append(tok)
-        tokenizer_layers = tuple(parsed)
-    else:
-        tokenizer_layers = (
-            'residual', 'compress_space',
-            'residual', 'compress_space',
-            'residual', 'compress_space',
-            'residual', 'compress_space',
-        )
+    mc = MODEL_CONFIGS_BY_NAME[args.model]
+    tokenizer_layers = tuple(
+        (name, int(val)) if ":" in tok else tok
+        for tok in mc.layers.split(",")
+        for name, _, val in [tok.partition(":")]
+    )
 
     # ── Normal training ──────────────────────────────────────────────────
 
@@ -316,27 +280,29 @@ def train():
 
     dataset = MarioVideoDataset(
         args.data_dir, seq_len=SEQUENCE_LENGTH,
-        preload=not args.no_preload,
         subset_n=args.overfit_n,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
 
-    # ── Palette mode: auto-detect from palette.json in data dir or subdirs ──
-    palette_path = None
+    # ── Load palette from palette.json in data dir or subdirs ──
+    palette_paths = []
     for _root, _dirs, _files in os.walk(args.data_dir):
         if "palette.json" in _files:
-            palette_path = os.path.join(_root, "palette.json")
-            break
-    palette_mode = palette_path is not None
-    palette = torch.empty(0, 3)  # overwritten below when palette_mode is True
-    num_palette_colors = 0
-    if palette_mode:
-        with open(palette_path) as f:
-            palette_rgb = json.load(f)
-        palette = torch.tensor(palette_rgb, dtype=torch.float32) / 255.0  # (K, 3)
-        num_palette_colors = palette.shape[0]
-        print(f"[palette] Loaded {num_palette_colors} colours from {palette_path}")
+            palette_paths.append(os.path.join(_root, "palette.json"))
+    if not palette_paths:
+        raise FileNotFoundError(f"No palette.json found under {args.data_dir}")
+    palette_path = palette_paths[0]
+    if len(palette_paths) > 1:
+        contents = [open(p).read() for p in palette_paths]
+        if len(set(contents)) > 1:
+            print(f"WARNING: found {len(palette_paths)} palette.json files with differing contents; using {palette_path}")
+    with open(palette_path) as f:
+        palette_rgb = json.load(f)
+    palette = torch.tensor(palette_rgb, dtype=torch.float32) / 255.0  # (K, 3)
+    num_palette_colors = palette.shape[0]
+    print(f"[palette] Loaded {num_palette_colors} colours from {palette_path}")
 
     num_unique_samples = len(dataset)
     gpu_cache = None
@@ -357,45 +323,35 @@ def train():
         else:
             print(f">> Overfit mode: {num_unique_samples} samples ({total_bytes / 2**20:.0f} MB) too large for GPU cache, using DataLoader.")
 
-    # When data is preloaded into pinned RAM, workers add IPC overhead with no benefit
-    preloaded = getattr(dataset, 'preloaded', False) or (
-        isinstance(dataset, Subset) and getattr(dataset.dataset, 'preloaded', False)
-    )
-    num_w = 0 if preloaded else args.num_workers
-    if gpu_cache is None:
-        sampler_len = 10**7
-        sampler = RandomSampler(dataset, replacement=True, num_samples=sampler_len) if not args.no_shuffle else None
-        dataloader = DataLoader(
+    max_workers = len(os.sched_getaffinity(0))
+    num_w = min(args.num_workers, max_workers)
+
+    def make_dataloader(batch_size):
+        sampler = RandomSampler(dataset, replacement=True, num_samples=10**7) if not args.no_shuffle else None
+        return DataLoader(
             dataset,
-            batch_size=args.batch_size,
+            batch_size=batch_size,
             sampler=sampler,
             shuffle=False,
             num_workers=num_w,
-            pin_memory=not preloaded and torch.cuda.is_available(),
+            pin_memory=torch.cuda.is_available(),
             persistent_workers=num_w > 0,
             prefetch_factor=2 if num_w > 0 else None,
         )
-    else:
-        dataloader = None
 
-    if palette_mode:
-        tokenizer = PaletteVideoTokenizer(
-            num_palette_colors=num_palette_colors,
-            image_size=IMAGE_SIZE,
-            init_dim=args.init_dim,
-            codebook_size=args.codebook_size,
-            layers=tokenizer_layers,
-        ).to(device)
-        palette = palette.to(device)
-    else:
-        tokenizer = VideoTokenizer(
-            image_size=IMAGE_SIZE,
-            init_dim=args.init_dim,
-            codebook_size=args.codebook_size,
-            layers=tokenizer_layers,
-            use_gan=False,
-            perceptual_loss_weight=0.0,
-        ).to(device)
+    dataloader = make_dataloader(args.batch_size) if gpu_cache is None else None
+
+    tokenizer = PaletteVideoTokenizer(
+        num_palette_colors=num_palette_colors,
+        image_size=IMAGE_SIZE,
+        init_dim=mc.init_dim,
+        codebook_size=mc.codebook_size,
+        layers=tokenizer_layers,
+    ).to(device)
+    if args.compile:
+        tokenizer = torch.compile(tokenizer)
+        print("[compile] torch.compile enabled")
+    palette = palette.to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
     # ── Auto batch-size ──────────────────────────────────────────────
@@ -415,18 +371,7 @@ def train():
         )
         # Rebuild DataLoader with the discovered batch size
         if gpu_cache is None:
-            sampler_len = 10**7
-            sampler = RandomSampler(dataset, replacement=True, num_samples=sampler_len) if not args.no_shuffle else None
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                sampler=sampler,
-                shuffle=False,
-                num_workers=num_w,
-                pin_memory=not preloaded,
-                persistent_workers=num_w > 0,
-                prefetch_factor=2 if num_w > 0 else None,
-            )
+            dataloader = make_dataloader(args.batch_size)
         print(f"[auto-batch] ✓ Selected batch size: {args.batch_size}\n")
     elif args.auto_batch_size:
         print("[auto-batch] Skipped — no CUDA device. Using --batch-size", args.batch_size)
@@ -486,46 +431,42 @@ def train():
     last_improvement_time = time.time()
     last_image_time = 0.0
 
+    def save_reconstruction(batch, path):
+        """Encode → decode a batch and save side-by-side comparison image.
+
+        Returns (codes, codebook_usage).
+        """
+        tokenizer.eval()
+        with torch.no_grad():
+            inp = PaletteVideoTokenizer.indices_to_onehot(
+                batch.long(), num_palette_colors,
+            )
+            codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+            recon_video = tokenizer.decode_from_code_indices(
+                codes,
+                video_contains_first_frame=video_contains_first_frame,
+            )
+            original_rgb = palette[batch[0].long()]
+            original_frames = original_rgb.permute(0, 3, 1, 2)
+            recon_idx = recon_video[0].argmax(dim=0)
+            recon_rgb = palette[recon_idx]
+            recon_frames = recon_rgb.permute(0, 3, 1, 2)
+            comparison = torch.cat([original_frames, recon_frames], dim=3)
+            save_image(comparison, path, nrow=1)
+            codebook_usage = codes.unique().numel()
+        tokenizer.train()
+        return codes, codebook_usage
+
     tokenizer.train()
 
-    # Get the preloaded CPU tensor if available (bypass DataLoader for speed)
-    cpu_cache = None
-    if gpu_cache is None and preloaded:
-        raw = dataset.data if hasattr(dataset, 'data') else None
-        if raw is None and isinstance(dataset, Subset) and hasattr(dataset.dataset, 'data'):
-            raw = dataset.dataset.data
-        cpu_cache = raw
-
     def batch_iter():
-        """Yields batches: GPU cache > pinned CPU prefetch > DataLoader."""
+        """Yields batches: GPU cache > DataLoader."""
         bs = args.batch_size
         if gpu_cache is not None:
             n = gpu_cache.shape[0]
             while True:
                 idx = torch.randint(n, (bs,), device=device)
                 yield gpu_cache[idx]
-        elif cpu_cache is not None:
-            # Shuffle-then-stream: sequential RAM reads are 10-50x faster
-            # than random gathers across a large tensor.
-            n = cpu_cache.shape[0]
-            sample_shape = cpu_cache.shape[1:]
-            q = queue_mod.Queue(maxsize=3)
-
-            def _prefetch():
-                buf = torch.empty(bs, *sample_shape, dtype=cpu_cache.dtype, pin_memory=True)
-                while True:
-                    perm = torch.randperm(n)
-                    for start in range(0, n - bs + 1, bs):
-                        idx = perm[start:start + bs]
-                        # Sort indices within batch for sequential memory access
-                        idx, _ = idx.sort()
-                        torch.index_select(cpu_cache, 0, idx, out=buf)
-                        q.put(buf.clone())
-
-            t = threading.Thread(target=_prefetch, daemon=True)
-            t.start()
-            while True:
-                yield q.get()
         else:
             yield from dataloader
 
@@ -541,23 +482,16 @@ def train():
             batch = batch.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        if palette_mode:
-            targets = batch.long()
-            inp = PaletteVideoTokenizer.indices_to_onehot(
-                targets, num_palette_colors,
-            )
-            loss, loss_breakdown = tokenizer(
-                inp,
-                targets=targets,
-                return_loss=True,
-                video_contains_first_frame=video_contains_first_frame,
-            )
-        else:
-            loss, loss_breakdown = tokenizer(
-                batch,
-                return_loss=True,
-                video_contains_first_frame=video_contains_first_frame,
-            )
+        targets = batch.long()
+        inp = PaletteVideoTokenizer.indices_to_onehot(
+            targets, num_palette_colors,
+        )
+        loss, loss_breakdown = tokenizer(
+            inp,
+            targets=targets,
+            return_loss=True,
+            video_contains_first_frame=video_contains_first_frame,
+        )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
@@ -586,7 +520,7 @@ def train():
             'lr': f"{current_lr:.2e}",
         })
 
-        if args.threshold > 0 and smoothed_recon < args.threshold:
+        if args.threshold is not None and smoothed_recon < args.threshold:
             print(f"\n[threshold] smoothed_recon={smoothed_recon:.6f} < "
                   f"threshold={args.threshold:.6f}. Stopping.")
             break
@@ -614,34 +548,10 @@ def train():
             now = time.time()
             if now - last_image_time >= args.image_interval_secs:
                 last_image_time = now
-                tokenizer.eval()
-                with torch.no_grad():
-                    if palette_mode:
-                        inp = PaletteVideoTokenizer.indices_to_onehot(
-                            batch.long(), num_palette_colors,
-                        )
-                        codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-                    else:
-                        codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-                    recon_video = tokenizer.decode_from_code_indices(
-                        codes,
-                        video_contains_first_frame=video_contains_first_frame,
-                    )
-
-                    step_metrics["codebook_usage"] = codes.unique().numel()
-
-                    if palette_mode:
-                        original_rgb = palette[batch[0].long()]
-                        original_frames = original_rgb.permute(0, 3, 1, 2)
-                        recon_idx = recon_video[0].argmax(dim=0)
-                        recon_rgb = palette[recon_idx]
-                        recon_frames = recon_rgb.permute(0, 3, 1, 2)
-                    else:
-                        original_frames = batch[0].permute(1, 0, 2, 3)
-                        recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
-                    comparison = torch.cat([original_frames, recon_frames], dim=3)
-                    save_image(comparison, os.path.join(args.output_dir, f"step_{global_step:06d}.png"), nrow=1)
-                tokenizer.train()
+                codes, codebook_usage = save_reconstruction(
+                    batch, os.path.join(args.output_dir, f"step_{global_step:06d}.png"),
+                )
+                step_metrics["codebook_usage"] = codebook_usage
 
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_log, f, indent=2)
@@ -667,30 +577,7 @@ def train():
     torch.save(tokenizer.state_dict(), ckpt_path)
     print(f"Checkpoint saved to {ckpt_path}")
 
-    tokenizer.eval()
-    with torch.no_grad():
-        if palette_mode:
-            inp = PaletteVideoTokenizer.indices_to_onehot(
-                batch.long(), num_palette_colors,
-            )
-            codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-        else:
-            codes = tokenizer(batch, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-        recon_video = tokenizer.decode_from_code_indices(
-            codes,
-            video_contains_first_frame=video_contains_first_frame,
-        )
-        if palette_mode:
-            original_rgb = palette[batch[0].long()]
-            original_frames = original_rgb.permute(0, 3, 1, 2)
-            recon_idx = recon_video[0].argmax(dim=0)
-            recon_rgb = palette[recon_idx]
-            recon_frames = recon_rgb.permute(0, 3, 1, 2)
-        else:
-            original_frames = batch[0].permute(1, 0, 2, 3)
-            recon_frames = recon_video[0].permute(1, 0, 2, 3).clamp(0, 1)
-        comparison = torch.cat([original_frames, recon_frames], dim=3)
-        save_image(comparison, os.path.join(args.output_dir, "final_reconstruction.png"), nrow=1)
+    save_reconstruction(batch, os.path.join(args.output_dir, "final_reconstruction.png"))
     print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
 
 if __name__ == "__main__":

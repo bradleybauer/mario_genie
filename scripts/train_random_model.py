@@ -2,6 +2,7 @@
 """Pick a random model config and train it once on the full dataset."""
 
 import argparse
+import os
 import random
 import subprocess
 import sys
@@ -28,7 +29,8 @@ def main() -> None:
     parser.add_argument("--max-batch-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed (also passed to trainer). Random if omitted.")
-    parser.add_argument("--num-workers", type=int, default=32)
+    parser.add_argument("--compile", action="store_true", help="Whether to compile the model with torch.compile.")
+    parser.add_argument("--num-workers", type=int, default=len(os.sched_getaffinity(0)))
     parser.add_argument("--filter", type=str, default=None,
                         help="Only consider models whose name contains this substring")
     parser.add_argument("--dry-run", action="store_true")
@@ -52,9 +54,7 @@ def main() -> None:
         sys.executable, "scripts/train_magvit.py",
         "--data-dir", args.data_dir,
         "--run-name", run_name,
-        "--init-dim", str(model.init_dim),
-        "--codebook-size", str(model.codebook_size),
-        "--layers", model.layers,
+        "--model", "dim8_cb4096_vanilla",
         "--max-minutes", str(args.max_minutes),
         "--lr", str(args.lr),
         "--warmup-steps", str(args.warmup_steps),
@@ -65,8 +65,7 @@ def main() -> None:
         "--num-workers", str(args.num_workers),
         "--output-dir", args.output_dir,
         "--auto-batch-size",
-        "--max-batch-size", str(args.max_batch_size),
-        "--no-preload",
+        "--max-batch-size", str(args.max_batch_size)
     ]
 
     print(f"Selected model: {model.name}")

@@ -7,7 +7,6 @@ Dataset statistics and progression/action balance reports for collected data.
 Usage:
     python scripts/balance_report.py --data-dir data/nes --stats
     python scripts/balance_report.py --data-dir data/nes --text
-    python scripts/balance_report.py --data-dir data/nes --output balance.json
     python scripts/balance_report.py --data-dir data/nes --plot
 """
 
@@ -17,7 +16,6 @@ import argparse
 import json
 import sys
 from collections import Counter, defaultdict
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -31,11 +29,9 @@ if str(SRC_DIR) not in sys.path:
 from mario_world_model.config import SEQUENCE_LENGTH
 from mario_world_model.coverage import (
     PROGRESSION_BIN_SIZE,
-    compute_action_balance,
     compute_progression_balance,
     print_progression_report,
     ProgressionBalanceReport,
-    scan_action_coverage,
     scan_progression_coverage,
 )
 from mario_world_model.envs import default_level_pool
@@ -136,31 +132,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing session_*.npz files",
     )
     parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Optional path to write the requested report data as JSON",
-    )
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=0,
-        help="Only show the N lowest-coverage rows in each printed report (0 = show all)",
-    )
-    parser.add_argument(
         "--stats",
         action="store_true",
         help="Print dataset statistics summary (sessions, frames, actions, levels)",
-    )
-    parser.add_argument(
-        "--actions",
-        action="store_true",
-        help="Show action distribution balance",
-    )
-    parser.add_argument(
-        "--text",
-        action="store_true",
-        help="Print the progression report as text to stdout",
     )
     parser.add_argument(
         "--plot",
@@ -171,7 +145,7 @@ def parse_args() -> argparse.Namespace:
         "--progression-bin-size",
         type=int,
         default=PROGRESSION_BIN_SIZE,
-        help="Progression coverage bin width in pixels; default is 64",
+        help="Progression coverage bin width in pixels; default is {}".format(PROGRESSION_BIN_SIZE),
     )
     parser.add_argument(
         "--watch-interval",
@@ -191,30 +165,6 @@ def build_progression_report(data_dir: Path, progression_bin_size: int) -> Progr
         all_levels=default_level_pool(),
         bin_size=progression_bin_size,
     )
-
-
-def build_output_payload(
-    args: argparse.Namespace,
-    prog_report: ProgressionBalanceReport,
-) -> dict[str, object]:
-    output_payload: dict[str, object] = {"progression": asdict(prog_report)}
-    if args.actions:
-        try:
-            from mario_world_model.actions import get_num_actions, get_action_meanings
-            num_actions = get_num_actions()
-        except ImportError:
-            num_actions = 26
-        act_cov = scan_action_coverage(args.data_dir)
-        act_report = compute_action_balance(act_cov, num_actions)
-        output_payload["actions"] = asdict(act_report)
-    return output_payload
-
-
-def _write_output_json(output_path: Optional[Path], payload: dict[str, object]) -> None:
-    if output_path is None:
-        return
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
 
 
 def _data_fingerprint(data_dir: Path) -> tuple[tuple[str, int, int], ...]:
@@ -335,8 +285,6 @@ def plot_progression_live(args: argparse.Namespace, initial_report: ProgressionB
         last_fingerprint = current_fingerprint
         refreshed_report = build_progression_report(args.data_dir, args.progression_bin_size)
         print("\n[watch] Data updated on disk. Refreshing progression plot...")
-        payload = build_output_payload(args, refreshed_report)
-        _write_output_json(args.output, payload)
         _draw_progression_axes(axes, refreshed_report, message="updated")
         fig.canvas.draw_idle()
 
@@ -361,20 +309,12 @@ def main() -> None:
 
     print(f"Scanning {args.data_dir} ...")
 
-    stats = None
+    stats = gather_stats(args.data_dir)
     if args.stats:
-        stats = gather_stats(args.data_dir)
         print_stats(stats)
 
     prog_report = build_progression_report(args.data_dir, args.progression_bin_size)
-    if args.text:
-        print_progression_report(prog_report, top_n=args.top)
-    output_payload = build_output_payload(args, prog_report)
-    if args.stats:
-        output_payload["stats"] = stats
-    _write_output_json(args.output, output_payload)
-    if args.output:
-        print(f"\nJSON report saved to {args.output}")
+    print_progression_report(prog_report, total_sequences=stats["total_sequences"])
     if args.plot:
         print(f"[watch] Plotting live updates every {args.watch_interval:.1f}s while files change on disk.")
         plot_progression_live(args, prog_report)
