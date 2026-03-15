@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kill the sweep tmux session on all remote workers."""
+"""Kill the sweep tmux session on remote workers."""
 
 import argparse
 import sys
@@ -11,8 +11,8 @@ from helpers import load_workers, report_results, run_on_all, show_workers, ssh
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stop sweep on all remote workers")
-    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
+    parser = argparse.ArgumentParser(description="Stop sweep on remote workers")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     parser.add_argument("--session", type=str, default="sweep",
                         help="Tmux session name to kill (default: sweep)")
     args = parser.parse_args()
@@ -21,7 +21,7 @@ def main():
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if "all" in args.workers else args.workers)
     print(f"Stopping '{args.session}' on {len(workers)} worker(s): {[w.name for w in workers]}")
 
     def stop(worker):

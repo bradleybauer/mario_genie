@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync local data/ to all remote machines."""
+"""Sync local data/ to remote machines."""
 
 import argparse
 import sys
@@ -29,15 +29,15 @@ def send_data(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Send data to all remotes")
-    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
+    parser = argparse.ArgumentParser(description="Send data to remotes")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     args = parser.parse_args()
 
     if not args.workers:
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if "all" in args.workers else args.workers)
     print(f"Sending data to {len(workers)} worker(s): {[w.name for w in workers]}")
     results = run_on_all(workers, send_data, desc="send data")
     sys.exit(0 if report_results(results) else 1)

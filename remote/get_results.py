@@ -23,7 +23,7 @@ def main():
     parser.add_argument("subdir", nargs="?", default=None,
                         help="Checkpoint subdirectory to fetch (default: all)")
     parser.add_argument("--workers", nargs="+",
-                        help="Worker names (omit to list available)")
+                        help="Worker names, or 'all' (omit to list available)")
     parser.add_argument("--images", action="store_true",
                         help="Only sync images and JSON (skip model weights)")
     args = parser.parse_args()
@@ -32,7 +32,7 @@ def main():
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if args.workers and "all" in args.workers else args.workers)
 
     remote_suffix = "checkpoints/"
     local_base = str(PROJECT_ROOT / "results" / "model_config_sweep_genie")

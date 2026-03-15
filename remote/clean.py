@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove the checkpoints directory on all remote workers."""
+"""Remove the checkpoints directory on remote workers."""
 
 import argparse
 import sys
@@ -11,8 +11,8 @@ from helpers import load_workers, report_results, run_on_all, show_workers, ssh
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Clean checkpoints on all remote workers")
-    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
+    parser = argparse.ArgumentParser(description="Clean checkpoints on remote workers")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     parser.add_argument("--subdir", type=str, default=None,
                         help="Only remove this subdirectory under checkpoints/")
     parser.add_argument("--yes", action="store_true",
@@ -23,7 +23,7 @@ def main():
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if "all" in args.workers else args.workers)
 
     if args.subdir:
         target = f"checkpoints/{args.subdir}"

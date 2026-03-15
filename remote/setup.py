@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Setup all remote machines: sync code and install dependencies."""
+"""Setup remote machines: sync code and install dependencies."""
 
 import argparse
 import sys
@@ -44,15 +44,15 @@ def setup_worker(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Setup all remote machines")
-    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
+    parser = argparse.ArgumentParser(description="Setup remote machines")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     args = parser.parse_args()
 
     if not args.workers:
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if "all" in args.workers else args.workers)
     print(f"Setting up {len(workers)} worker(s): {[w.name for w in workers]}")
     results = run_on_all(workers, setup_worker, desc="setup")
     sys.exit(0 if report_results(results) else 1)

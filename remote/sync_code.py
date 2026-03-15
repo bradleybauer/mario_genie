@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync local code to all remote machines (without full setup/install)."""
+"""Sync local code to remote machines (without full setup/install)."""
 
 import argparse
 import sys
@@ -40,15 +40,15 @@ def sync_worker(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync code to all remotes")
-    parser.add_argument("workers", nargs="*", help="Worker names (omit to list available)")
+    parser = argparse.ArgumentParser(description="Sync code to remotes")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     args = parser.parse_args()
 
     if not args.workers:
         show_workers()
         sys.exit(0)
 
-    workers = load_workers(args.workers)
+    workers = load_workers(None if "all" in args.workers else args.workers)
     print(f"Syncing code to {len(workers)} worker(s): {[w.name for w in workers]}")
     results = run_on_all(workers, sync_worker, desc="sync code")
     sys.exit(0 if report_results(results) else 1)
