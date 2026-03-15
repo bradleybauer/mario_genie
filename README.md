@@ -195,6 +195,36 @@ Added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --r
 
 TODO
 
+<br>
+<br>
+
+# SMB3
+
+**Context:** 
+I'm interested in building an smb3 world model as well. I imagine this would be MUCH harder.
+One idea I had for how to make things easier would be to clean the data a bit.
+Specifically fixing flickering in the smb3 status bar and removing the max 8 sprite limit.
+The nes has certain limits on the max number of sprites that can appear on a scan line.
+If the game attempts to draw more than the max the sprites begin to flicker in time.
+I do not want the model to have to spend capacity to reverse engineer exactly how this flicker mechanic works.
+
+**Approach:** 
+The status bar flickering can be fixed by writing 5 bytes to the ROM file. The three `0xEA` bytes are 6502 NOP instructions, effectively disabling the code that caused the flicker. This will cause a minor floor-shaking glitch during the end credits.
+
+| Address   | Before | After  | Note |
+|-----------|--------|--------|------|
+| `$3F7B2`  | `0x0D` | `0x16` | —    |
+| `$3F8E0`  | `0x68` | `0xEA` | NOP  |
+| `$3F8E1`  | `0x8D` | `0xEA` | NOP  |
+| `$3F8E2`  | `0x10` | `0xEA` | NOP  |
+| `$3F8E3`  | `0x40` | `0xEA` | NOP  |
+
+To fix the sprite limit will require using a different emulator.
+A good candidate is Mesen which also emulates sound which would be neat to learn how to model (as if an smb3 world model was't ambitions enough lol)
+
+**Result:** 
+Big TODO
+
 <!-- Template -->
 
 <br>
