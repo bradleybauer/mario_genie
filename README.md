@@ -201,7 +201,7 @@ TODO
 # SMB3
 
 **Context:** 
-I'm interested in building an smb3 world model as well. I imagine this would be MUCH harder.
+I'm interested in building an smb3 world model as well (lol). I imagine this would be MUCH harder.
 One idea I had for how to make things easier would be to clean the data a bit.
 Specifically fixing flickering in the smb3 status bar and removing the max 8 sprite limit.
 The nes has certain limits on the max number of sprites that can appear on a scan line.
