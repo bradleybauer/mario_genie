@@ -35,13 +35,18 @@ from mario_world_model.actions import get_action_meanings
 # ---------------------------------------------------------------------------
 
 def load_palette(data_dir: Path) -> np.ndarray | None:
-    """Load palette.json → (K, 3) uint8 array, or None if not found."""
-    palette_path = data_dir / "palette.json"
-    if not palette_path.exists():
-        return None
-    with palette_path.open("r") as f:
-        pal = json.load(f)
-    return np.array(pal, dtype=np.uint8)
+    """Load palette.json → (K, 3) uint8 array, searching up from data_dir."""
+    current = data_dir.resolve()
+    while True:
+        palette_path = current / "palette.json"
+        if palette_path.exists():
+            with palette_path.open("r") as f:
+                pal = json.load(f)
+            return np.array(pal, dtype=np.uint8)
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
 
 
 def frames_to_rgb(frames: np.ndarray, palette: np.ndarray | None) -> np.ndarray:

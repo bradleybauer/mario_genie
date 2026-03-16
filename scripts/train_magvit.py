@@ -30,7 +30,7 @@ from mario_world_model.dataset_paths import find_session_files
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
-from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
 
 
 def _format_elapsed(seconds):
@@ -44,19 +44,6 @@ def _format_elapsed(seconds):
     return f"{secs}s"
 
 
-def _get_available_memory():
-    """Return available system memory in bytes."""
-    try:
-        with open('/proc/meminfo') as f:
-            for line in f:
-                if line.startswith('MemAvailable:'):
-                    return int(line.split()[1]) * 1024  # kB -> bytes
-    except (OSError, ValueError):
-        pass
-    try:
-        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_AVPHYS_PAGES')
-    except (ValueError, OSError):
-        return 0
 
 
 def _index_file(file_idx, filepath, seq_len):
@@ -83,9 +70,9 @@ def _index_file(file_idx, filepath, seq_len):
         return file_idx, 0, []
 
 class MarioVideoDataset(Dataset):
-    def __init__(self, data_dir, seq_len=4, subset_n=0, seed=42, num_workers=None):
+    def __init__(self, data_dir, seq_len=4, subset_n=0, seed=42, num_workers=None, system_info=None):
         if num_workers is None:
-            num_workers = len(os.sched_getaffinity(0))
+            num_workers = get_effective_cpu_count(system_info)
         self.data_files = find_session_files(data_dir)
         self.seq_len = seq_len
         self.samples = []
@@ -127,15 +114,15 @@ class MarioVideoDataset(Dataset):
         total_frames = sum(frame_counts)
         self.frames_by_file = None
         if total_frames > 0:
-            available = _get_available_memory()
+            available = get_available_memory(system_info)
             probe = np.load(self.data_files[0], mmap_mode='r')['frames']
             bytes_per_frame = math.prod(probe.shape[1:])  # C*H*W, uint8
             total_bytes = total_frames * bytes_per_frame
             headroom = 2 * 2**30  # keep 2 GB free
 
             if available > 0 and total_bytes < available - headroom:
-                print(f"Loading all frames into RAM ({total_bytes / 2**20:.0f} MB, "
-                      f"{available / 2**20:.0f} MB available)...")
+                print(f"Loading all frames into RAM ({total_bytes / 2**30:.0f} GB, "
+                      f"{available / 2**30:.0f} GB available)...")
                 self.frames_by_file = [None] * n_files
 
                 def _load_file(idx):
@@ -149,10 +136,10 @@ class MarioVideoDataset(Dataset):
                             self.frames_by_file[idx] = frames
                             pbar.update(1)
                 actual = sum(f.nbytes for f in self.frames_by_file)
-                print(f"Loaded {actual / 2**20:.0f} MB into RAM (COW-shared with workers)")
+                print(f"Loaded {actual / 2**30:.0f} GB into RAM (COW-shared with workers)")
             else:
-                print(f"Dataset too large for RAM ({total_bytes / 2**20:.0f} MB, "
-                      f"{available / 2**20:.0f} MB available). Using mmap.")
+                print(f"Dataset too large for RAM ({total_bytes / 2**30:.0f} GB, "
+                      f"{available / 2**30:.0f} GB available). Using mmap.")
 
     def __len__(self):
         return len(self.samples)
@@ -196,7 +183,7 @@ def train():
         help="Cap batch size (0 = no cap). Use with --auto-batch-size to "
              "limit large batches for faster convergence.",
     )
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--warmup-steps", type=int, default=200,
                         help="Linear warmup from 0 to --lr over this many steps (default: 200)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
@@ -222,8 +209,9 @@ def train():
                         help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
-    parser.add_argument("--num-workers", type=int, default=min(len(os.sched_getaffinity(0)), 64),
-                        help=f"Number of DataLoader workers (default: {min(len(os.sched_getaffinity(0)), 64)})")
+    _default_workers = min(get_effective_cpu_count(), 64)
+    parser.add_argument("--num-workers", type=int, default=_default_workers,
+                        help=f"Number of DataLoader workers (default: {_default_workers})")
     parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
     parser.add_argument(
         "--max-patience", type=float, default=None,
@@ -310,21 +298,14 @@ def train():
         subset_n=args.overfit_n,
         seed=args.seed,
         num_workers=args.num_workers,
+        system_info=system_info,
     )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
 
-    # ── Load palette from palette.json in data dir or subdirs ──
-    palette_paths = []
-    for _root, _dirs, _files in os.walk(args.data_dir):
-        if "palette.json" in _files:
-            palette_paths.append(os.path.join(_root, "palette.json"))
-    if not palette_paths:
-        raise FileNotFoundError(f"No palette.json found under {args.data_dir}")
-    palette_path = palette_paths[0]
-    if len(palette_paths) > 1:
-        contents = [open(p).read() for p in palette_paths]
-        if len(set(contents)) > 1:
-            print(f"WARNING: found {len(palette_paths)} palette.json files with differing contents; using {palette_path}")
+    # ── Load palette from palette.json in data dir ──
+    palette_path = os.path.join(args.data_dir, "palette.json")
+    if not os.path.isfile(palette_path):
+        raise FileNotFoundError(f"No palette.json found in {args.data_dir}")
     with open(palette_path) as f:
         palette_rgb = json.load(f)
     palette = torch.tensor(palette_rgb, dtype=torch.float32) / 255.0  # (K, 3)
@@ -345,12 +326,12 @@ def train():
         else:
             budget = 0
         if total_bytes <= budget:
-            print(f">> Overfit mode: caching {num_unique_samples} samples on GPU ({total_bytes / 2**20:.0f} MB).")
+            print(f">> Overfit mode: caching {num_unique_samples} samples on GPU ({total_bytes / 2**30:.0f} GB).")
             gpu_cache = torch.stack([dataset[i] for i in range(num_unique_samples)]).to(device)
         else:
-            print(f">> Overfit mode: {num_unique_samples} samples ({total_bytes / 2**20:.0f} MB) too large for GPU cache, using DataLoader.")
+            print(f">> Overfit mode: {num_unique_samples} samples ({total_bytes / 2**30:.0f} GB) too large for GPU cache, using DataLoader.")
 
-    max_workers = len(os.sched_getaffinity(0))
+    max_workers = get_effective_cpu_count(system_info)
     num_w = min(args.num_workers, max_workers)
 
     def make_dataloader(batch_size):

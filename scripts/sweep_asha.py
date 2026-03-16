@@ -216,11 +216,11 @@ def main() -> None:
             "Unrecognised args are forwarded to train_magvit.py."
         ),
     )
-    parser.add_argument("--data-dir", default="data/nes")
+    parser.add_argument("--data-dir", default="data/")
     parser.add_argument("--output-dir", default="checkpoints/asha_sweep")
     parser.add_argument(
-        "--rungs", type=str, default="500,1500,4500,13500",
-        help="Comma-separated step budgets for successive halving (default: 500,1500,4500,13500)",
+        "--rungs", type=str, default="1800,5400,16200,48600",
+        help="Comma-separated step budgets for successive halving (default: 1800,5400,16200,48600)",
     )
     parser.add_argument(
         "--reduction-factor", type=int, default=3,

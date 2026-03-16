@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import load_workers, show_workers
+from helpers import load_workers, show_workers, ssh_base_args
 
 
 def main():
@@ -37,10 +37,8 @@ def main():
     print(f"Connecting to {w.name} ({w.host})...")
 
     ssh_cmd = [
-        "ssh",
-        "-p", str(w.port),
+        *ssh_base_args(w),
         "-L", f"{args.port_forward}:localhost:{args.port_forward}",
-        "-o", "StrictHostKeyChecking=accept-new",
     ]
     if args.verbose:
         ssh_cmd.append("-vvv")

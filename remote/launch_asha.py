@@ -19,7 +19,7 @@ Usage:
         --rungs 500,1500,4500,13500 \\
         --batch-sizes 4,8,16 \\
         --reduction-factor 3 \\
-        -- --lr 1e-3 --warmup-steps 100
+        -- --lr 8e-4 --warmup-steps 100
 
 Everything after '--' is forwarded to train_magvit.py on each worker.
 """
@@ -143,10 +143,10 @@ def build_worker_script(
     """Build a bash script that trains all assigned trials for one rung."""
     lines = [
         "#!/bin/bash",
+        ". /opt/miniforge3/etc/profile.d/conda.sh",
+        "conda activate mario",
         "set -e",
         f"cd {worker.project_dir}",
-        'eval "$(conda shell.bash hook)"',
-        "conda activate mario",
         "",
     ]
 
@@ -156,7 +156,7 @@ def build_worker_script(
 
         cmd_parts = [
             "python scripts/train_magvit.py",
-            f"--data-dir data/nes",
+            f"--data-dir data/",
             f"--output-dir {sweep_dir}",
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
@@ -227,6 +227,7 @@ def wait_for_workers(
         return
 
     print(f"    Waiting for {len(active_workers)} worker(s) ...")
+    last_status_print = 0.0
     while active_workers:
         time.sleep(poll_interval)
         still_running = []
@@ -236,9 +237,10 @@ def wait_for_workers(
             else:
                 print(f"    [{w.name}] done")
         active_workers = still_running
-        if active_workers:
+        if active_workers and time.time() - last_status_print >= 900:
             names = ", ".join(w.name for w in active_workers)
             print(f"    Still running: {names}")
+            last_status_print = time.time()
 
 
 def pull_metrics(
@@ -276,15 +278,15 @@ def main() -> None:
             "to train_magvit.py."
         ),
     )
-    parser.add_argument("--data-dir", default="data/nes",
-                        help="Data dir on remote machines (default: data/nes)")
+    parser.add_argument("--data-dir", default="data/",
+                        help="Data dir on remote machines (default: data/)")
     parser.add_argument("--sweep-dir", default="checkpoints/asha_sweep",
                         help="Sweep output dir on remote machines")
     parser.add_argument("--local-results", default=None,
                         help="Local dir for metrics (default: results/asha_sweep)")
     parser.add_argument(
-        "--rungs", type=str, default="500,1500,4500,13500",
-        help="Comma-separated step budgets (default: 500,1500,4500,13500)",
+        "--rungs", type=str, default="6000,18000,54000,162000",
+        help="Comma-separated step budgets (default: 6000,18000,54000,162000)",
     )
     parser.add_argument(
         "--reduction-factor", type=int, default=3,

@@ -58,10 +58,10 @@ def main():
 
         launcher_script = "\n".join([
             "#!/bin/bash",
+            ". /opt/miniforge3/etc/profile.d/conda.sh",
+            "conda activate mario",
             "set -e",
             f"cd {worker.project_dir}",
-            'eval "$(conda shell.bash hook)"',
-            "conda activate mario",
             f"exec {sweep_cmd}",
             "",
         ])

@@ -70,6 +70,15 @@ def load_workers(names: list[str] | None = None) -> list[Worker]:
     return workers
 
 
+def ssh_base_args(worker: Worker) -> list[str]:
+    """Return the common SSH args for connecting to a worker."""
+    return [
+        "ssh", "-p", str(worker.port),
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-i", "~/.ssh/id_wtf",
+    ]
+
+
 def ssh(
     worker: Worker,
     command: str,
@@ -79,11 +88,7 @@ def ssh(
     input: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a command on a remote worker via SSH."""
-    cmd = [
-        "ssh", "-p", str(worker.port),
-        "-o", "StrictHostKeyChecking=accept-new",
-        worker.remote, command,
-    ]
+    cmd = [*ssh_base_args(worker), worker.remote, command]
     return subprocess.run(cmd, check=check, capture_output=capture, text=True, input=input)
 
 
@@ -98,7 +103,7 @@ def rsync_to(
     """Rsync local files/dirs to a remote worker."""
     if isinstance(local_srcs, str):
         local_srcs = [local_srcs]
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new"]
+    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_wtf"]
     if extra_args:
         cmd.extend(extra_args)
     cmd.extend(local_srcs)
@@ -113,7 +118,7 @@ def rsync_from(
     *,
     extra_args: list[str] | None = None,    capture: bool = False,) -> subprocess.CompletedProcess:
     """Rsync files from a remote worker to local."""
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new"]
+    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_wtf"]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(f"{worker.remote}:{remote_src}")
