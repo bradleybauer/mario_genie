@@ -230,10 +230,12 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         cfg = run["config"]
         metrics = run["metrics"]
 
-        # Best (minimum) reconstruction loss
-        _, recon_losses = get_recon_values(metrics)
-        best_recon = min(recon_losses) if recon_losses else float("nan")
-        final_recon = recon_losses[-1] if recon_losses else float("nan")
+        smoothed_recon_losses = [
+            m["smoothed_recon_loss"] for m in metrics if "smoothed_recon_loss" in m
+        ]
+        min_smoothed_recon = (
+            min(smoothed_recon_losses) if smoothed_recon_losses else float("nan")
+        )
 
         # Final codebook usage
         cb_entries = [m for m in metrics if "codebook_usage" in m]
@@ -245,24 +247,18 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         total_steps = last.get("step", 0)
         elapsed_s = last.get("elapsed_s", 0)
 
-        layers_str = format_layers(cfg.get("layers", "?"))
-
         rows.append(OrderedDict([
             ("name", run["name"]),
-            ("init_dim", cfg.get("init_dim", "?")),
-            ("codebook_size", cfg.get("codebook_size", "?")),
-            ("layers", layers_str),
             ("num_params", f"{cfg.get('num_parameters', 0):,}"),
-            ("best_recon", f"{best_recon:.4f}"),
-            ("final_recon", f"{final_recon:.4f}"),
+            ("min_smoothed_recon", f"{min_smoothed_recon:.4f}"),
             ("final_cb_usage", final_cb),
             ("max_cb_usage", max_cb),
             ("total_steps", total_steps),
             ("elapsed_s", f"{elapsed_s:.0f}"),
         ]))
 
-    # Sort by best_recon ascending
-    rows.sort(key=lambda r: float(r["best_recon"]))
+    # Sort by min_smoothed_recon ascending
+    rows.sort(key=lambda r: float(r["min_smoothed_recon"]))
     return rows
 
 
