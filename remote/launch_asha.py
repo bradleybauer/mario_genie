@@ -139,13 +139,13 @@ def build_worker_script(
     max_rung_steps: int,
     sweep_dir: str,
     extra_args: str,
+    no_compile: bool = False,
 ) -> str:
     """Build a bash script that trains all assigned trials for one rung."""
     lines = [
         "#!/bin/bash",
         ". /opt/miniforge3/etc/profile.d/conda.sh",
         "conda activate mario",
-        "set -e",
         f"cd {worker.project_dir}",
         "",
     ]
@@ -160,11 +160,13 @@ def build_worker_script(
             f"--output-dir {sweep_dir}",
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
-            f"--auto-batch-size",
-            f"--max-batch-size {trial.batch_size}",
+            f"--batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
         ]
+
+        if no_compile:
+            cmd_parts.append("--no-compile")
 
         # Resume from previous rung's checkpoint if it exists
         if trial.completed_rung >= 0:
@@ -176,7 +178,7 @@ def build_worker_script(
             cmd_parts.append(extra_args)
 
         lines.append(f"echo '>>> Training {trial.run_name} to step {rung_steps}'")
-        lines.append(" \\\n    ".join(cmd_parts))
+        lines.append(" \\\n    ".join(cmd_parts) + " || echo '>>> FAILED {trial.run_name}'")
         lines.append("")
 
     lines.append("echo '>>> Worker done'")
@@ -192,6 +194,7 @@ def launch_rung_on_workers(
     sweep_dir: str,
     extra_args: str,
     session: str = TMUX_SESSION,
+    no_compile: bool = False,
 ) -> None:
     """Upload scripts and launch training on all workers for one rung."""
     for worker in workers:
@@ -201,7 +204,7 @@ def launch_rung_on_workers(
 
         script = build_worker_script(
             worker, worker_trials, rung_steps, max_rung_steps,
-            sweep_dir, extra_args,
+            sweep_dir, extra_args, no_compile=no_compile,
         )
 
         remote_script = f"{worker.project_dir}/run_asha_rung.sh"
@@ -307,6 +310,10 @@ def main() -> None:
                         help="Resume from saved sweep state")
     parser.add_argument("--session", type=str, default=TMUX_SESSION,
                         help="Tmux session name on workers (default: asha)")
+    parser.add_argument(
+        "--no-compile-rungs", type=int, default=2,
+        help="Skip torch.compile for the first N rungs (default: 2)",
+    )
     args, extra_train_args = parser.parse_known_args()
 
     if extra_train_args and extra_train_args[0] == "--":
@@ -332,11 +339,12 @@ def main() -> None:
             print(f"No models match filter '{args.filter}'.")
             sys.exit(1)
 
+    # Assign trials per batch-size group so each bs is evenly spread
+    # across workers (avoids all bs=16 landing on one worker).
     trials: list[Trial] = []
-    for i, mc in enumerate(configs):
-        for j, bs in enumerate(batch_sizes):
-            # Round-robin across workers
-            worker_idx = (i * len(batch_sizes) + j) % len(workers)
+    for bs in batch_sizes:
+        for i, mc in enumerate(configs):
+            worker_idx = i % len(workers)
             trials.append(Trial(
                 model_name=mc.name,
                 batch_size=bs,
@@ -441,11 +449,13 @@ def main() -> None:
                 print(f"    [{wn}] {len(wt)} trial(s)")
 
             # Launch on all workers
+            no_compile = rung_idx < args.no_compile_rungs
             launch_rung_on_workers(
                 workers, trials_by_worker,
                 rung_steps, max_rung_steps,
                 args.sweep_dir, extra_args_str,
                 session=args.session,
+                no_compile=no_compile,
             )
 
             # Wait for all workers to finish

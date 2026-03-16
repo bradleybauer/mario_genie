@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import gc
 import json
 import math
 import os
@@ -573,13 +574,26 @@ def train():
         inp = PaletteVideoTokenizer.indices_to_onehot(
             targets, num_palette_colors,
         )
-        loss, loss_breakdown = tokenizer(
-            inp,
-            targets=targets,
-            return_loss=True,
-            video_contains_first_frame=video_contains_first_frame,
-        )
-        loss.backward()
+        try:
+            loss, loss_breakdown = tokenizer(
+                inp,
+                targets=targets,
+                return_loss=True,
+                video_contains_first_frame=video_contains_first_frame,
+            )
+            loss.backward()
+        except torch.cuda.OutOfMemoryError:
+            # Clean up GPU memory
+            optimizer.zero_grad(set_to_none=True)
+            del inp, targets, batch
+            gc.collect()
+            torch.cuda.empty_cache()
+            if global_step == start_step:
+                print(f"\n[OOM] Out of memory on first step with batch_size={args.batch_size}. Exiting.")
+                sys.exit(1)
+            print(f"\n[OOM] Out of memory at step {global_step}, skipping batch.")
+            global_step += 1
+            continue
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
