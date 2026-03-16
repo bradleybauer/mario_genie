@@ -102,7 +102,7 @@ ATTENTION_VARIANTS = {
     "attn": AttentionVariant(name="attn", suffix="_attn", enabled=True),
 }
 
-DIMS = [16, 8]
+DIMS = [32, 16, 8]
 CODEBOOK_SIZES = [65536, 4096]
 
 # ── Generated registry ────────────────────────────────────────────
@@ -118,7 +118,7 @@ MODEL_CONFIGS: list[ModelConfig] = [
             scale_name="vanilla",
             attention_name="plain",
         )
-        for dim in [32]+DIMS
+        for dim in DIMS
         for cb in CODEBOOK_SIZES
     ),
     # Open-Genie variants

@@ -557,6 +557,7 @@ def train():
     pbar = tqdm(batch_iter(), desc="Training", initial=start_step, total=pbar_total)
 
     global_step = start_step
+    consecutive_ooms = 0
     for batch in pbar:
         if args.max_steps > 0 and global_step >= args.max_steps:
             print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
@@ -591,9 +592,14 @@ def train():
             if global_step == start_step:
                 print(f"\n[OOM] Out of memory on first step with batch_size={args.batch_size}. Exiting.")
                 sys.exit(1)
-            print(f"\n[OOM] Out of memory at step {global_step}, skipping batch.")
+            consecutive_ooms += 1
+            print(f"\n[OOM] Out of memory at step {global_step}, skipping batch. ({consecutive_ooms} consecutive)")
+            if consecutive_ooms >= 20:
+                print(f"\n[OOM] {consecutive_ooms} consecutive OOMs — model cannot fit. Aborting.")
+                sys.exit(1)
             global_step += 1
             continue
+        consecutive_ooms = 0
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()

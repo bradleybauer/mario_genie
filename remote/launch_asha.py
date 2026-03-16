@@ -189,6 +189,8 @@ def build_worker_script(
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
             f"--batch-size {trial.batch_size}",
+            "--auto-batch-size",
+            f"--max-batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
         ]
@@ -196,11 +198,10 @@ def build_worker_script(
         if no_compile:
             cmd_parts.append("--no-compile")
 
-        # Resume from previous rung's checkpoint if it exists
-        if trial.completed_rung >= 0:
-            cmd_parts.append(
-                f'$( [ -f {state_file} ] && echo "--resume-from {state_file}" )'
-            )
+        # Resume from checkpoint if one exists on the remote
+        cmd_parts.append(
+            f'$( [ -f {state_file} ] && echo "--resume-from {state_file}" )'
+        )
 
         if extra_args:
             cmd_parts.append(extra_args)
@@ -325,8 +326,8 @@ def main() -> None:
         help="Keep top 1/η trials after each rung (default: 3)",
     )
     parser.add_argument(
-        "--batch-sizes", type=str, default="4,8,16",
-        help="Comma-separated batch sizes (default: 4,8,16)",
+        "--batch-size", type=int, default=8,
+        help="Max batch size per trial (auto-sized down if needed, default: 8)",
     )
     parser.add_argument("--filter", type=str, default=None,
                         help="Only run models whose name contains this substring")
@@ -349,7 +350,7 @@ def main() -> None:
     extra_args_str = " ".join(extra_train_args)
 
     rungs = sorted(int(x) for x in args.rungs.split(","))
-    batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
+    batch_size = args.batch_size
     eta = args.reduction_factor
     max_rung_steps = rungs[-1]
 
@@ -374,14 +375,13 @@ def main() -> None:
     param_counts = estimate_param_counts(configs)
 
     trials: list[Trial] = []
-    for bs in batch_sizes:
-        for mc in configs:
-            trials.append(Trial(
-                model_name=mc.name,
-                batch_size=bs,
-                run_name=f"{mc.name}_bs{bs}",
-                worker_name="",  # assigned below
-            ))
+    for mc in configs:
+        trials.append(Trial(
+            model_name=mc.name,
+            batch_size=batch_size,
+            run_name=mc.name,
+            worker_name="",  # assigned below
+        ))
 
     # LPT bin-packing: sort by cost descending, greedily assign to
     # the least-loaded worker.
@@ -448,14 +448,14 @@ def main() -> None:
 
     print(f"\nDistributed ASHA Sweep")
     print(f"  Workers:       {worker_names}")
-    print(f"  Trials:        {n_trials} ({len(configs)} models × {len(batch_sizes)} batch sizes)")
+    print(f"  Trials:        {n_trials} ({len(configs)} models, bs≤{batch_size} auto-sized)")
     print(f"  Assignment:    {worker_counts}")
     print(f"  Cost balance:  {{"
           + ", ".join(f"{w}: {worker_cost.get(w,0)/1e6:.1f}M params" for w in worker_names)
           + "}")
     print(f"  Rungs:         {rungs}")
     print(f"  Reduction (η): {eta}")
-    print(f"  Batch sizes:   {batch_sizes}")
+    print(f"  Batch size:    ≤{batch_size} (auto-sized)")
     print(f"  Est. budget:   {plan_budget:,} total steps  "
           f"(vs {n_trials * max_rung_steps:,} exhaustive)")
     if extra_args_str:
@@ -539,7 +539,7 @@ def main() -> None:
 
         save_state(
             state_path,
-            rungs=rungs, eta=eta, batch_sizes=batch_sizes,
+            rungs=rungs, eta=eta, batch_sizes=[batch_size],
             trials=trials, current_rung=rung_idx + 1,
         )
 
@@ -548,12 +548,12 @@ def main() -> None:
     print(f"\n{'=' * 80}")
     print("FINAL LEADERBOARD — Distributed ASHA Sweep")
     print(f"{'=' * 80}")
-    print(f"{'Rank':<6}{'Trial':<45}{'BS':>4}{'Best Recon':>12}{'Rung':>6}{'Worker':>8}")
-    print("-" * 81)
+    print(f"{'Rank':<6}{'Trial':<45}{'Best Recon':>12}{'Rung':>6}{'Worker':>8}")
+    print("-" * 77)
     for i, t in enumerate(ranked, 1):
         recon_str = f"{t.best_recon:.6f}" if np.isfinite(t.best_recon) else "N/A"
         rung_str = f"{t.completed_rung + 1}/{len(rungs)}"
-        print(f"{i:<6}{t.run_name:<45}{t.batch_size:>4}{recon_str:>12}"
+        print(f"{i:<6}{t.run_name:<45}{recon_str:>12}"
               f"{rung_str:>6}{t.worker_name:>8}")
 
     print(f"\nState saved to: {state_path}")

@@ -247,6 +247,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         total_steps = last.get("step", 0)
         elapsed_s = last.get("elapsed_s", 0)
 
+        steps_per_s = total_steps / elapsed_s if elapsed_s > 0 else float("nan")
+
         rows.append(OrderedDict([
             ("name", run["name"]),
             ("num_params", f"{cfg.get('num_parameters', 0):,}"),
@@ -255,6 +257,7 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
             ("max_cb_usage", max_cb),
             ("total_steps", total_steps),
             ("elapsed_s", f"{elapsed_s:.0f}"),
+            ("steps/s", f"{steps_per_s:.2f}"),
         ]))
 
     # Sort by min_smoothed_recon ascending
@@ -300,7 +303,9 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
     axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
     run_styles = build_run_styles(runs)
     nrows = 2 if has_cb else 1
-    fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True)
+    height_ratios = [2, 1] if nrows == 2 else [1]
+    fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True,
+                             gridspec_kw={"height_ratios": height_ratios})
     if nrows == 1:
         axes = [axes]
 
