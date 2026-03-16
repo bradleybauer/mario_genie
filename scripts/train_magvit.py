@@ -522,7 +522,7 @@ def train():
         tokenizer.eval()
         with torch.no_grad():
             inp = PaletteVideoTokenizer.indices_to_onehot(
-                batch.long(), num_palette_colors,
+                batch.long().to(device), num_palette_colors,
             )
             codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
             recon_video = tokenizer.decode_from_code_indices(

@@ -55,6 +55,34 @@ if str(SRC_DIR) not in sys.path:
 from mario_world_model.model_configs import MODEL_CONFIGS
 
 
+# ── Cost estimation ───────────────────────────────────────────────
+
+
+def estimate_param_counts(configs: list) -> dict[str, int]:
+    """Instantiate each model config and count parameters."""
+    from magvit2_pytorch import VideoTokenizer
+
+    counts = {}
+    for mc in configs:
+        layers = tuple(
+            (name, int(val)) if ":" in tok else tok
+            for tok in mc.layers.split(",")
+            for name, _, val in [tok.partition(":")]
+        )
+        model = VideoTokenizer(
+            image_size=256,
+            init_dim=mc.init_dim,
+            channels=23,
+            codebook_size=mc.codebook_size,
+            layers=layers,
+            use_gan=False,
+            perceptual_loss_weight=0.0,
+        )
+        counts[mc.name] = sum(p.numel() for p in model.parameters())
+        del model
+    return counts
+
+
 # ── Data classes ──────────────────────────────────────────────────
 
 
@@ -339,18 +367,31 @@ def main() -> None:
             print(f"No models match filter '{args.filter}'.")
             sys.exit(1)
 
-    # Assign trials per batch-size group so each bs is evenly spread
-    # across workers (avoids all bs=16 landing on one worker).
+    # Cost-aware worker assignment: estimate per-model GPU cost from
+    # param count and bin-pack trials onto workers using LPT (Longest
+    # Processing Time first) to equalise total estimated load.
+    print("Estimating model param counts for cost-aware assignment ...")
+    param_counts = estimate_param_counts(configs)
+
     trials: list[Trial] = []
     for bs in batch_sizes:
-        for i, mc in enumerate(configs):
-            worker_idx = i % len(workers)
+        for mc in configs:
             trials.append(Trial(
                 model_name=mc.name,
                 batch_size=bs,
                 run_name=f"{mc.name}_bs{bs}",
-                worker_name=worker_names[worker_idx],
+                worker_name="",  # assigned below
             ))
+
+    # LPT bin-packing: sort by cost descending, greedily assign to
+    # the least-loaded worker.
+    trials.sort(key=lambda t: param_counts.get(t.model_name, 0), reverse=True)
+    worker_load: dict[str, int] = {name: 0 for name in worker_names}
+    for trial in trials:
+        cost = param_counts.get(trial.model_name, 0)
+        target = min(worker_load, key=lambda w: worker_load[w])
+        trial.worker_name = target
+        worker_load[target] += cost
 
     # ── Resume ───────────────────────────────────────────────────
     os.makedirs(local_results, exist_ok=True)
@@ -399,14 +440,19 @@ def main() -> None:
         plan_budget += n_alive * (r - prev)
         n_alive = max(1, math.ceil(n_alive / eta))
 
-    worker_counts = {}
+    worker_counts: dict[str, int] = {}
+    worker_cost: dict[str, int] = {}
     for t in trials:
         worker_counts[t.worker_name] = worker_counts.get(t.worker_name, 0) + 1
+        worker_cost[t.worker_name] = worker_cost.get(t.worker_name, 0) + param_counts.get(t.model_name, 0)
 
     print(f"\nDistributed ASHA Sweep")
     print(f"  Workers:       {worker_names}")
     print(f"  Trials:        {n_trials} ({len(configs)} models × {len(batch_sizes)} batch sizes)")
     print(f"  Assignment:    {worker_counts}")
+    print(f"  Cost balance:  {{"
+          + ", ".join(f"{w}: {worker_cost.get(w,0)/1e6:.1f}M params" for w in worker_names)
+          + "}")
     print(f"  Rungs:         {rungs}")
     print(f"  Reduction (η): {eta}")
     print(f"  Batch sizes:   {batch_sizes}")
