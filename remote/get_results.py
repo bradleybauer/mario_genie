@@ -35,7 +35,7 @@ def main():
     workers = load_workers(None if args.workers and "all" in args.workers else args.workers)
 
     remote_suffix = "checkpoints/"
-    local_base = str(PROJECT_ROOT / "results" / "model_config_sweep_genie")
+    local_base = str(PROJECT_ROOT / "results")
     if args.subdir:
         remote_suffix += args.subdir + "/"
         local_base = os.path.join(local_base, args.subdir)

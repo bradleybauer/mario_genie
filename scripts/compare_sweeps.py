@@ -521,7 +521,7 @@ def main():
                         help="Horizontal bar chart of best reconstruction loss")
     parser.add_argument("--color-by", choices=FACET_PROPERTIES, default=None,
                         help="Color bar chart bars by this property")
-    parser.add_argument("--smooth", type=float, default=5.0,
+    parser.add_argument("--smooth", type=float, default=0.0,
                         help="Gaussian sigma for plot smoothing (0 = no smoothing)")
     parser.add_argument("--no-legend", action="store_true",
                         help="Hide the legend on plots")
