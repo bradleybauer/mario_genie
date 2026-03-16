@@ -160,7 +160,8 @@ def build_worker_script(
             f"--output-dir {sweep_dir}",
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
-            f"--batch-size {trial.batch_size}",
+            f"--auto-batch-size",
+            f"--max-batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
         ]
@@ -364,6 +365,22 @@ def main() -> None:
                         trial.worker_name = saved_worker
             start_rung_idx = saved.get("current_rung", 0)
             print(f"[resume] Loaded state from {state_path}, starting at rung {start_rung_idx}")
+    else:
+        # ── Clean start: wipe remote sweep dirs, kill stale tmux, clear local results ──
+        print("[clean] Killing stale tmux sessions and wiping remote sweep dirs ...")
+
+        def clean_worker(worker):
+            ssh(worker, f"tmux kill-session -t {args.session} 2>/dev/null || true", check=False)
+            ssh(worker, f"rm -rf {worker.project_dir}/{args.sweep_dir}")
+
+        run_on_all(workers, clean_worker, desc="clean remote")
+
+        # Clear local results
+        import shutil
+        if os.path.isdir(local_results):
+            shutil.rmtree(local_results)
+        os.makedirs(local_results, exist_ok=True)
+        print("[clean] Done")
 
     # ── Print plan ───────────────────────────────────────────────
     n_trials = len(trials)
