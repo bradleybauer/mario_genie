@@ -102,7 +102,12 @@ ATTENTION_VARIANTS = {
     "attn": AttentionVariant(name="attn", suffix="_attn", enabled=True),
 }
 
+# Controlling model width.
 DIMS = [32, 16, 8]
+
+# More or less controls bottleneck dimension. Although, it also introduces a huge matrix in the tokenizer during training as this codebook size increases.
+# "This produces a (B*N, num_codebooks, codebook_size) tensor, then softmax over the codebook axis. For a 16×16 latent grid with codebook_size=65536, that's (B*256, 1, 65536) — 16× larger than the 4096 case. This is why those models use more memory and are slower.""
+#
 CODEBOOK_SIZES = [65536, 4096]
 
 # ── Generated registry ────────────────────────────────────────────
@@ -146,7 +151,6 @@ MODEL_CONFIGS_BY_NAME: dict[str, ModelConfig] = {m.name: m for m in MODEL_CONFIG
 
 
 if __name__ == "__main__":
-    import torch
     from magvit2_pytorch import VideoTokenizer
 
     NUM_PALETTE_COLORS = 23

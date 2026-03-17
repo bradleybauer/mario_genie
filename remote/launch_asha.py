@@ -130,6 +130,9 @@ def read_best_recon(metrics_path: str) -> float:
     try:
         with open(metrics_path) as f:
             metrics = json.load(f)
+        # Prefer eval_recon_loss (computed on held-out set at end of rung)
+        if metrics and "eval_recon_loss" in metrics[-1]:
+            return metrics[-1]["eval_recon_loss"]
         vals = [m["smoothed_recon_loss"] for m in metrics if "smoothed_recon_loss" in m]
         if not vals:
             vals = [m["recon_loss"] for m in metrics if "recon_loss" in m]
@@ -193,6 +196,7 @@ def build_worker_script(
             f"--max-batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
+            "--eval-samples 3000",
         ]
 
         if no_compile:

@@ -19,6 +19,7 @@ import json
 import re
 import sys
 from collections import OrderedDict, defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -49,6 +50,7 @@ DISTINCT_COLORS = [
 ]
 LINE_STYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), (0, (5, 2, 1, 2, 1, 2))]
 LINE_WIDTHS = [1.8, 1.2, 2.4]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def get_recon_values(metrics: list[dict]) -> tuple[str | None, list[float]]:
@@ -188,6 +190,106 @@ def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
     return lower, upper
 
 
+def resolve_data_dir(run: dict) -> Path | None:
+    """Resolve a run's configured data directory to an existing path."""
+    data_dir = run["config"].get("data_dir")
+    if not data_dir:
+        return None
+
+    configured_path = Path(data_dir)
+    candidates = []
+    if configured_path.is_absolute():
+        candidates.append(configured_path)
+    else:
+        candidates.extend([
+            Path.cwd() / configured_path,
+            Path(run["dir"]) / configured_path,
+            PROJECT_ROOT / configured_path,
+        ])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+@lru_cache(maxsize=None)
+def count_dataset_sequences(data_dir: str, sequence_length: int) -> int | None:
+    """Approximate dataset size from saved session metadata."""
+    root = Path(data_dir)
+    meta_files = sorted(root.rglob("session_*.meta.json"))
+    if not meta_files:
+        return None
+
+    total_sequences = 0
+    for meta_file in meta_files:
+        with open(meta_file) as f:
+            meta = json.load(f)
+        num_frames = meta.get("num_frames", 0)
+        if num_frames >= sequence_length:
+            total_sequences += (num_frames - sequence_length) // sequence_length + 1
+    return total_sequences
+
+
+def estimate_train_sample_count(run: dict) -> int | None:
+    """Estimate the effective training-set size used by a run."""
+    cfg = run["config"]
+    data_dir = resolve_data_dir(run)
+    if data_dir is None:
+        return None
+
+    sequence_length = int(cfg.get("sequence_length", 16) or 16)
+    total_sequences = count_dataset_sequences(str(data_dir), sequence_length)
+    if total_sequences is None:
+        return None
+
+    overfit_n = int(cfg.get("overfit_n", 0) or 0)
+    if overfit_n > 0:
+        return min(overfit_n, total_sequences)
+
+    eval_samples = int(cfg.get("eval_samples", 0) or 0)
+    if eval_samples > 0 and total_sequences > eval_samples:
+        return total_sequences - eval_samples
+    return total_sequences
+
+
+def get_total_samples(metrics: list[dict]) -> int | None:
+    """Return the latest recorded total sample count."""
+    for metric in reversed(metrics):
+        total_samples = metric.get("total_samples")
+        if total_samples is not None:
+            return int(total_samples)
+    return None
+
+
+def get_total_steps(metrics: list[dict]) -> int:
+    """Return the latest recorded optimizer step count."""
+    last = metrics[-1]
+    if "total_steps" in last:
+        return int(last["total_steps"])
+    return int(last.get("step", 0))
+
+
+def format_dataset_seen_pct(run: dict) -> str:
+    """Render approximate dataset coverage as effective epochs in percent."""
+    train_sample_count = estimate_train_sample_count(run)
+    total_samples = get_total_samples(run["metrics"])
+    if not train_sample_count or total_samples is None:
+        return "?"
+    return f"{(100.0 * total_samples / train_sample_count):.1f}%"
+
+
+def format_dataset_seen_per_step(run: dict) -> str:
+    """Render approximate dataset coverage normalized by steps taken."""
+    train_sample_count = estimate_train_sample_count(run)
+    total_samples = get_total_samples(run["metrics"])
+    total_steps = get_total_steps(run["metrics"])
+    if not train_sample_count or total_samples is None or total_steps <= 0:
+        return "?"
+    seen_pct = 100.0 * total_samples / train_sample_count
+    return f"{(seen_pct / total_steps):.4f}%"
+
+
 def discover_runs(results_dirs: list[str]) -> list[dict]:
     """Find all directories under one or more results trees with config.json and metrics.json."""
     runs = []
@@ -244,7 +346,7 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
 
         # Last step / elapsed
         last = metrics[-1]
-        total_steps = last.get("step", 0)
+        total_steps = get_total_steps(metrics)
         elapsed_s = last.get("elapsed_s", 0)
 
         steps_per_s = total_steps / elapsed_s if elapsed_s > 0 else float("nan")
@@ -252,6 +354,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         rows.append(OrderedDict([
             ("name", run["name"]),
             ("num_params", f"{cfg.get('num_parameters', 0):,}"),
+            ("batch_size", cfg.get("batch_size", "?")),
+            ("approx_dataset_seen", format_dataset_seen_pct(run)),
             ("min_smoothed_recon", f"{min_smoothed_recon:.4f}"),
             ("final_cb_usage", final_cb),
             ("max_cb_usage", max_cb),
@@ -471,6 +575,9 @@ def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | N
     labels = [e[0] for e in entries]
     values = [e[1] for e in entries]
     props = [e[2] for e in entries]
+
+    unique_props: list[str] = []
+    prop_colors: dict[str | None, tuple[float, float, float, float]] = {}
 
     # Color by property if requested
     if color_by:

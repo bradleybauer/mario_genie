@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import copy
 import gc
 import json
 import math
@@ -210,6 +211,8 @@ def train():
                         help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
+    parser.add_argument("--eval-samples", type=int, default=256,
+                        help="Number of held-out samples for end-of-training evaluation (0 to disable)")
     _default_workers = min(get_effective_cpu_count(), 64)
     parser.add_argument("--num-workers", type=int, default=_default_workers,
                         help=f"Number of DataLoader workers (default: {_default_workers})")
@@ -273,6 +276,24 @@ def train():
         for name, _, val in [tok.partition(":")]
     )
 
+    # ── Early exit: already at max_steps (avoid loading data/model) ────
+    if args.resume_from and args.max_steps > 0:
+        ckpt_meta = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+        if ckpt_meta.get("global_step", 0) >= args.max_steps:
+            print(f"[max-steps] Already at step {ckpt_meta['global_step']} >= {args.max_steps}. Nothing to do.")
+            return
+        del ckpt_meta
+
+    # Restore batch_size from previous run's config on resume
+    if args.resume_from:
+        prev_config_path = os.path.join(os.path.dirname(args.resume_from), "config.json")
+        if os.path.exists(prev_config_path):
+            with open(prev_config_path) as f:
+                prev_config = json.load(f)
+            if "batch_size" in prev_config:
+                args.batch_size = prev_config["batch_size"]
+                print(f"[resume] Restored batch_size={args.batch_size} from {prev_config_path}")
+
     # ── Normal training ──────────────────────────────────────────────────
 
     # Seeding
@@ -302,6 +323,19 @@ def train():
         system_info=system_info,
     )
     print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
+
+    # ── Split eval set (deterministic via torch seed) ────────────────
+    eval_dataset = None
+    if args.eval_samples > 0 and args.overfit_n == 0 and len(dataset) > args.eval_samples:
+        eval_rng = torch.Generator()
+        eval_rng.manual_seed(args.seed)
+        perm = torch.randperm(len(dataset), generator=eval_rng)
+        eval_indices = perm[:args.eval_samples].tolist()
+        train_indices = perm[args.eval_samples:].tolist()
+        eval_dataset = copy.copy(dataset)
+        eval_dataset.samples = [dataset.samples[i] for i in eval_indices]
+        dataset.samples = [dataset.samples[i] for i in train_indices]
+        print(f"Eval split: {len(eval_dataset)} eval, {len(dataset)} train samples")
 
     # ── Load palette from palette.json in data dir ──
     palette_path = os.path.join(args.data_dir, "palette.json")
@@ -364,7 +398,7 @@ def train():
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
     # ── Auto batch-size (before compile — compiled graphs cache shapes) ──
-    if args.auto_batch_size and device.type == "cuda":
+    if args.auto_batch_size and device.type == "cuda" and not args.resume_from:
         print("\n[auto-batch] Probing GPU for maximum batch size …")
         ceiling = num_unique_samples
         if args.max_batch_size > 0:
@@ -399,7 +433,7 @@ def train():
     num_parameters = sum(p.numel() for p in tokenizer.parameters())
 
     # ── Compile (after auto-batch so shape probing isn't cached) ──
-    if not args.no_compile:
+    if not args.no_compile and not args.resume_from:
         tokenizer = torch.compile(tokenizer)
         print("[compile] torch.compile enabled")
 
@@ -462,6 +496,10 @@ def train():
         scheduler.load_state_dict(ckpt['scheduler'])
         start_step = ckpt['global_step']
         print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+
+        if args.max_steps > 0 and start_step >= args.max_steps:
+            print(f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do.")
+            return
 
     # ── Perf tracking ────────────────────────────────────────────────
     _perf_step_count = start_step
@@ -571,11 +609,11 @@ def train():
             batch = batch.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        targets = batch.long()
-        inp = PaletteVideoTokenizer.indices_to_onehot(
-            targets, num_palette_colors,
-        )
         try:
+            targets = batch.long()
+            inp = PaletteVideoTokenizer.indices_to_onehot(
+                targets, num_palette_colors,
+            )
             loss, loss_breakdown = tokenizer(
                 inp,
                 targets=targets,
@@ -586,7 +624,8 @@ def train():
         except torch.cuda.OutOfMemoryError:
             # Clean up GPU memory
             optimizer.zero_grad(set_to_none=True)
-            del inp, targets, batch
+            for _v in ('inp', 'targets', 'batch'):
+                locals().pop(_v, None)
             gc.collect()
             torch.cuda.empty_cache()
             if global_step == start_step:
@@ -701,6 +740,12 @@ def train():
 
     # Always record the final state so sweep readers see the terminal smoothed_recon
     total_elapsed = time.time() - train_start
+
+    # If no training steps ran (e.g. resumed at max_steps), skip final bookkeeping
+    if _perf_step_count == 0:
+        print("No training steps executed. Exiting.")
+        return
+
     gs = _gpu_stats()
     final_metrics = {
         "step": global_step,
@@ -744,6 +789,111 @@ def train():
 
     save_reconstruction(batch, os.path.join(args.output_dir, "final_reconstruction.png"))
     print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
+
+    # ── Eval on held-out set ──────────────────────────────────────────
+    if eval_dataset is not None:
+        eval_loader = DataLoader(
+            eval_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=num_w, pin_memory=torch.cuda.is_available(),
+        )
+        tokenizer.eval()
+        eval_losses = []
+        all_codes = []
+        total_pixels = 0
+        correct_pixels = 0
+        eval_batch_for_recon = None
+        with torch.no_grad():
+            for eval_batch in tqdm(eval_loader, desc="Evaluating"):
+                eval_batch = eval_batch.to(device, non_blocking=True)
+                if eval_batch_for_recon is None:
+                    eval_batch_for_recon = eval_batch
+                targets = eval_batch.long()
+                inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
+                _, eval_lb = tokenizer(
+                    inp, targets=targets, return_loss=True,
+                    video_contains_first_frame=video_contains_first_frame,
+                )
+                eval_losses.append(eval_lb.recon_loss.item())
+                # Collect codes and pixel accuracy
+                codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                all_codes.append(codes.cpu())
+                recon_video = tokenizer.decode_from_code_indices(
+                    codes, video_contains_first_frame=video_contains_first_frame,
+                )
+                recon_idx = recon_video.argmax(dim=1)  # (B, T, H, W)
+                total_pixels += targets.numel()
+                correct_pixels += (recon_idx == targets).sum().item()
+
+        eval_recon_loss = sum(eval_losses) / len(eval_losses)
+        pixel_accuracy = correct_pixels / max(total_pixels, 1)
+
+        # Codebook analysis
+        all_codes_flat = torch.cat([c.flatten() for c in all_codes])
+        unique_codes = all_codes_flat.unique()
+        codebook_utilization = unique_codes.numel() / mc.codebook_size
+        code_counts = torch.bincount(all_codes_flat, minlength=mc.codebook_size)
+        # Entropy of code distribution (bits)
+        code_probs = code_counts[code_counts > 0].float() / code_counts.sum()
+        code_entropy = -(code_probs * code_probs.log2()).sum().item()
+        max_entropy = math.log2(mc.codebook_size)
+
+        print(f"Eval recon_loss: {eval_recon_loss:.6f} ({len(eval_dataset)} samples, {len(eval_losses)} batches)")
+        print(f"Eval pixel_accuracy: {pixel_accuracy:.4f}")
+        print(f"Eval codebook: {unique_codes.numel()}/{mc.codebook_size} codes used "
+              f"({codebook_utilization:.1%}), entropy={code_entropy:.2f}/{max_entropy:.2f} bits")
+
+        eval_stats = {
+            "eval_recon_loss": eval_recon_loss,
+            "eval_pixel_accuracy": round(pixel_accuracy, 6),
+            "eval_codebook_used": unique_codes.numel(),
+            "eval_codebook_size": mc.codebook_size,
+            "eval_codebook_utilization": round(codebook_utilization, 4),
+            "eval_code_entropy_bits": round(code_entropy, 4),
+            "eval_max_entropy_bits": round(max_entropy, 4),
+        }
+        final_metrics.update(eval_stats)
+        if metrics_log and metrics_log[-1].get("step") == global_step:
+            metrics_log[-1].update(eval_stats)
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics_log, f, indent=2)
+
+        # Save codebook histogram
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            # Full histogram (all code indices)
+            ax = axes[0]
+            ax.bar(range(mc.codebook_size), code_counts.numpy(), width=1.0, linewidth=0)
+            ax.set_xlabel("Code index")
+            ax.set_ylabel("Count")
+            ax.set_title(f"Code usage ({unique_codes.numel()}/{mc.codebook_size} used, "
+                         f"entropy={code_entropy:.2f} bits)")
+            # Log-scale sorted frequency (rank-frequency plot)
+            ax = axes[1]
+            sorted_counts = code_counts[code_counts > 0].sort(descending=True).values.numpy()
+            ax.bar(range(len(sorted_counts)), sorted_counts, width=1.0, linewidth=0)
+            ax.set_yscale('log')
+            ax.set_xlabel("Rank")
+            ax.set_ylabel("Count (log)")
+            ax.set_title(f"Rank-frequency (pixel acc={pixel_accuracy:.3f}, "
+                         f"recon={eval_recon_loss:.4f})")
+            fig.tight_layout()
+            hist_path = os.path.join(args.output_dir, "eval_codebook_histogram.png")
+            fig.savefig(hist_path, dpi=150)
+            plt.close(fig)
+            print(f"Codebook histogram saved to {hist_path}")
+        except ImportError:
+            print("[eval] matplotlib not available, skipping histogram")
+
+        if eval_batch_for_recon is not None:
+            save_reconstruction(
+                eval_batch_for_recon,
+                os.path.join(args.output_dir, "eval_reconstruction.png"),
+            )
+            print(f"Eval reconstruction saved to {args.output_dir}/eval_reconstruction.png")
+        tokenizer.train()
 
 if __name__ == "__main__":
     train()
