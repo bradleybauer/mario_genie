@@ -19,7 +19,7 @@ Usage:
         --rungs 500,1500,4500,13500 \\
         --batch-sizes 4,8,16 \\
         --reduction-factor 3 \\
-        -- --lr 8e-4 --warmup-steps 100
+        -- --warmup-steps 100
 
 Everything after '--' is forwarded to train_magvit.py on each worker.
 """
@@ -170,7 +170,6 @@ def build_worker_script(
     max_rung_steps: int,
     sweep_dir: str,
     extra_args: str,
-    no_compile: bool = False,
 ) -> str:
     """Build a bash script that trains all assigned trials for one rung."""
     lines = [
@@ -192,15 +191,13 @@ def build_worker_script(
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
             f"--batch-size {trial.batch_size}",
-            "--auto-batch-size",
-            f"--max-batch-size {trial.batch_size}",
+            # "--auto-batch-size",
+            # f"--max-batch-size {trial.batch_size}",
+            f"--batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
             "--eval-samples 3000",
         ]
-
-        if no_compile:
-            cmd_parts.append("--no-compile")
 
         # Resume from checkpoint if one exists on the remote
         cmd_parts.append(
@@ -227,7 +224,6 @@ def launch_rung_on_workers(
     sweep_dir: str,
     extra_args: str,
     session: str = TMUX_SESSION,
-    no_compile: bool = False,
 ) -> None:
     """Upload scripts and launch training on all workers for one rung."""
     for worker in workers:
@@ -237,7 +233,7 @@ def launch_rung_on_workers(
 
         script = build_worker_script(
             worker, worker_trials, rung_steps, max_rung_steps,
-            sweep_dir, extra_args, no_compile=no_compile,
+            sweep_dir, extra_args,
         )
 
         remote_script = f"{worker.project_dir}/run_asha_rung.sh"
@@ -330,8 +326,8 @@ def main() -> None:
         help="Keep top 1/η trials after each rung (default: 3)",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=8,
-        help="Max batch size per trial (auto-sized down if needed, default: 8)",
+        "--batch-size", type=int, default=6,
+        help="Max batch size per trial (auto-sized down if needed, default: 4)",
     )
     parser.add_argument("--filter", type=str, default=None,
                         help="Only run models whose name contains this substring")
@@ -343,10 +339,6 @@ def main() -> None:
                         help="Resume from saved sweep state")
     parser.add_argument("--session", type=str, default=TMUX_SESSION,
                         help="Tmux session name on workers (default: asha)")
-    parser.add_argument(
-        "--no-compile-rungs", type=int, default=2,
-        help="Skip torch.compile for the first N rungs (default: 2)",
-    )
     args, extra_train_args = parser.parse_known_args()
 
     if extra_train_args and extra_train_args[0] == "--":
@@ -499,13 +491,11 @@ def main() -> None:
                 print(f"    [{wn}] {len(wt)} trial(s)")
 
             # Launch on all workers
-            no_compile = rung_idx < args.no_compile_rungs
             launch_rung_on_workers(
                 workers, trials_by_worker,
                 rung_steps, max_rung_steps,
                 args.sweep_dir, extra_args_str,
                 session=args.session,
-                no_compile=no_compile,
             )
 
             # Wait for all workers to finish

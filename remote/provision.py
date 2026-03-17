@@ -40,7 +40,7 @@ FILTERS = {
     "inet_up": {"gte": 1000},
     "cpu_cores": {"gte": 32},
     "cpu_ram": {"gte": 99000},
-    "gpu_ram": {"gt": 19000},
+    "gpu_ram": {"gt": 39000},
     "cuda_max_good": {"gte": 13.0},
     "num_gpus": {"eq": 1},
     "direct_port_count": {"gte": 1},

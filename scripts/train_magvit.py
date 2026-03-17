@@ -9,6 +9,7 @@ import random
 import time
 from datetime import datetime
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, RandomSampler
 import sys
@@ -82,7 +83,8 @@ class MarioVideoDataset(Dataset):
         n_files = len(self.data_files)
         print(f"Indexing {n_files} data files (stride=1)...")
         frame_counts = [0] * n_files
-        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+        index_workers = max(num_workers, 1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
             futures = {
                 pool.submit(_index_file, idx, f, seq_len): idx
                 for idx, f in enumerate(self.data_files)
@@ -104,6 +106,8 @@ class MarioVideoDataset(Dataset):
             frame_counts = [frame_counts[i] for i in valid]
             self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
             n_files = len(self.data_files)
+
+        self.samples.sort()  # deterministic order regardless of thread completion
 
         if subset_n > 0 and subset_n < len(self.samples):
             total = len(self.samples)
@@ -130,7 +134,7 @@ class MarioVideoDataset(Dataset):
                 def _load_file(idx):
                     return idx, np.load(self.data_files[idx])['frames']
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as pool:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
                     futures = [pool.submit(_load_file, i) for i in range(n_files)]
                     with tqdm(total=n_files, desc="Loading into RAM", unit="file") as pbar:
                         for future in concurrent.futures.as_completed(futures):
@@ -205,8 +209,8 @@ def train():
         action="store_true",
         help="Print available model configs and exit.",
     )
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile (enabled by default)")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile (disabled by default)")
     parser.add_argument("--tf32", action="store_true",
                         help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
@@ -433,9 +437,9 @@ def train():
     num_parameters = sum(p.numel() for p in tokenizer.parameters())
 
     # ── Compile (after auto-batch so shape probing isn't cached) ──
-    if not args.no_compile and not args.resume_from:
-        tokenizer = torch.compile(tokenizer)
-        print("[compile] torch.compile enabled")
+    if args.compile and not args.resume_from:
+        tokenizer = torch.compile(tokenizer, dynamic=True)
+        print("[compile] torch.compile enabled (dynamic=True)")
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
@@ -645,6 +649,7 @@ def train():
 
         current_lr = optimizer.param_groups[0]['lr']
         recon = loss_breakdown.recon_loss.item()
+        aux_loss = loss_breakdown.lfq_aux_loss.item()
 
         # ── Perf tracking ────────────────────────────────────────────
         _perf_step_count += 1
@@ -712,6 +717,7 @@ def train():
                 "step": global_step,
                 "loss": loss.item(),
                 "recon_loss": recon,
+                "lfq_aux_loss": aux_loss,
                 "smoothed_recon_loss": smoothed_recon,
                 "best_smoothed_recon": best_smoothed_recon,
                 "lr": current_lr,
@@ -751,6 +757,7 @@ def train():
         "step": global_step,
         "loss": loss.item(),
         "recon_loss": recon,
+        "lfq_aux_loss": aux_loss,
         "smoothed_recon_loss": smoothed_recon,
         "best_smoothed_recon": best_smoothed_recon,
         "lr": optimizer.param_groups[0]['lr'],
@@ -766,15 +773,19 @@ def train():
     with open(metrics_path, 'w') as f:
         json.dump(metrics_log, f, indent=2)
 
+    # Keep a reference for final reconstruction before cleanup
+    final_recon_batch = batch
+
     # ── Save checkpoint & final reconstruction ───────────────────────
     ckpt_path = os.path.join(args.output_dir, "magvit2_best.pt")
     unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
-    torch.save(unwrapped.state_dict(), ckpt_path)
-    print(f"Checkpoint saved to {ckpt_path} ({len(unwrapped.state_dict())} keys)")
+    model_sd = unwrapped.state_dict()
+    torch.save(model_sd, ckpt_path)
+    print(f"Checkpoint saved to {ckpt_path} ({len(model_sd)} keys)")
 
     # Full training state for ASHA / resume
     training_state = {
-        'model': unwrapped.state_dict(),
+        'model': model_sd,
         'optimizer': optimizer.state_dict(),
         'scheduler': scheduler.state_dict(),
         'global_step': global_step,
@@ -786,52 +797,58 @@ def train():
     state_path = os.path.join(args.output_dir, "training_state.pt")
     torch.save(training_state, state_path)
     print(f"Training state saved to {state_path}")
+    del training_state, model_sd
 
-    save_reconstruction(batch, os.path.join(args.output_dir, "final_reconstruction.png"))
-    print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
+    # Free training-only objects before eval to reduce RSS
+    del optimizer, scheduler, dataloader
+    # Drop training dataset and its mmap handles to release resident pages
+    if hasattr(dataset, '_mmap_cache'):
+        dataset._mmap_cache.clear()
+    if eval_dataset is not None and hasattr(eval_dataset, '_mmap_cache'):
+        eval_dataset._mmap_cache.clear()
+    del dataset, batch, pbar
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # ── Eval on held-out set ──────────────────────────────────────────
     if eval_dataset is not None:
         eval_loader = DataLoader(
             eval_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=num_w, pin_memory=torch.cuda.is_available(),
+            num_workers=0, pin_memory=False,
         )
         tokenizer.eval()
         eval_losses = []
-        all_codes = []
+        code_counts = torch.zeros(mc.codebook_size, dtype=torch.long)
         total_pixels = 0
         correct_pixels = 0
-        eval_batch_for_recon = None
         with torch.no_grad():
             for eval_batch in tqdm(eval_loader, desc="Evaluating"):
                 eval_batch = eval_batch.to(device, non_blocking=True)
-                if eval_batch_for_recon is None:
-                    eval_batch_for_recon = eval_batch
                 targets = eval_batch.long()
                 inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
-                _, eval_lb = tokenizer(
-                    inp, targets=targets, return_loss=True,
-                    video_contains_first_frame=video_contains_first_frame,
-                )
-                eval_losses.append(eval_lb.recon_loss.item())
-                # Collect codes and pixel accuracy
+                # Single encode → codes
                 codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-                all_codes.append(codes.cpu())
+                code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
+                # Single decode → logits
                 recon_video = tokenizer.decode_from_code_indices(
                     codes, video_contains_first_frame=video_contains_first_frame,
                 )
+                del codes, inp
+                # Recon loss (same as PaletteVideoTokenizer's cross-entropy)
+                eval_losses.append(F.cross_entropy(recon_video, targets).item())
+                # Pixel accuracy
                 recon_idx = recon_video.argmax(dim=1)  # (B, T, H, W)
                 total_pixels += targets.numel()
                 correct_pixels += (recon_idx == targets).sum().item()
+                del recon_video, recon_idx, targets
 
         eval_recon_loss = sum(eval_losses) / len(eval_losses)
         pixel_accuracy = correct_pixels / max(total_pixels, 1)
 
-        # Codebook analysis
-        all_codes_flat = torch.cat([c.flatten() for c in all_codes])
-        unique_codes = all_codes_flat.unique()
-        codebook_utilization = unique_codes.numel() / mc.codebook_size
-        code_counts = torch.bincount(all_codes_flat, minlength=mc.codebook_size)
+        # Codebook analysis (from running bincount)
+        unique_codes_n = (code_counts > 0).sum().item()
+        codebook_utilization = unique_codes_n / mc.codebook_size
         # Entropy of code distribution (bits)
         code_probs = code_counts[code_counts > 0].float() / code_counts.sum()
         code_entropy = -(code_probs * code_probs.log2()).sum().item()
@@ -839,13 +856,13 @@ def train():
 
         print(f"Eval recon_loss: {eval_recon_loss:.6f} ({len(eval_dataset)} samples, {len(eval_losses)} batches)")
         print(f"Eval pixel_accuracy: {pixel_accuracy:.4f}")
-        print(f"Eval codebook: {unique_codes.numel()}/{mc.codebook_size} codes used "
+        print(f"Eval codebook: {unique_codes_n}/{mc.codebook_size} codes used "
               f"({codebook_utilization:.1%}), entropy={code_entropy:.2f}/{max_entropy:.2f} bits")
 
         eval_stats = {
             "eval_recon_loss": eval_recon_loss,
             "eval_pixel_accuracy": round(pixel_accuracy, 6),
-            "eval_codebook_used": unique_codes.numel(),
+            "eval_codebook_used": unique_codes_n,
             "eval_codebook_size": mc.codebook_size,
             "eval_codebook_utilization": round(codebook_utilization, 4),
             "eval_code_entropy_bits": round(code_entropy, 4),
@@ -868,7 +885,7 @@ def train():
             ax.bar(range(mc.codebook_size), code_counts.numpy(), width=1.0, linewidth=0)
             ax.set_xlabel("Code index")
             ax.set_ylabel("Count")
-            ax.set_title(f"Code usage ({unique_codes.numel()}/{mc.codebook_size} used, "
+            ax.set_title(f"Code usage ({unique_codes_n}/{mc.codebook_size} used, "
                          f"entropy={code_entropy:.2f} bits)")
             # Log-scale sorted frequency (rank-frequency plot)
             ax = axes[1]
@@ -887,13 +904,19 @@ def train():
         except ImportError:
             print("[eval] matplotlib not available, skipping histogram")
 
-        if eval_batch_for_recon is not None:
-            save_reconstruction(
-                eval_batch_for_recon,
-                os.path.join(args.output_dir, "eval_reconstruction.png"),
-            )
-            print(f"Eval reconstruction saved to {args.output_dir}/eval_reconstruction.png")
+        save_reconstruction(
+            eval_batch,
+            os.path.join(args.output_dir, "eval_reconstruction.png"),
+        )
+        print(f"Eval reconstruction saved to {args.output_dir}/eval_reconstruction.png")
         tokenizer.train()
+
+        save_reconstruction(eval_batch, os.path.join(args.output_dir, "final_reconstruction.png"))
+        print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
+    else:
+        save_reconstruction(final_recon_batch, os.path.join(args.output_dir, "final_reconstruction.png"))
+        print(f"Final reconstruction saved to {args.output_dir}/final_reconstruction.png")
+
 
 if __name__ == "__main__":
     train()
