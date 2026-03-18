@@ -344,8 +344,15 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         final_cb = cb_entries[-1]["codebook_usage"] if cb_entries else None
         max_cb = max(m["codebook_usage"] for m in cb_entries) if cb_entries else None
 
-        # Last step / elapsed
+        # Eval metrics (from final entry if present)
         last = metrics[-1]
+        eval_recon = last.get("eval_recon_loss")
+        eval_pixel_acc = last.get("eval_pixel_accuracy")
+        eval_cb_util = last.get("eval_codebook_utilization")
+        eval_entropy = last.get("eval_code_entropy_bits")
+        eval_max_entropy = last.get("eval_max_entropy_bits")
+
+        # Last step / elapsed
         total_steps = get_total_steps(metrics)
         elapsed_s = last.get("elapsed_s", 0)
 
@@ -357,15 +364,23 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
             ("batch_size", cfg.get("batch_size", "?")),
             ("approx_dataset_seen", format_dataset_seen_pct(run)),
             ("min_smoothed_recon", f"{min_smoothed_recon:.4f}"),
+            ("eval_recon", f"{eval_recon:.4f}" if eval_recon is not None else ""),
+            ("eval_px_acc", f"{eval_pixel_acc:.4f}" if eval_pixel_acc is not None else ""),
             ("final_cb_usage", final_cb),
             ("max_cb_usage", max_cb),
+            ("cb_util", f"{eval_cb_util:.1%}" if eval_cb_util is not None else ""),
+            ("entropy", f"{eval_entropy:.2f}/{eval_max_entropy:.2f}" if eval_entropy is not None and eval_max_entropy is not None else ""),
             ("total_steps", total_steps),
             ("elapsed_s", f"{elapsed_s:.0f}"),
             ("steps/s", f"{steps_per_s:.2f}"),
         ]))
 
-    # Sort by min_smoothed_recon ascending
-    rows.sort(key=lambda r: float(r["min_smoothed_recon"]))
+    # Sort by eval_recon (if available), then min_smoothed_recon as fallback
+    def _sort_key(r):
+        eval_val = float(r["eval_recon"]) if r["eval_recon"] else float("inf")
+        smooth_val = float(r["min_smoothed_recon"])
+        return (eval_val, smooth_val)
+    rows.sort(key=_sort_key)
     return rows
 
 
@@ -403,12 +418,20 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
         return
 
     has_cb = any("codebook_usage" in m for run in runs for m in run["metrics"])
+    has_eval = any("eval_recon_loss" in run["metrics"][-1] for run in runs if run["metrics"])
     has_smoothed_recon = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
     axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
     run_styles = build_run_styles(runs)
-    nrows = 2 if has_cb else 1
-    height_ratios = [2, 1] if nrows == 2 else [1]
-    fig, axes = plt.subplots(nrows, 1, figsize=(12, 5 * nrows), sharex=True,
+
+    # Build panel list: recon loss always, then optional codebook + eval panels
+    panels = ["recon"]
+    if has_cb:
+        panels.append("codebook")
+    if has_eval:
+        panels.append("eval")
+    nrows = len(panels)
+    height_ratios = [2] + [1] * (nrows - 1)
+    fig, axes = plt.subplots(nrows, 1, figsize=(12, 4 * nrows), sharex=True,
                              gridspec_kw={"height_ratios": height_ratios})
     if nrows == 1:
         axes = [axes]
@@ -448,8 +471,8 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
     ax.grid(True, alpha=0.3)
 
     # --- Codebook usage ---
-    if has_cb:
-        ax = axes[1]
+    if "codebook" in panels:
+        ax = axes[panels.index("codebook")]
         for run in sorted_runs:
             metrics = run["metrics"]
             style = run_styles[run["name"]]
@@ -480,6 +503,57 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
         if show_legend:
             ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
+
+    # --- Eval metrics (bar-style at final step) ---
+    if "eval" in panels:
+        ax = axes[panels.index("eval")]
+        eval_data = []
+        for run in sorted_runs:
+            last = run["metrics"][-1]
+            if "eval_recon_loss" in last:
+                eval_data.append({
+                    "name": run["name"],
+                    "eval_recon": last["eval_recon_loss"],
+                    "pixel_acc": last.get("eval_pixel_accuracy"),
+                    "cb_util": last.get("eval_codebook_utilization"),
+                    "entropy": last.get("eval_code_entropy_bits"),
+                    "max_entropy": last.get("eval_max_entropy_bits"),
+                    "style": run_styles[run["name"]],
+                })
+        if eval_data:
+            eval_data.sort(key=lambda e: e["eval_recon"])
+            names = [e["name"] for e in eval_data]
+            y_pos = np.arange(len(names))
+            bar_height = 0.6
+
+            # Left axis: eval recon loss + pixel accuracy
+            recon_vals = [e["eval_recon"] for e in eval_data]
+            colors = [e["style"]["color"] for e in eval_data]
+            ax.barh(y_pos, recon_vals, height=bar_height, color=colors,
+                    edgecolor="white", linewidth=0.5, alpha=0.8, label="eval_recon_loss")
+
+            # Annotate with pixel accuracy and codebook stats
+            for i, e in enumerate(eval_data):
+                parts = []
+                if e["pixel_acc"] is not None:
+                    parts.append(f"px_acc={e['pixel_acc']:.3f}")
+                if e["cb_util"] is not None:
+                    parts.append(f"cb={e['cb_util']:.0%}")
+                if e["entropy"] is not None and e["max_entropy"] is not None:
+                    parts.append(f"H={e['entropy']:.1f}/{e['max_entropy']:.1f}b")
+                if parts:
+                    ax.annotate(
+                        "  " + ", ".join(parts),
+                        xy=(e["eval_recon"], i),
+                        va="center", fontsize=6, alpha=0.8,
+                    )
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(names, fontsize=7)
+            ax.invert_yaxis()
+            ax.set_xlabel("Eval Recon Loss")
+            ax.set_title("Eval Metrics (pixel accuracy, codebook utilization, entropy)")
+            ax.grid(True, axis="x", alpha=0.3)
 
     axes[-1].set_xlabel(axis_label)
     fig.tight_layout()

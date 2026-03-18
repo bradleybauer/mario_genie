@@ -240,9 +240,11 @@ def launch_rung_on_workers(
         ssh(worker, f"cat > {remote_script} && chmod +x {remote_script}",
             input=script)
 
-        # Kill existing session and start fresh
+        # Kill existing session and start fresh — use send-keys instead of
+        # passing the command to new-session, which can silently hang over SSH
         ssh(worker, f"tmux kill-session -t {session} 2>/dev/null || true", check=False)
-        ssh(worker, f"tmux new-session -d -s {session} 'bash {remote_script}'")
+        ssh(worker, f"tmux new-session -d -s {session}")
+        ssh(worker, f"tmux send-keys -t {session} 'exec bash {remote_script}' Enter")
         print(f"    [{worker.name}] launched {len(worker_trials)} trial(s)")
 
 
@@ -318,12 +320,12 @@ def main() -> None:
     parser.add_argument("--local-results", default=None,
                         help="Local dir for metrics (default: results/asha_sweep)")
     parser.add_argument(
-        "--rungs", type=str, default="6000,18000,54000,162000",
-        help="Comma-separated step budgets (default: 6000,18000,54000,162000)",
+        "--rungs", type=str, default="18000,54000,162000",
+        help="Comma-separated step budgets (default: 18000,54000,162000)",
     )
     parser.add_argument(
-        "--reduction-factor", type=int, default=3,
-        help="Keep top 1/η trials after each rung (default: 3)",
+        "--reduction-factor", type=int, default=2,
+        help="Keep top 1/η trials after each rung (default: 2)",
     )
     parser.add_argument(
         "--batch-size", type=int, default=6,
