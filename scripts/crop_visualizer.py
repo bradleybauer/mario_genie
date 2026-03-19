@@ -13,6 +13,7 @@ Controls:
     G                 — snap both to nearest multiple of 16
     D                 — toggle 2× downsample
     F                 — step through frames
+    R / N             — load a random sample
     Escape / Q        — quit
 
 Usage:
@@ -69,11 +70,24 @@ def resolve_session(path: Path) -> Path:
     if path.is_dir():
         sessions = sorted(path.glob("session_*.npz"))
         if sessions:
-            return sessions[len(sessions) // 2]
+            return sessions[8]
         # Recurse one level
         sessions = sorted(path.glob("*/session_*.npz"))
         if sessions:
-            return sessions[len(sessions) // 2]
+            return sessions[8]
+    raise FileNotFoundError(f"No session .npz found at {path}")
+
+
+def list_sessions(path: Path) -> list[Path]:
+    if path.is_file() and path.suffix == ".npz":
+        return [path]
+    if path.is_dir():
+        sessions = sorted(path.glob("session_*.npz"))
+        if sessions:
+            return sessions
+        sessions = sorted(path.glob("*/session_*.npz"))
+        if sessions:
+            return sessions
     raise FileNotFoundError(f"No session .npz found at {path}")
 
 
@@ -83,12 +97,14 @@ def main():
     parser.add_argument("--scale", type=int, default=3, help="Display scale factor (default: 3)")
     args = parser.parse_args()
 
+    session_paths = list_sessions(args.path)
     session_path = resolve_session(args.path)
-    print(f"Loading {session_path} ...")
-    data = np.load(session_path, mmap_mode="r")
-    frames = data["frames"]
-    n_frames, c, h, w = frames.shape
-    print(f"  {n_frames} frames, shape ({c}, {h}, {w})")
+    session_idx = session_paths.index(session_path)
+    rng = np.random.default_rng()
+
+    data = None
+    frames = None
+    n_frames = c = h = w = 0
 
     palette = load_palette(args.path if args.path.is_dir() else args.path.parent)
 
@@ -99,12 +115,49 @@ def main():
     frame_idx = 0
 
     pygame.init()
-    screen_w, screen_h = w * scale, h * scale
+    screen_w, screen_h = 0, 0
     info_bar_h = 80
-    screen = pygame.display.set_mode((screen_w, screen_h + info_bar_h))
+    screen = None
     pygame.display.set_caption("Crop Visualizer")
     font = pygame.font.SysFont("monospace", 18)
     clock = pygame.time.Clock()
+
+    def load_sample(new_session_idx: int, new_frame_idx: int | None = None) -> None:
+        nonlocal data, frames, n_frames, c, h, w, session_idx, frame_idx, screen_w, screen_h, screen
+
+        if data is not None:
+            data.close()
+
+        session_idx = new_session_idx
+        session_path = session_paths[session_idx]
+        print(f"Loading {session_path} ...")
+        data = np.load(session_path, mmap_mode="r")
+        frames = data["frames"]
+        n_frames, c, h, w = frames.shape
+        print(f"  {n_frames} frames, shape ({c}, {h}, {w})")
+
+        if new_frame_idx is None:
+            frame_idx = int(rng.integers(n_frames))
+        else:
+            frame_idx = max(0, min(new_frame_idx, n_frames - 1))
+
+        new_screen_w, new_screen_h = w * scale, h * scale
+        if screen is None or new_screen_w != screen_w or new_screen_h != screen_h:
+            screen_w, screen_h = new_screen_w, new_screen_h
+            screen = pygame.display.set_mode((screen_w, screen_h + info_bar_h))
+
+    def load_random_sample() -> None:
+        if len(session_paths) == 1:
+            next_session_idx = session_idx
+        else:
+            choices = len(session_paths) - 1
+            offset = int(rng.integers(choices))
+            next_session_idx = (session_idx + 1 + offset) % len(session_paths)
+        load_sample(next_session_idx)
+
+    load_sample(session_idx, 0)
+    assert frames is not None
+    assert screen is not None
 
     running = True
     while running:
@@ -147,6 +200,11 @@ def main():
                     downsample = not downsample
                 elif event.key == pygame.K_f:
                     frame_idx = (frame_idx + n_frames // 10) % n_frames
+                elif event.key in (pygame.K_r, pygame.K_n):
+                    load_random_sample()
+
+            assert frames is not None
+            assert screen is not None
 
         # Render frame
         rgb = frame_to_rgb(frames[frame_idx], palette)  # (H, W, 3)
@@ -218,8 +276,8 @@ def main():
             f"tokens: {tokens}  |  "
             f"{pct:.0f}% of original"
             + ("" if valid else "  [NOT div by 16 — press G]"),
-            f"Frame {frame_idx}/{n_frames}  |  "
-            f"Up/Down: ±V  Shift+Up/Down: ±H  G: snap  D: 2× down  F: next  Q: quit",
+            f"Sample {session_idx + 1}/{len(session_paths)}  |  Frame {frame_idx}/{n_frames}  |  "
+            f"Up/Down: ±V  Shift+Up/Down: ±H  G: snap  D: 2× down  F: next frame  R/N: random sample  Q: quit",
         ]
 
         y = screen_h + 8
@@ -233,6 +291,8 @@ def main():
         clock.tick(30)
 
     pygame.quit()
+    if data is not None:
+        data.close()
 
 
 if __name__ == "__main__":

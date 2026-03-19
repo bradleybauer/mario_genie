@@ -36,6 +36,11 @@ from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
 
 
+DEFAULT_IMAGE_SIZE = IMAGE_SIZE
+OVERSCAN_CROP_SIZE = 240
+CROP_224_SIZE = 224
+
+
 def _format_elapsed(seconds):
     seconds = max(int(seconds), 0)
     minutes, secs = divmod(seconds, 60)
@@ -49,6 +54,23 @@ def _format_elapsed(seconds):
 
 
 
+def _crop_chunk(chunk: np.ndarray, crop_size: int) -> np.ndarray:
+    """Crop padded 256x256 frames to a centered square size.
+
+    Assumes the preprocessing pipeline padded 240x256 gameplay frames to 256x256,
+    so reducing the square size removes equal borders on all sides.
+    """
+    height, width = chunk.shape[-2:]
+    if (height, width) == (crop_size, crop_size):
+        return chunk
+    if (height, width) != (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE):
+        raise ValueError(
+            f"crop expects frames of shape 256x256 or {crop_size}x{crop_size}, got {height}x{width}"
+        )
+    border = (DEFAULT_IMAGE_SIZE - crop_size) // 2
+    return chunk[..., border:-border, border:-border]
+
+
 def _index_file(file_idx, filepath, seq_len):
     """Index a session file.
 
@@ -56,14 +78,24 @@ def _index_file(file_idx, filepath, seq_len):
     (file_idx, t_start) tuples.
     """
     try:
-        npz = np.load(filepath, mmap_mode='r')
-        frames = npz['frames']
+        # Try reading frame count from the lightweight .meta.json sidecar
+        meta_path = filepath.replace('.npz', '.meta.json')
+        total_t = None
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            if 'num_frames' in meta:
+                total_t = meta['num_frames']
 
-        if frames.ndim != 4:
-            print(f"Skipping {filepath}: expected session format (N,C,H,W), got ndim={frames.ndim}")
-            return file_idx, 0, []
+        if total_t is None:
+            # Fallback: open the npz to get the frame count
+            npz = np.load(filepath, mmap_mode='r')
+            frames = npz['frames']
+            if frames.ndim != 4:
+                print(f"Skipping {filepath}: expected session format (N,C,H,W), got ndim={frames.ndim}")
+                return file_idx, 0, []
+            total_t = frames.shape[0]
 
-        total_t = frames.shape[0]
         if total_t < seq_len:
             return file_idx, 0, []
         samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
@@ -73,12 +105,22 @@ def _index_file(file_idx, filepath, seq_len):
         return file_idx, 0, []
 
 class MarioVideoDataset(Dataset):
-    def __init__(self, data_dir, seq_len=4, subset_n=0, seed=42, num_workers=None, system_info=None):
+    def __init__(
+        self,
+        data_dir,
+        seq_len=4,
+        subset_n=0,
+        seed=42,
+        num_workers=None,
+        system_info=None,
+        crop_size=None,
+    ):
         if num_workers is None:
             num_workers = get_effective_cpu_count(system_info)
         self.data_files = find_session_files(data_dir)
         self.seq_len = seq_len
         self.samples = []
+        self.crop_size = crop_size
         
         n_files = len(self.data_files)
         print(f"Indexing {n_files} data files (stride=1)...")
@@ -167,6 +209,8 @@ class MarioVideoDataset(Dataset):
         else:
             frames = self._get_frames_mmap(file_idx)
         chunk = frames[t_start:t_start+self.seq_len, 0]  # (T, H, W) uint8
+        if self.crop_size is not None:
+            chunk = _crop_chunk(chunk, self.crop_size)
         return torch.from_numpy(chunk.copy())
 
 
@@ -175,7 +219,7 @@ def train():
     parser.add_argument(
         "--data-dir",
         type=str,
-        required=True,
+        default="data",
         help="Path to session files or a parent directory containing nested session folders",
     )
     parser.add_argument("--batch-size", type=int, default=4)
@@ -190,8 +234,8 @@ def train():
              "limit large batches for faster convergence.",
     )
     parser.add_argument("--lr", type=float, default=8e-4)
-    parser.add_argument("--warmup-steps", type=int, default=200,
-                        help="Linear warmup from 0 to --lr over this many steps (default: 200)")
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=200)
     parser.add_argument("--image-interval-secs", type=float, default=300,
@@ -209,8 +253,6 @@ def train():
         action="store_true",
         help="Print available model configs and exit.",
     )
-    parser.add_argument("--compile", action="store_true",
-                        help="Enable torch.compile (disabled by default)")
     parser.add_argument("--tf32", action="store_true",
                         help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
@@ -259,7 +301,35 @@ def train():
         "--resume-from", type=str, default=None,
         help="Path to training_state.pt to resume training from.",
     )
+    parser.add_argument(
+        "--crop-240",
+        action="store_true",
+        help=(
+            "Center-crop preprocessed 256x256 frames to 240x240 by removing 8px "
+            "on each edge. Useful for SMB1/SMB3-style overscan cleanup while "
+            "preserving the original 240px gameplay height."
+        ),
+    )
+    parser.add_argument(
+        "--crop-224",
+        action="store_true",
+        help=(
+            "Center-crop preprocessed 256x256 frames to 224x224 by removing 16px "
+            "on each edge. Useful when you want a 14x14 latent grid instead of 15x15."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.crop_240 and args.crop_224:
+        parser.error("Use at most one of --crop-240 and --crop-224.")
+
+    crop_size = None
+    if args.crop_240:
+        crop_size = OVERSCAN_CROP_SIZE
+    elif args.crop_224:
+        crop_size = CROP_224_SIZE
+
+    image_size = crop_size or DEFAULT_IMAGE_SIZE
 
     if args.list_models:
         for name in sorted(MODEL_CONFIGS_BY_NAME):
@@ -325,8 +395,12 @@ def train():
         seed=args.seed,
         num_workers=args.num_workers,
         system_info=system_info,
+        crop_size=crop_size,
     )
-    print(f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames.")
+    print(
+        f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames "
+        f"(image_size={image_size})."
+    )
 
     # ── Split eval set (deterministic via torch seed) ────────────────
     eval_dataset = None
@@ -390,7 +464,7 @@ def train():
 
     tokenizer = PaletteVideoTokenizer(
         num_palette_colors=num_palette_colors,
-        image_size=IMAGE_SIZE,
+        image_size=image_size,
         init_dim=mc.init_dim,
         codebook_size=mc.codebook_size,
         layers=tokenizer_layers,
@@ -401,7 +475,7 @@ def train():
     palette = palette.to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
 
-    # ── Auto batch-size (before compile — compiled graphs cache shapes) ──
+    # ── Auto batch-size ──
     if args.auto_batch_size and device.type == "cuda" and not args.resume_from:
         print("\n[auto-batch] Probing GPU for maximum batch size …")
         ceiling = num_unique_samples
@@ -409,7 +483,7 @@ def train():
             ceiling = min(ceiling, args.max_batch_size)
         args.batch_size = find_max_batch_size(
             tokenizer,
-            image_size=IMAGE_SIZE,
+            image_size=image_size,
             seq_len=SEQUENCE_LENGTH,
             device=device,
             floor=1,
@@ -433,13 +507,8 @@ def train():
         torch.set_float32_matmul_precision('high')
         print("[tf32] TF32 matmul precision enabled")
 
-    # ── Count parameters (before compile — wrapper can change counts) ──
+    # ── Count parameters ──
     num_parameters = sum(p.numel() for p in tokenizer.parameters())
-
-    # ── Compile (after auto-batch so shape probing isn't cached) ──
-    if args.compile and not args.resume_from:
-        tokenizer = torch.compile(tokenizer, dynamic=True)
-        print("[compile] torch.compile enabled (dynamic=True)")
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
@@ -472,7 +541,7 @@ def train():
 
     # Save config for reproducibility
     config = vars(args).copy()
-    config["image_size"] = IMAGE_SIZE
+    config["image_size"] = image_size
     config["sequence_length"] = SEQUENCE_LENGTH
     config["layers"] = [list(l) if isinstance(l, tuple) else l for l in tokenizer_layers]
     config["git_hash"] = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or None
@@ -513,7 +582,7 @@ def train():
     _perf_window_samples = 0
     _PERF_WINDOW = 20  # rolling window size in steps
     # Bytes per sample for throughput: one-hot input (B, K, T, H, W) float32
-    _bytes_per_sample = num_palette_colors * SEQUENCE_LENGTH * IMAGE_SIZE * IMAGE_SIZE * 4
+    _bytes_per_sample = num_palette_colors * SEQUENCE_LENGTH * image_size * image_size * 4
 
     def _gpu_stats():
         """Return dict of GPU stats, or empty dict if unavailable."""
@@ -577,7 +646,7 @@ def train():
             recon_rgb = palette[recon_idx]
             recon_frames = recon_rgb.permute(0, 3, 1, 2)
             comparison = torch.cat([original_frames, recon_frames], dim=3)
-            save_image(comparison, path, nrow=1)
+            save_image(comparison, path, nrow=1, padding=0)
             codebook_usage = codes.unique().numel()
         tokenizer.train()
         return codes, codebook_usage

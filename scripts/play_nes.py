@@ -336,6 +336,7 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
     h, w, _ = obs.shape
     game_w = w * scale
     game_h = h * scale
+    print(f'Resolution: {game_w}x{game_h} (native {w}x{h}, scale {scale}x)')
 
     FPS_BAR_H = 18  # height of status bar when no RAM panel
     if show_ram:
@@ -368,6 +369,7 @@ def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CE
         obs, reward, done, info = env.step(action)
         if done:
             obs = env.reset()
+        print(f'\robs.shape={obs.shape}', end='', flush=True)
 
         screen.fill((10, 10, 15))
         surface = pygame.surfarray.make_surface(np.swapaxes(obs, 0, 1))
@@ -405,6 +407,7 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
     h, w, _ = obs.shape
     game_w = w * scale
     game_h = h * scale
+    print(f'Resolution: {game_w}x{game_h} (native {w}x{h}, scale {scale}x)')
 
     # Check for WRAM support
     show_wram = len(env.get_ram()) > WRAM_OFFSET + WRAM_SIZE // 2
@@ -441,6 +444,7 @@ def _run_retro_pygame(name, path, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decode
         )
         if terminated or truncated:
             obs, _info = env.reset()
+        print(f'\robs.shape={obs.shape}', end='', flush=True)
 
         screen.fill((10, 10, 15))
         surface = pygame.surfarray.make_surface(np.swapaxes(obs, 0, 1))
@@ -652,6 +656,7 @@ def _run_retro(name, path, scale=DEFAULT_SCALE):
                      use_restricted_actions=retro.Actions.ALL)
     obs, _info = env.reset()
     h, w, _ = obs.shape
+    print(f'Resolution: {w * scale}x{h * scale} (native {w}x{h}, scale {scale}x)')
 
     # First step triggers viewer creation
     obs, *_ = env.step(np.zeros(9, dtype=np.int8))
@@ -717,6 +722,7 @@ def _run_retro(name, path, scale=DEFAULT_SCALE):
         )
         if terminated or truncated:
             obs, _info = env.reset()
+        print(f'\robs.shape={obs.shape}', end='', flush=True)
 
         elapsed = time.monotonic() - t0
         if elapsed < target_dt:

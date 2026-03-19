@@ -75,7 +75,7 @@ def ssh_base_args(worker: Worker) -> list[str]:
     return [
         "ssh", "-p", str(worker.port),
         "-o", "StrictHostKeyChecking=accept-new",
-        "-i", "~/.ssh/id_wtf",
+        "-i", "~/.ssh/id_ed25519",
     ]
 
 
@@ -103,7 +103,7 @@ def rsync_to(
     """Rsync local files/dirs to a remote worker."""
     if isinstance(local_srcs, str):
         local_srcs = [local_srcs]
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_wtf"]
+    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519"]
     if extra_args:
         cmd.extend(extra_args)
     cmd.extend(local_srcs)
@@ -118,7 +118,7 @@ def rsync_from(
     *,
     extra_args: list[str] | None = None,    capture: bool = False,) -> subprocess.CompletedProcess:
     """Rsync files from a remote worker to local."""
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_wtf"]
+    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519"]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(f"{worker.remote}:{remote_src}")

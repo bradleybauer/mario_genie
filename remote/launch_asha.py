@@ -30,6 +30,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -191,12 +192,10 @@ def build_worker_script(
             f"--run-name {trial.run_name}",
             f"--model {trial.model_name}",
             f"--batch-size {trial.batch_size}",
-            # "--auto-batch-size",
-            # f"--max-batch-size {trial.batch_size}",
-            f"--batch-size {trial.batch_size}",
             f"--max-steps {rung_steps}",
             f"--total-steps {max_rung_steps}",
-            "--eval-samples 3000",
+            "--eval-samples 5000",
+            "--crop-224"
         ]
 
         # Resume from checkpoint if one exists on the remote
@@ -216,90 +215,131 @@ def build_worker_script(
     return "\n".join(lines)
 
 
-def launch_rung_on_workers(
-    workers: list[Worker],
-    trials_by_worker: dict[str, list[Trial]],
-    rung_steps: int,
-    max_rung_steps: int,
-    sweep_dir: str,
-    extra_args: str,
-    session: str = TMUX_SESSION,
-) -> None:
-    """Upload scripts and launch training on all workers for one rung."""
-    for worker in workers:
-        worker_trials = trials_by_worker.get(worker.name, [])
-        if not worker_trials:
-            continue
-
-        script = build_worker_script(
-            worker, worker_trials, rung_steps, max_rung_steps,
-            sweep_dir, extra_args,
-        )
-
-        remote_script = f"{worker.project_dir}/run_asha_rung.sh"
-        ssh(worker, f"cat > {remote_script} && chmod +x {remote_script}",
-            input=script)
-
-        # Kill existing session and start fresh — use send-keys instead of
-        # passing the command to new-session, which can silently hang over SSH
-        ssh(worker, f"tmux kill-session -t {session} 2>/dev/null || true", check=False)
-        ssh(worker, f"tmux new-session -d -s {session}")
-        ssh(worker, f"tmux send-keys -t {session} 'exec bash {remote_script}' Enter")
-        print(f"    [{worker.name}] launched {len(worker_trials)} trial(s)")
-
-
-def wait_for_workers(
-    workers: list[Worker],
-    trials_by_worker: dict[str, list[Trial]],
-    poll_interval: float = 30,
-    session: str = TMUX_SESSION,
-) -> None:
-    """Block until all workers' tmux sessions finish."""
-    active_workers = [
-        w for w in workers if trials_by_worker.get(w.name)
-    ]
-    if not active_workers:
-        return
-
-    print(f"    Waiting for {len(active_workers)} worker(s) ...")
-    last_status_print = 0.0
-    while active_workers:
-        time.sleep(poll_interval)
-        still_running = []
-        for w in active_workers:
-            if is_tmux_running(w, session):
-                still_running.append(w)
-            else:
-                print(f"    [{w.name}] done")
-        active_workers = still_running
-        if active_workers and time.time() - last_status_print >= 900:
-            names = ", ".join(w.name for w in active_workers)
-            print(f"    Still running: {names}")
-            last_status_print = time.time()
-
-
-def pull_metrics(
+def pull_results(
     workers: list[Worker],
     sweep_dir: str,
     local_results_dir: str,
+    *,
+    images: bool = False,
 ) -> None:
-    """Rsync metrics JSON files from all workers to local results dir."""
+    """Rsync results from workers to local.  Optionally include images."""
     os.makedirs(local_results_dir, exist_ok=True)
+
+    includes = ["--include=*/", "--include=*.json"]
+    if images:
+        includes.append("--include=*.png")
+    includes.append("--exclude=*")
 
     def fetch(worker):
         rsync_from(
             worker,
             f"{worker.project_dir}/{sweep_dir}/",
             local_results_dir + "/",
-            extra_args=[
-                "--include=*/",
-                "--include=*.json",
-                "--exclude=*",
-            ],
+            extra_args=includes,
             capture=True,
         )
 
-    run_on_all(workers, fetch, desc="pull metrics")
+    run_on_all(workers, fetch, desc="pull results")
+
+
+def run_rung_dynamic(
+    workers: list[Worker],
+    trials: list[Trial],
+    rung_steps: int,
+    max_rung_steps: int,
+    sweep_dir: str,
+    extra_args: str,
+    local_results: str,
+    poll_interval: float = 900,
+    session: str = TMUX_SESSION,
+) -> None:
+    """Dynamically assign trials to idle workers one at a time.
+
+    Every *poll_interval* seconds (default 15 min) the scheduler checks
+    which workers are idle, pulls results (including images), and feeds
+    the next queued trial to any free worker.
+    """
+    worker_by_name = {w.name: w for w in workers}
+
+    # Sticky trials (have a checkpoint on a specific worker) get priority
+    # on that worker.  Everything else goes into a shared flexible queue.
+    sticky: dict[str, deque[Trial]] = {w.name: deque() for w in workers}
+    flexible: deque[Trial] = deque()
+    for t in trials:
+        if t.worker_name and t.worker_name in worker_by_name:
+            sticky[t.worker_name].append(t)
+        else:
+            flexible.append(t)
+
+    running: dict[str, Trial] = {}  # worker_name → active trial
+    total = len(trials)
+    completed = 0
+
+    def pick_trial(worker_name: str) -> Trial | None:
+        """Prefer sticky trials for this worker, then flexible, then steal."""
+        if sticky[worker_name]:
+            return sticky[worker_name].popleft()
+        if flexible:
+            return flexible.popleft()
+        for wn, q in sticky.items():
+            if wn != worker_name and q:
+                return q.popleft()
+        return None
+
+    def launch_one(worker: Worker, trial: Trial) -> None:
+        trial.worker_name = worker.name
+        script = build_worker_script(
+            worker, [trial], rung_steps, max_rung_steps,
+            sweep_dir, extra_args,
+        )
+        remote_script = f"{worker.project_dir}/run_asha_rung.sh"
+        ssh(worker, f"cat > {remote_script} && chmod +x {remote_script}",
+            input=script)
+        ssh(worker, f"tmux kill-session -t {session} 2>/dev/null || true",
+            check=False)
+        ssh(worker, f"tmux new-session -d -s {session} bash {remote_script}")
+        running[worker.name] = trial
+        print(f"    [{worker.name}] started {trial.run_name}")
+
+    # ── Initial assignment ────────────────────────────────────────
+    for worker in workers:
+        trial = pick_trial(worker.name)
+        if trial:
+            launch_one(worker, trial)
+
+    if not running:
+        return
+
+    # ── Poll loop ─────────────────────────────────────────────────
+    while running:
+        time.sleep(poll_interval)
+
+        # Pull results (with images) from all workers
+        print(f"\n  Pulling results (with images) ...")
+        pull_results(workers, sweep_dir, local_results, images=True)
+
+        # Detect finished workers
+        newly_idle = [
+            wn for wn in list(running)
+            if not is_tmux_running(worker_by_name[wn], session)
+        ]
+
+        for wn in newly_idle:
+            trial = running.pop(wn)
+            completed += 1
+            print(f"    [{wn}] finished {trial.run_name}  ({completed}/{total})")
+            next_trial = pick_trial(wn)
+            if next_trial:
+                launch_one(worker_by_name[wn], next_trial)
+
+        if running:
+            queued = len(flexible) + sum(len(q) for q in sticky.values())
+            status = ", ".join(f"{wn}:{running[wn].run_name}" for wn in running)
+            print(f"    Active: {status}  |  queued: {queued}")
+
+    # Final pull to ensure everything is synced
+    print(f"\n  Final results pull ...")
+    pull_results(workers, sweep_dir, local_results, images=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────
@@ -313,15 +353,14 @@ def main() -> None:
             "to train_magvit.py."
         ),
     )
+    parser.add_argument("sweep_name", nargs="?", default="asha_sweep",
+                        help="Sweep name — sets remote dir (checkpoints/<name>) "
+                             "and local dir (results/<name>)")
     parser.add_argument("--data-dir", default="data/",
                         help="Data dir on remote machines (default: data/)")
-    parser.add_argument("--sweep-dir", default="checkpoints/asha_sweep",
-                        help="Sweep output dir on remote machines")
-    parser.add_argument("--local-results", default=None,
-                        help="Local dir for metrics (default: results/asha_sweep)")
     parser.add_argument(
-        "--rungs", type=str, default="18000,54000,162000",
-        help="Comma-separated step budgets (default: 18000,54000,162000)",
+        "--rungs", type=str, default="30000,60000,180000",
+        help="Comma-separated step budgets (default: 30000,60000,180000)",
     )
     parser.add_argument(
         "--reduction-factor", type=int, default=2,
@@ -333,10 +372,14 @@ def main() -> None:
     )
     parser.add_argument("--filter", type=str, default=None,
                         help="Only run models whose name contains this substring")
+    parser.add_argument("--models", type=str, default=None,
+                        help="Comma-separated list of exact model names to run")
+    parser.add_argument("--include-1t", action="store_true",
+                        help="Also include _1t variants of selected models")
     parser.add_argument("--workers", type=str, default=None,
                         help="Comma-separated worker names (default: all)")
-    parser.add_argument("--poll-interval", type=float, default=30,
-                        help="Seconds between completion polls (default: 30)")
+    parser.add_argument("--poll-interval", type=float, default=900,
+                        help="Seconds between idle checks and result pulls (default: 900 = 15 min)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from saved sweep state")
     parser.add_argument("--session", type=str, default=TMUX_SESSION,
@@ -352,7 +395,8 @@ def main() -> None:
     eta = args.reduction_factor
     max_rung_steps = rungs[-1]
 
-    local_results = args.local_results or str(PROJECT_ROOT / "results" / "asha_sweep")
+    sweep_dir = f"checkpoints/{args.sweep_name}"
+    local_results = str(PROJECT_ROOT / "results" / args.sweep_name)
     state_path = os.path.join(local_results, STATE_FILENAME)
 
     workers = load_workers(parse_worker_names(args.workers))
@@ -360,17 +404,31 @@ def main() -> None:
 
     # ── Build trial list with sticky worker assignment ───────────
     configs = MODEL_CONFIGS.copy()
-    if args.filter:
-        configs = [c for c in configs if args.filter in c.name]
-        if not configs:
-            print(f"No models match filter '{args.filter}'.")
+    if args.models:
+        names = set(n.strip() for n in args.models.split(","))
+        if args.include_1t:
+            names |= {n + "_1t" for n in names if not n.endswith("_1t")}
+        configs = [c for c in configs if c.name in names]
+        missing = names - {c.name for c in configs}
+        if missing:
+            print(f"Unknown model(s): {', '.join(sorted(missing))}")
             sys.exit(1)
+    elif args.filter:
+        configs = [c for c in configs if args.filter in c.name]
+    if args.include_1t and not args.models:
+        # With --filter or no filter, add _1t variants of matched configs
+        base_names = {c.name for c in configs}
+        t1_names = {n + "_1t" for n in base_names if not n.endswith("_1t")}
+        extras = [c for c in MODEL_CONFIGS if c.name in t1_names and c.name not in base_names]
+        configs.extend(extras)
+    if not configs:
+        print(f"No models matched.")
+        sys.exit(1)
 
-    # Cost-aware worker assignment: estimate per-model GPU cost from
-    # param count and bin-pack trials onto workers using LPT (Longest
-    # Processing Time first) to equalise total estimated load.
-    print("Estimating model param counts for cost-aware assignment ...")
+    # Estimate param counts for display; sort so expensive trials start first
+    print("Estimating model param counts ...")
     param_counts = estimate_param_counts(configs)
+    configs.sort(key=lambda c: (not c.name.endswith("_1t"), -param_counts.get(c.name, 0)))
 
     trials: list[Trial] = []
     for mc in configs:
@@ -378,18 +436,8 @@ def main() -> None:
             model_name=mc.name,
             batch_size=batch_size,
             run_name=mc.name,
-            worker_name="",  # assigned below
+            worker_name="",  # assigned dynamically
         ))
-
-    # LPT bin-packing: sort by cost descending, greedily assign to
-    # the least-loaded worker.
-    trials.sort(key=lambda t: param_counts.get(t.model_name, 0), reverse=True)
-    worker_load: dict[str, int] = {name: 0 for name in worker_names}
-    for trial in trials:
-        cost = param_counts.get(trial.model_name, 0)
-        target = min(worker_load, key=lambda w: worker_load[w])
-        trial.worker_name = target
-        worker_load[target] += cost
 
     # ── Resume ───────────────────────────────────────────────────
     os.makedirs(local_results, exist_ok=True)
@@ -418,7 +466,7 @@ def main() -> None:
 
         def clean_worker(worker):
             ssh(worker, f"tmux kill-session -t {args.session} 2>/dev/null || true", check=False)
-            ssh(worker, f"rm -rf {worker.project_dir}/{args.sweep_dir}")
+            ssh(worker, f"rm -rf {worker.project_dir}/{sweep_dir}")
 
         run_on_all(workers, clean_worker, desc="clean remote")
 
@@ -438,22 +486,16 @@ def main() -> None:
         plan_budget += n_alive * (r - prev)
         n_alive = max(1, math.ceil(n_alive / eta))
 
-    worker_counts: dict[str, int] = {}
-    worker_cost: dict[str, int] = {}
-    for t in trials:
-        worker_counts[t.worker_name] = worker_counts.get(t.worker_name, 0) + 1
-        worker_cost[t.worker_name] = worker_cost.get(t.worker_name, 0) + param_counts.get(t.model_name, 0)
+    total_params = sum(param_counts.get(t.model_name, 0) for t in trials)
 
     print(f"\nDistributed ASHA Sweep")
     print(f"  Workers:       {worker_names}")
-    print(f"  Trials:        {n_trials} ({len(configs)} models, bs≤{batch_size} auto-sized)")
-    print(f"  Assignment:    {worker_counts}")
-    print(f"  Cost balance:  {{"
-          + ", ".join(f"{w}: {worker_cost.get(w,0)/1e6:.1f}M params" for w in worker_names)
-          + "}")
+    print(f"  Trials:        {n_trials} ({len(configs)} models, bs≤{batch_size})")
+    print(f"  Allocation:    dynamic (largest models first)")
+    print(f"  Total params:  {total_params/1e6:.1f}M across {n_trials} trials")
     print(f"  Rungs:         {rungs}")
     print(f"  Reduction (η): {eta}")
-    print(f"  Batch size:    ≤{batch_size} (auto-sized)")
+    print(f"  Batch size:    ≤{batch_size}")
     print(f"  Est. budget:   {plan_budget:,} total steps  "
           f"(vs {n_trials * max_rung_steps:,} exhaustive)")
     if extra_args_str:
@@ -484,32 +526,14 @@ def main() -> None:
         print(f"{'=' * 64}")
 
         if to_train:
-            # Group by worker
-            trials_by_worker: dict[str, list[Trial]] = {}
-            for t in to_train:
-                trials_by_worker.setdefault(t.worker_name, []).append(t)
-
-            for wn, wt in trials_by_worker.items():
-                print(f"    [{wn}] {len(wt)} trial(s)")
-
-            # Launch on all workers
-            launch_rung_on_workers(
-                workers, trials_by_worker,
+            run_rung_dynamic(
+                workers, to_train,
                 rung_steps, max_rung_steps,
-                args.sweep_dir, extra_args_str,
-                session=args.session,
-            )
-
-            # Wait for all workers to finish
-            wait_for_workers(
-                workers, trials_by_worker,
+                sweep_dir, extra_args_str,
+                local_results,
                 poll_interval=args.poll_interval,
                 session=args.session,
             )
-
-            # Pull metrics
-            print(f"\n  Pulling metrics ...")
-            pull_metrics(workers, args.sweep_dir, local_results)
 
         # Read metrics and update trials
         for t in active:

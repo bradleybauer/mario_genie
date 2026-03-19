@@ -37,6 +37,7 @@ def build_open_genie_layers(
     residual_blocks: tuple[int, int, int, int, int],
     *,
     use_attention: bool = False,
+    temporal_compressions: int = 2,
 ) -> str:
     """Approximate the Open-Genie MAGVIT hierarchy with MAGVIT-2 layer primitives.
 
@@ -57,7 +58,7 @@ def build_open_genie_layers(
         f"compress_space:{stage2_dim}",
         *attention_layers,
         f"consecutive_residual:{blocks_3}",
-        f"compress_time:{stage3_dim}",
+        *([] if temporal_compressions < 2 else [f"compress_time:{stage3_dim}"]),
         f"compress_space:{stage3_dim}",
         *attention_layers,
         f"consecutive_residual:{blocks_4}",
@@ -67,7 +68,7 @@ def build_open_genie_layers(
     return ",".join(layers)
 
 
-def build_vanilla_layers(init_dim: int) -> str:
+def build_vanilla_layers(init_dim: int, *, temporal_compressions: int = 2) -> str:
     """Simple residual + compress_space + compress_time architecture.
 
     Four spatial compressions (256 → 16) and two temporal compressions
@@ -82,7 +83,7 @@ def build_vanilla_layers(init_dim: int) -> str:
         f"compress_time:{dim2}",
         f"compress_space:{dim2}",
         f"residual:{dim4}",
-        f"compress_time:{dim4}",
+        *([] if temporal_compressions < 2 else [f"compress_time:{dim4}"]),
         f"compress_space:{dim4}",
         f"residual:{dim4}",
         f"compress_space:{dim4}",
@@ -112,30 +113,39 @@ CODEBOOK_SIZES = [65536, 4096]
 
 # ── Generated registry ────────────────────────────────────────────
 
+TEMPORAL_VARIANTS = [2, 1]
+
+
+def _temporal_suffix(t: int) -> str:
+    return "" if t == 2 else "_1t"
+
+
 MODEL_CONFIGS: list[ModelConfig] = [
     # Vanilla (residual + compress_space + compress_time)
     *(
         ModelConfig(
-            name=f"dim{dim}_cb{cb}_vanilla",
+            name=f"dim{dim}_cb{cb}_vanilla{_temporal_suffix(t)}",
             init_dim=dim,
             codebook_size=cb,
-            layers=build_vanilla_layers(dim),
+            layers=build_vanilla_layers(dim, temporal_compressions=t),
             scale_name="vanilla",
             attention_name="plain",
         )
         for dim in DIMS
         for cb in CODEBOOK_SIZES
+        for t in TEMPORAL_VARIANTS
     ),
     # Open-Genie variants
     *(
         ModelConfig(
-            name=f"dim{dim}_cb{cb}_{scale.name}{variant.suffix}",
+            name=f"dim{dim}_cb{cb}_{scale.name}{variant.suffix}{_temporal_suffix(t)}",
             init_dim=dim,
             codebook_size=cb,
             layers=build_open_genie_layers(
                 dim,
                 scale.residual_blocks,
                 use_attention=variant.enabled,
+                temporal_compressions=t,
             ),
             scale_name=scale.name,
             attention_name=variant.name,
@@ -144,6 +154,7 @@ MODEL_CONFIGS: list[ModelConfig] = [
         for cb in CODEBOOK_SIZES
         for scale in SCALE_CONFIGS.values()
         for variant in ATTENTION_VARIANTS.values()
+        for t in TEMPORAL_VARIANTS
     ),
 ]
 
