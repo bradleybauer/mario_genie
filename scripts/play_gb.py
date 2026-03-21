@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mario-land", action="store_true", help="Filter ROM selection to Super Mario Land titles.")
     parser.add_argument("--list", action="store_true", help="List discovered ROMs and exit.")
     parser.add_argument("--save", action="store_true", help="Persist cartridge save RAM on exit.")
-    parser.add_argument("--mute", action="store_true", help="Disable sound.")
+    parser.add_argument("--sound", action="store_true", help="Enable sound (off by default due to WSL2 choppiness).")
     return parser
 
 
@@ -256,11 +256,11 @@ def frame_to_surface(frame: np.ndarray) -> pygame.Surface:
     return pygame.surfarray.make_surface(np.swapaxes(rgb, 0, 1))
 
 
-def run_game(name: str, path: str, *, scale: int, force_dmg: bool, save: bool, mute: bool = False) -> None:
+def run_game(name: str, path: str, *, scale: int, force_dmg: bool, save: bool, sound: bool = False) -> None:
     _source_name, rom_path, temp_dir = materialize_rom(path)
     pyboy = None
     try:
-        sound_enabled = not mute
+        sound_enabled = sound
         kwargs = dict(
             window="SDL2",
             scale=1,
@@ -297,6 +297,7 @@ def run_game(name: str, path: str, *, scale: int, force_dmg: bool, save: bool, m
         print(f"Loading {name} ({mode_name}) ...")
         print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc=Quit")
         print(f"Resolution: {game_w}x{game_h} (native {width}x{height}, scale {scale}x)")
+        print(f"Obs shape: {frame.shape}")
 
         try:
             running = True
@@ -371,7 +372,7 @@ def main() -> None:
         except (FileNotFoundError, ValueError) as exc:
             print(exc)
             raise SystemExit(2) from exc
-        run_game(name, path, scale=args.scale, force_dmg=not args.cgb, save=args.save, mute=args.mute)
+        run_game(name, path, scale=args.scale, force_dmg=not args.cgb, save=args.save, sound=args.sound)
         return
 
     all_roms = discover_roms()
@@ -407,7 +408,7 @@ def main() -> None:
         query = "super mario land"
 
     name, path = choose_rom(roms, query=query)
-    run_game(name, path, scale=args.scale, force_dmg=not args.cgb, save=args.save, mute=args.mute)
+    run_game(name, path, scale=args.scale, force_dmg=not args.cgb, save=args.save, sound=args.sound)
 
 
 if __name__ == "__main__":

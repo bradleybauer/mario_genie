@@ -23,7 +23,7 @@ if str(SRC_DIR) not in sys.path:
 
 from torchvision.utils import save_image
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, LambdaLR
 
 from tqdm import tqdm
 
@@ -298,6 +298,11 @@ def train():
         ),
     )
     parser.add_argument(
+        "--constant-lr", action="store_true",
+        help="Use a constant learning rate (no warmup or cosine decay). "
+             "On resume, the scheduler state is not restored.",
+    )
+    parser.add_argument(
         "--resume-from", type=str, default=None,
         help="Path to training_state.pt to resume training from.",
     )
@@ -512,32 +517,38 @@ def train():
 
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
-    # ── LR schedule: linear warmup → cosine decay to 10 % of peak ────
+    # ── LR schedule ──────────────────────────────────────────────────
     max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
-    min_lr = args.lr * 0.25
-    warmup_steps = args.warmup_steps
 
-    # Estimate total training steps for the cosine T_max
-    total_steps_for_schedule = args.total_steps or args.max_steps
-    if total_steps_for_schedule > 0:
-        estimated_total = max(total_steps_for_schedule, warmup_steps + 100)
-    elif max_seconds > 0:
-        estimated_total = max(int(max_seconds * 5), warmup_steps + 100)
+    if args.constant_lr:
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+        print(f"[lr] Constant LR = {args.lr}")
     else:
-        estimated_total = 100_000
-    decay_steps = max(estimated_total - warmup_steps, 1)
+        # Linear warmup → cosine decay to 25 % of peak
+        min_lr = args.lr * 0.25
+        warmup_steps = args.warmup_steps
 
-    warmup_scheduler = LinearLR(
-        optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
-    )
-    decay_scheduler = CosineAnnealingLR(
-        optimizer, T_max=decay_steps, eta_min=min_lr
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, decay_scheduler],
-        milestones=[warmup_steps],
-    )
+        # Estimate total training steps for the cosine T_max
+        total_steps_for_schedule = args.total_steps or args.max_steps
+        if total_steps_for_schedule > 0:
+            estimated_total = max(total_steps_for_schedule, warmup_steps + 100)
+        elif max_seconds > 0:
+            estimated_total = max(int(max_seconds * 5), warmup_steps + 100)
+        else:
+            estimated_total = 100_000
+        decay_steps = max(estimated_total - warmup_steps, 1)
+
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps
+        )
+        decay_scheduler = CosineAnnealingLR(
+            optimizer, T_max=decay_steps, eta_min=min_lr
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, decay_scheduler],
+            milestones=[warmup_steps],
+        )
 
     # Save config for reproducibility
     config = vars(args).copy()
@@ -566,7 +577,19 @@ def train():
         unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
         unwrapped.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
+        if not args.constant_lr:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        else:
+            # Rebuild the constant scheduler *after* optimizer restore so it
+            # locks in the checkpoint's last LR as its base_lr.
+            # We must overwrite initial_lr (set by the original scheduler and
+            # saved inside the optimizer state_dict) so that LambdaLR picks up
+            # the current decayed LR rather than the original peak LR.
+            resumed_lr = optimizer.param_groups[0]['lr']
+            for pg in optimizer.param_groups:
+                pg['initial_lr'] = pg['lr']
+            scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+            print(f"[resume] Constant LR locked to checkpoint value: {resumed_lr:.6e}")
         start_step = ckpt['global_step']
         print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
 
