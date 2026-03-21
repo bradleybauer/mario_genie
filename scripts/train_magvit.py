@@ -303,8 +303,16 @@ def train():
              "On resume, the scheduler state is not restored.",
     )
     parser.add_argument(
+        "--checkpoint-interval", type=int, default=0,
+        help=(
+            "Save weights and run eval every this many steps (0 = disabled). "
+            "Checkpoints are saved as training_state_latest.pt and periodic eval "
+            "metrics are appended to metrics.json."
+        ),
+    )
+    parser.add_argument(
         "--resume-from", type=str, default=None,
-        help="Path to training_state.pt to resume training from.",
+        help="Path to a training_state*.pt file to resume training from.",
     )
     parser.add_argument(
         "--crop-240",
@@ -639,12 +647,14 @@ def train():
     smooth_alpha = 0.95
     smoothed_recon = None
     best_smoothed_recon = float('inf')
+    best_eval_recon = float('inf')
     last_improvement_time = time.time()
     last_image_time = 0.0
 
     if args.resume_from and ckpt is not None:
         smoothed_recon = ckpt.get('smoothed_recon')
         best_smoothed_recon = ckpt.get('best_smoothed_recon', float('inf'))
+        best_eval_recon = ckpt.get('best_eval_recon', float('inf'))
         metrics_log = ckpt.get('metrics_log', [])
         _perf_sample_count = ckpt.get('total_samples', 0)
 
@@ -675,6 +685,60 @@ def train():
         return codes, codebook_usage
 
     tokenizer.train()
+
+    def run_eval(eval_ds, step_label):
+        """Run eval pass on eval_ds. Returns dict of eval metrics."""
+        eval_loader = DataLoader(
+            eval_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, pin_memory=False,
+        )
+        tokenizer.eval()
+        eval_losses = []
+        code_counts = torch.zeros(mc.codebook_size, dtype=torch.long)
+        total_pixels = 0
+        correct_pixels = 0
+        last_eval_batch = None
+        with torch.no_grad():
+            for eval_batch in tqdm(eval_loader, desc=f"Eval@{step_label}", leave=False):
+                eval_batch = eval_batch.to(device, non_blocking=True)
+                last_eval_batch = eval_batch
+                targets = eval_batch.long()
+                inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
+                codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
+                recon_video = tokenizer.decode_from_code_indices(
+                    codes, video_contains_first_frame=video_contains_first_frame,
+                )
+                del codes, inp
+                eval_losses.append(F.cross_entropy(recon_video, targets).item())
+                recon_idx = recon_video.argmax(dim=1)
+                total_pixels += targets.numel()
+                correct_pixels += (recon_idx == targets).sum().item()
+                del recon_video, recon_idx, targets
+
+        eval_recon_loss = sum(eval_losses) / len(eval_losses)
+        pixel_accuracy = correct_pixels / max(total_pixels, 1)
+        unique_codes_n = (code_counts > 0).sum().item()
+        codebook_utilization = unique_codes_n / mc.codebook_size
+        code_probs = code_counts[code_counts > 0].float() / code_counts.sum()
+        code_entropy = -(code_probs * code_probs.log2()).sum().item()
+        max_entropy = math.log2(mc.codebook_size)
+
+        print(f"Eval recon_loss: {eval_recon_loss:.6f} ({len(eval_ds)} samples, {len(eval_losses)} batches)")
+        print(f"Eval pixel_accuracy: {pixel_accuracy:.4f}")
+        print(f"Eval codebook: {unique_codes_n}/{mc.codebook_size} codes used "
+              f"({codebook_utilization:.1%}), entropy={code_entropy:.2f}/{max_entropy:.2f} bits")
+
+        tokenizer.train()
+        return {
+            "eval_recon_loss": eval_recon_loss,
+            "eval_pixel_accuracy": round(pixel_accuracy, 6),
+            "eval_codebook_used": unique_codes_n,
+            "eval_codebook_size": mc.codebook_size,
+            "eval_codebook_utilization": round(codebook_utilization, 4),
+            "eval_code_entropy_bits": round(code_entropy, 4),
+            "eval_max_entropy_bits": round(max_entropy, 4),
+        }, last_eval_batch, code_counts
 
     def batch_iter():
         """Yields batches: GPU cache > DataLoader."""
@@ -805,11 +869,15 @@ def train():
         # ── Periodic logging & image saves ───────────────────────────
         if global_step % args.val_interval == 0:
             gs = _gpu_stats()
+            qlb = loss_breakdown.quantizer_loss_breakdown
             step_metrics = {
                 "step": global_step,
                 "loss": loss.item(),
                 "recon_loss": recon,
                 "lfq_aux_loss": aux_loss,
+                "lfq_per_sample_entropy": qlb.per_sample_entropy.item() if qlb is not None else 0.0,
+                "lfq_batch_entropy": qlb.batch_entropy.item() if qlb is not None else 0.0,
+                "lfq_commitment": qlb.commitment.item() if qlb is not None else 0.0,
                 "smoothed_recon_loss": smoothed_recon,
                 "best_smoothed_recon": best_smoothed_recon,
                 "lr": current_lr,
@@ -834,6 +902,49 @@ def train():
             with open(metrics_path, 'w') as f:
                 json.dump(metrics_log, f, indent=2)
 
+        # ── Periodic checkpoint & eval ───────────────────────────────
+        if (args.checkpoint_interval > 0
+                and global_step > 0
+                and global_step % args.checkpoint_interval == 0):
+            print(f"\n[checkpoint] Saving latest weights at step {global_step}")
+            unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
+            _ckpt_sd = unwrapped.state_dict()
+            torch.save(_ckpt_sd, os.path.join(args.output_dir, "magvit2_latest.pt"))
+            _training_state = {
+                'model': _ckpt_sd,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'global_step': global_step,
+                'smoothed_recon': smoothed_recon,
+                'best_smoothed_recon': best_smoothed_recon,
+                'best_eval_recon': best_eval_recon,
+                'metrics_log': metrics_log,
+                'total_samples': _perf_sample_count,
+            }
+            torch.save(_training_state, os.path.join(args.output_dir, "training_state_latest.pt"))
+
+            if eval_dataset is not None:
+                eval_stats, _, _ = run_eval(eval_dataset, global_step)
+                # Append eval stats to the most recent metrics entry
+                if metrics_log and metrics_log[-1].get("step") == global_step:
+                    metrics_log[-1].update(eval_stats)
+                else:
+                    eval_entry = {"step": global_step, "elapsed_s": round(time.time() - train_start, 2)}
+                    eval_entry.update(eval_stats)
+                    metrics_log.append(eval_entry)
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics_log, f, indent=2)
+
+                # Save best checkpoint if eval loss improved
+                if eval_stats["eval_recon_loss"] < best_eval_recon:
+                    best_eval_recon = eval_stats["eval_recon_loss"]
+                    torch.save(_ckpt_sd, os.path.join(args.output_dir, "magvit2_best.pt"))
+                    _training_state['best_eval_recon'] = best_eval_recon
+                    torch.save(_training_state, os.path.join(args.output_dir, "training_state_best.pt"))
+                    print(f"[checkpoint] New best eval_recon_loss={best_eval_recon:.6f} → saved *_best.pt")
+
+            del _ckpt_sd, _training_state
+
         global_step += 1
 
     # Always record the final state so sweep readers see the terminal smoothed_recon
@@ -845,16 +956,22 @@ def train():
         return
 
     gs = _gpu_stats()
+    qlb = loss_breakdown.quantizer_loss_breakdown
     final_metrics = {
         "step": global_step,
         "loss": loss.item(),
         "recon_loss": recon,
         "lfq_aux_loss": aux_loss,
+        "lfq_per_sample_entropy": qlb.per_sample_entropy.item() if qlb is not None else 0.0,
+        "lfq_batch_entropy": qlb.batch_entropy.item() if qlb is not None else 0.0,
+        "lfq_commitment": qlb.commitment.item() if qlb is not None else 0.0,
         "smoothed_recon_loss": smoothed_recon,
         "best_smoothed_recon": best_smoothed_recon,
         "lr": optimizer.param_groups[0]['lr'],
         "elapsed_s": round(total_elapsed, 2),
         "samples_per_sec": round(_perf_sample_count / max(total_elapsed, 1e-9), 1),
+        "data_throughput_mbps": round(_perf_sample_count / max(total_elapsed, 1e-9) * _bytes_per_sample / 2**20, 1),
+        "steps_per_sec": round(_perf_step_count / max(total_elapsed, 1e-9), 2),
         "total_samples": _perf_sample_count,
         "total_steps": _perf_step_count,
         **gs,
@@ -868,8 +985,8 @@ def train():
     # Keep a reference for final reconstruction before cleanup
     final_recon_batch = batch
 
-    # ── Save checkpoint & final reconstruction ───────────────────────
-    ckpt_path = os.path.join(args.output_dir, "magvit2_best.pt")
+    # ── Save latest checkpoint & final reconstruction ────────────────
+    ckpt_path = os.path.join(args.output_dir, "magvit2_latest.pt")
     unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
     model_sd = unwrapped.state_dict()
     torch.save(model_sd, ckpt_path)
@@ -883,12 +1000,15 @@ def train():
         'global_step': global_step,
         'smoothed_recon': smoothed_recon,
         'best_smoothed_recon': best_smoothed_recon,
+        'best_eval_recon': best_eval_recon,
         'metrics_log': metrics_log,
         'total_samples': _perf_sample_count,
     }
-    state_path = os.path.join(args.output_dir, "training_state.pt")
+    state_path = os.path.join(args.output_dir, "training_state_latest.pt")
     torch.save(training_state, state_path)
     print(f"Training state saved to {state_path}")
+    _optimizer_sd = training_state['optimizer']
+    _scheduler_sd = training_state['scheduler']
     del training_state, model_sd
 
     # Free training-only objects before eval to reduce RSS
@@ -905,66 +1025,38 @@ def train():
 
     # ── Eval on held-out set ──────────────────────────────────────────
     if eval_dataset is not None:
-        eval_loader = DataLoader(
-            eval_dataset, batch_size=args.batch_size, shuffle=False,
-            num_workers=0, pin_memory=False,
-        )
-        tokenizer.eval()
-        eval_losses = []
-        code_counts = torch.zeros(mc.codebook_size, dtype=torch.long)
-        total_pixels = 0
-        correct_pixels = 0
-        with torch.no_grad():
-            for eval_batch in tqdm(eval_loader, desc="Evaluating"):
-                eval_batch = eval_batch.to(device, non_blocking=True)
-                targets = eval_batch.long()
-                inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
-                # Single encode → codes
-                codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-                code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
-                # Single decode → logits
-                recon_video = tokenizer.decode_from_code_indices(
-                    codes, video_contains_first_frame=video_contains_first_frame,
-                )
-                del codes, inp
-                # Recon loss (same as PaletteVideoTokenizer's cross-entropy)
-                eval_losses.append(F.cross_entropy(recon_video, targets).item())
-                # Pixel accuracy
-                recon_idx = recon_video.argmax(dim=1)  # (B, T, H, W)
-                total_pixels += targets.numel()
-                correct_pixels += (recon_idx == targets).sum().item()
-                del recon_video, recon_idx, targets
-
-        eval_recon_loss = sum(eval_losses) / len(eval_losses)
-        pixel_accuracy = correct_pixels / max(total_pixels, 1)
-
-        # Codebook analysis (from running bincount)
-        unique_codes_n = (code_counts > 0).sum().item()
-        codebook_utilization = unique_codes_n / mc.codebook_size
-        # Entropy of code distribution (bits)
-        code_probs = code_counts[code_counts > 0].float() / code_counts.sum()
-        code_entropy = -(code_probs * code_probs.log2()).sum().item()
-        max_entropy = math.log2(mc.codebook_size)
-
-        print(f"Eval recon_loss: {eval_recon_loss:.6f} ({len(eval_dataset)} samples, {len(eval_losses)} batches)")
-        print(f"Eval pixel_accuracy: {pixel_accuracy:.4f}")
-        print(f"Eval codebook: {unique_codes_n}/{mc.codebook_size} codes used "
-              f"({codebook_utilization:.1%}), entropy={code_entropy:.2f}/{max_entropy:.2f} bits")
-
-        eval_stats = {
-            "eval_recon_loss": eval_recon_loss,
-            "eval_pixel_accuracy": round(pixel_accuracy, 6),
-            "eval_codebook_used": unique_codes_n,
-            "eval_codebook_size": mc.codebook_size,
-            "eval_codebook_utilization": round(codebook_utilization, 4),
-            "eval_code_entropy_bits": round(code_entropy, 4),
-            "eval_max_entropy_bits": round(max_entropy, 4),
-        }
+        eval_stats, eval_batch, code_counts = run_eval(eval_dataset, "final")
         final_metrics.update(eval_stats)
         if metrics_log and metrics_log[-1].get("step") == global_step:
             metrics_log[-1].update(eval_stats)
         with open(metrics_path, 'w') as f:
             json.dump(metrics_log, f, indent=2)
+
+        # Save best checkpoint if final eval loss improved
+        if eval_stats["eval_recon_loss"] < best_eval_recon:
+            best_eval_recon = eval_stats["eval_recon_loss"]
+            unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
+            _best_sd = unwrapped.state_dict()
+            torch.save(_best_sd, os.path.join(args.output_dir, "magvit2_best.pt"))
+            torch.save({
+                'model': _best_sd,
+                'optimizer': _optimizer_sd,
+                'scheduler': _scheduler_sd,
+                'global_step': global_step,
+                'smoothed_recon': smoothed_recon,
+                'best_smoothed_recon': best_smoothed_recon,
+                'best_eval_recon': best_eval_recon,
+                'metrics_log': metrics_log,
+                'total_samples': _perf_sample_count,
+            }, os.path.join(args.output_dir, "training_state_best.pt"))
+            del _best_sd
+            print(f"[final] New best eval_recon_loss={best_eval_recon:.6f} → saved *_best.pt")
+
+        unique_codes_n = eval_stats["eval_codebook_used"]
+        codebook_utilization = eval_stats["eval_codebook_utilization"]
+        code_entropy = eval_stats["eval_code_entropy_bits"]
+        pixel_accuracy = eval_stats["eval_pixel_accuracy"]
+        eval_recon_loss = eval_stats["eval_recon_loss"]
 
         # Save codebook histogram
         try:

@@ -200,15 +200,16 @@ TODO
 
 # SMB3
 
-**Context:** 
+**Context:**
 I'm interested in building an smb3 world model as well (lol). I imagine this would be MUCH harder.
 One idea I had for how to make things easier would be to clean the data a bit.
 Specifically fixing flickering in the smb3 status bar and removing the max 8 sprite limit.
 The nes has certain limits on the max number of sprites that can appear on a scan line.
 If the game attempts to draw more than the max the sprites begin to flicker in time.
 I do not want the model to have to spend capacity to reverse engineer exactly how this flicker mechanic works.
+(Edit: I think I'll attempt super mario land 2 before smb3.)
 
-**Approach:** 
+**Approach:**
 The status bar flickering can be fixed by writing 5 bytes to the ROM file. The three `0xEA` bytes are 6502 NOP instructions, effectively disabling the code that caused the flicker. This will cause a minor floor-shaking glitch during the end credits.
 
 | Address   | Before | After  | Note |
@@ -222,7 +223,7 @@ The status bar flickering can be fixed by writing 5 bytes to the ROM file. The t
 To fix the sprite limit will require using a different emulator.
 A good candidate is Mesen which also emulates sound which would be neat to learn how to model (as if an smb3 world model was't ambitions enough lol)
 
-**Result:** 
+**Result:**
 Big TODO
 
 <br>
@@ -233,6 +234,9 @@ Big TODO
 **Context:** 
 The model is starting to learn the finer details in the dataset and unfortunately it's learning mid-frame spilt artifacts.
 ![mid-frame split](pictures/split.png)
+
+BTW here is an example of a "scene-cut". This one is "natural" meaning it represents real gameplay. In this case mario reached the flag pole in 4-1 and immediately advanced to 4-2.
+![scene-cut](pictures/scene-cut.gif)
 
 **Approach:** 
 Prompt claude more carefully for a script to find frame splits (and "unnatural" scene-cuts).
@@ -249,11 +253,11 @@ TODO
 
 # Title
 
-**Context:** 
+**Context:**
 
-**Approach:** 
+**Approach:**
 
-**Result:** 
+**Result:**
 
 
 Random picture of me and my mom (her name is claudette)

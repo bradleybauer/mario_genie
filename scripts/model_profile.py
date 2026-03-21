@@ -118,6 +118,16 @@ def main() -> None:
     parser.add_argument("--sequence-length", type=int, default=SEQUENCE_LENGTH)
     parser.add_argument("--num-palette-colors", type=int, default=23)
     parser.add_argument(
+        "--crop-240",
+        action="store_true",
+        help="Use 240x240 image size (center-crop from 256x256).",
+    )
+    parser.add_argument(
+        "--crop-224",
+        action="store_true",
+        help="Use 224x224 image size (center-crop from 256x256).",
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default=None,
@@ -145,6 +155,13 @@ def main() -> None:
         help="Optional path to save results as JSON.",
     )
     args = parser.parse_args()
+
+    if args.crop_240 and args.crop_224:
+        parser.error("--crop-240 and --crop-224 are mutually exclusive")
+    if args.crop_240:
+        args.image_size = 240
+    elif args.crop_224:
+        args.image_size = 224
 
     if args.list_models:
         for name in sorted(MODEL_CONFIGS_BY_NAME):

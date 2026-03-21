@@ -101,6 +101,8 @@ def show_viewer(folder_path, fps, scale):
     btn_next = Button(ax_next, "Next \u25b6")
     ax_pause = plt.axes([0.75, 0.05, 0.1, 0.05])
     btn_pause = Button(ax_pause, "Pause")
+    ax_save = plt.axes([0.14, 0.05, 0.1, 0.05])
+    btn_save = Button(ax_save, "Save GIF")
 
     def _switch_image(new_idx):
         new_idx = new_idx % len(image_paths)
@@ -144,6 +146,21 @@ def show_viewer(folder_path, fps, scale):
 
     btn_pause.on_clicked(on_pause)
 
+    def on_save(_event):
+        cur = all_frames[state["img_idx"]]
+        img_name = os.path.splitext(os.path.basename(image_paths[state["img_idx"]]))[0]
+        out_path = f"{folder_label}_{img_name}.gif"
+        pil_frames = [Image.fromarray(f) for f in cur]
+        pil_frames[0].save(
+            out_path, save_all=True, append_images=pil_frames[1:],
+            duration=int(1000 / fps), loop=0,
+        )
+        print(f"Saved {out_path}")
+        btn_save.label.set_text("Saved!")
+        fig.canvas.draw_idle()
+
+    btn_save.on_clicked(on_save)
+
     def animate(_i):
         cur = all_frames[state["img_idx"]]
         n_cur = len(cur)
@@ -166,27 +183,52 @@ def show_viewer(folder_path, fps, scale):
     plt.show()
 
 
+class _LazyRun:
+    """Stores paths eagerly, loads frames per-image on demand."""
+    __slots__ = ("paths", "_frames")
+
+    def __init__(self, paths):
+        self.paths = paths
+        self._frames = [None] * len(paths)
+
+    def frames(self, idx):
+        if self._frames[idx] is None:
+            self._frames[idx] = load_frames(self.paths[idx])
+        return self._frames[idx]
+
+
+def _discover_run(root, name):
+    """Return a _LazyRun for a subfolder, or None if no valid PNGs."""
+    folder = os.path.join(root, name)
+    try:
+        image_paths = collect_images(folder)
+    except FileNotFoundError:
+        return None
+    if not image_paths:
+        return None
+    return _LazyRun(image_paths)
+
+
 def show_combined(root, subfolders, fps, scale):
     """Single-window UI with run selector on the left and viewer on the right."""
-    # Pre-load all runs
-    run_data = {}
+    # Discover which subfolders have PNGs (cheap: just glob, no image loading)
+    available = []
     for name in subfolders:
         folder = os.path.join(root, name)
-        try:
-            image_paths = collect_images(folder)
-        except FileNotFoundError:
-            continue
-        loaded = [(p, load_frames(p)) for p in image_paths]
-        loaded = [(p, f) for p, f in loaded if f]
-        if loaded:
-            paths, frames = zip(*loaded)
-            run_data[name] = {"paths": list(paths), "frames": list(frames)}
+        if glob.glob(os.path.join(folder, "*.png")):
+            available.append(name)
 
-    if not run_data:
+    if not available:
         print(f"No valid reconstruction frames found under {root}")
         return
 
-    available = [name for name in subfolders if name in run_data]
+    # Lazy cache — runs are loaded on first access
+    run_cache = {}
+
+    def _get_run(name):
+        if name not in run_cache:
+            run_cache[name] = _discover_run(root, name)
+        return run_cache[name]
 
     state = {
         "run_idx": 0,
@@ -204,8 +246,9 @@ def show_combined(root, subfolders, fps, scale):
     sidebar_needed_pts = sidebar_top_margin_pts + n_runs * (btn_h_pts + btn_gap_pts)
 
     # Viewer sizing from first run's first frame
-    first_run = run_data[available[0]]
-    fh, fw = first_run["frames"][0][0].shape[:2]
+    first_run = _get_run(available[0])
+    first_frame = first_run.frames(0)[0]
+    fh, fw = first_frame.shape[:2]
     viewer_w_pts = fw * scale
     viewer_h_pts = fh * scale + 80  # extra for controls
 
@@ -220,7 +263,7 @@ def show_combined(root, subfolders, fps, scale):
     ax_img = fig.add_axes([sidebar_frac + 0.02, 0.18, 1.0 - sidebar_frac - 0.04, 0.78])
     ax_img.set_axis_off()
 
-    first_frames = first_run["frames"][0]
+    first_frames = first_run.frames(0)
     im = ax_img.imshow(first_frames[0], interpolation="nearest")
     title = ax_img.set_title("", fontsize=10)
 
@@ -237,6 +280,8 @@ def show_combined(root, subfolders, fps, scale):
     btn_next = Button(ax_next, "Next \u25b6")
     ax_pause = fig.add_axes([ctrl_left + ctrl_w - 0.18, 0.05, 0.09, 0.05])
     btn_pause = Button(ax_pause, "Pause")
+    ax_save = fig.add_axes([ctrl_left + ctrl_w - 0.30, 0.05, 0.09, 0.05])
+    btn_save = Button(ax_save, "Save GIF")
 
     # Run selector buttons (left sidebar)
     run_buttons = []
@@ -255,12 +300,12 @@ def show_combined(root, subfolders, fps, scale):
         run_buttons.append(btn)
 
     def _cur_run():
-        return run_data[available[state["run_idx"]]]
+        return _get_run(available[state["run_idx"]])
 
     def _title_text():
         run = _cur_run()
-        img_name = os.path.basename(run["paths"][state["img_idx"]])
-        return f"{available[state['run_idx']]} / {img_name}  ({state['img_idx']+1}/{len(run['paths'])})"
+        img_name = os.path.basename(run.paths[state["img_idx"]])
+        return f"{available[state['run_idx']]} / {img_name}  ({state['img_idx']+1}/{len(run.paths)})"
 
     def _highlight_button(idx):
         for i, btn in enumerate(run_buttons):
@@ -271,7 +316,7 @@ def show_combined(root, subfolders, fps, scale):
         state["run_idx"] = idx
         state["img_idx"] = 0
         run = _cur_run()
-        cur_frames = run["frames"][0]
+        cur_frames = run.frames(0)
         n = len(cur_frames)
         slider.valmin = 1
         slider.valmax = n
@@ -285,9 +330,9 @@ def show_combined(root, subfolders, fps, scale):
 
     def _switch_image(new_idx):
         run = _cur_run()
-        new_idx = new_idx % len(run["paths"])
+        new_idx = new_idx % len(run.paths)
         state["img_idx"] = new_idx
-        cur_frames = run["frames"][new_idx]
+        cur_frames = run.frames(new_idx)
         n = len(cur_frames)
         slider.valmin = 1
         slider.valmax = n
@@ -308,7 +353,7 @@ def show_combined(root, subfolders, fps, scale):
 
     def on_slider(val):
         run = _cur_run()
-        cur_frames = run["frames"][state["img_idx"]]
+        cur_frames = run.frames(state["img_idx"])
         idx = (int(val) - 1) % len(cur_frames)
         im.set_data(cur_frames[idx])
         fig.canvas.draw_idle()
@@ -326,9 +371,26 @@ def show_combined(root, subfolders, fps, scale):
 
     btn_pause.on_clicked(on_pause)
 
+    def on_save(_event):
+        run = _cur_run()
+        cur_frames = run.frames(state["img_idx"])
+        run_name = available[state["run_idx"]]
+        img_name = os.path.splitext(os.path.basename(run.paths[state["img_idx"]]))[0]
+        out_path = f"{run_name}_{img_name}.gif"
+        pil_frames = [Image.fromarray(f) for f in cur_frames]
+        pil_frames[0].save(
+            out_path, save_all=True, append_images=pil_frames[1:],
+            duration=int(1000 / fps), loop=0,
+        )
+        print(f"Saved {out_path}")
+        btn_save.label.set_text("Saved!")
+        fig.canvas.draw_idle()
+
+    btn_save.on_clicked(on_save)
+
     def animate(_i):
         run = _cur_run()
-        cur_frames = run["frames"][state["img_idx"]]
+        cur_frames = run.frames(state["img_idx"])
         n_cur = len(cur_frames)
         next_val = int(slider.val) % n_cur + 1
         slider.set_val(next_val)
