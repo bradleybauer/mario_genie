@@ -376,6 +376,8 @@ def show_combined(root, subfolders, fps, scale):
     def on_slider(val):
         run = _cur_run()
         cur_frames = run.frames(state["img_idx"])
+        if not cur_frames:
+            return
         idx = (int(val) - 1) % len(cur_frames)
         im.set_data(cur_frames[idx])
         fig.canvas.draw_idle()
