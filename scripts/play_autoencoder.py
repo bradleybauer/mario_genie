@@ -48,6 +48,44 @@ except ImportError:
 
 PALETTE_PATH = os.path.join(PROJECT_ROOT, 'data', 'palette.json')
 
+RESULTS_SEARCH_DIRS = [
+    os.path.join(PROJECT_ROOT, 'results'),
+    os.path.join(PROJECT_ROOT, 'checkpoints'),
+    os.path.join(PROJECT_ROOT, '224_1t'),
+]
+
+
+def find_best_checkpoint() -> str:
+    """Scan results directories and return the checkpoint dir with lowest recon loss."""
+    best_loss = float('inf')
+    best_dir = None
+
+    for search_root in RESULTS_SEARCH_DIRS:
+        if not os.path.isdir(search_root):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(search_root):
+            if 'magvit2_best.pt' in filenames and 'metrics.json' in filenames:
+                metrics_path = os.path.join(dirpath, 'metrics.json')
+                try:
+                    with open(metrics_path) as f:
+                        metrics = json.load(f)
+                    for m in metrics:
+                        val = m.get('smoothed_recon_loss', m.get('recon_loss'))
+                        if val is not None and val < best_loss:
+                            best_loss = val
+                            best_dir = dirpath
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+    if best_dir is None:
+        raise FileNotFoundError(
+            "No checkpoint with metrics.json + magvit2_best.pt found in: "
+            + ", ".join(RESULTS_SEARCH_DIRS)
+        )
+
+    print(f"Auto-selected best checkpoint: {best_dir} (loss={best_loss:.6f})")
+    return best_dir
+
 
 def load_model(checkpoint_dir: str, device: torch.device):
     """Load a PaletteVideoTokenizer from a checkpoint directory.
@@ -324,8 +362,8 @@ def run_game_loop(
 def main():
     parser = argparse.ArgumentParser(description="Play NES through autoencoder lens")
     parser.add_argument(
-        '--checkpoint', required=True,
-        help='Path to checkpoint directory (containing config.json + magvit2_best.pt)',
+        '--checkpoint', default=None,
+        help='Path to checkpoint directory (auto-selects best if omitted)',
     )
     parser.add_argument('--rom', default=None, help='ROM name or number (interactive if omitted)')
     parser.add_argument('--scale', type=int, default=2, help='Display scale factor (default: 2)')
@@ -348,8 +386,9 @@ def main():
     args = parser.parse_args()
 
     # Load model
+    checkpoint = args.checkpoint or find_best_checkpoint()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model, image_size, crop_size = load_model(args.checkpoint, device)
+    model, image_size, crop_size = load_model(checkpoint, device)
 
     if not args.no_compile and device.type == 'cuda':
         try:

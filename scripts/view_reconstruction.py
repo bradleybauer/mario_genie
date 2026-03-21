@@ -27,11 +27,19 @@ def load_frames(path):
     """Split a vertically-stacked grid PNG into individual frames."""
     img = Image.open(path)
     w, h = img.size
-    frame_h = w // 2
-    if h % frame_h != 0:
-        for div in range(1, h + 1):
-            if h % div == 0 and abs(div - w // 2) < abs(frame_h - w // 2):
-                frame_h = div
+    target = w // 2
+    if target == 0 or h == 0:
+        return [np.array(img)] if w and h else []
+    if h % target == 0:
+        frame_h = target
+    else:
+        # Find the divisor of h closest to the target frame height
+        divisors = set()
+        for i in range(1, int(h**0.5) + 1):
+            if h % i == 0:
+                divisors.add(i)
+                divisors.add(h // i)
+        frame_h = min(divisors, key=lambda d: abs(d - target))
     n_frames = h // frame_h
     arr = np.array(img)
     frames = [arr[i * frame_h:(i + 1) * frame_h] for i in range(n_frames)]
@@ -39,10 +47,11 @@ def load_frames(path):
 
 
 def collect_images(path):
-    """Return a sorted list of PNG paths from a file or directory."""
+    """Return a sorted list of reconstruction PNG paths from a file or directory."""
     if os.path.isfile(path):
         return [path]
     pngs = sorted(glob.glob(os.path.join(path, "*.png")))
+    pngs = [p for p in pngs if "histogram" not in os.path.basename(p)]
     if not pngs:
         raise FileNotFoundError(f"No PNG files found in {path}")
     return pngs

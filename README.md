@@ -7,6 +7,9 @@
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
 - [Disentangling Hidden State From RAM](#disentangling-hidden-state-from-ram)
+- [SMB3/SuperMarioLand2](#smb3)
+- [More Data Artifacts](#more-data-artifacts)
+- [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
 
 <br>
 
@@ -245,6 +248,17 @@ Check if frame spilts can be prevented with Mesen.
 **Result:** 
 TODO
 
+
+# Causal Conv Temporal Padding
+
+**Context:**
+Reconstruction of frame 1 (0-indexed) is consistently worse than all other frames in a sample. Consider adding context frames.
+
+**Approach:**
+Prepend extra context frames during both training and inference. The dataset returns `seq_len + N_CTX` frames, and the loss is computed only on the final `seq_len` frames, discarding the context prefix from the output. This gives early frames real temporal context instead of zero-padding.
+
+**Result:**
+TODO
 
 <!-- Template -->
 
