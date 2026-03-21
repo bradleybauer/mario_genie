@@ -225,6 +225,22 @@ A good candidate is Mesen which also emulates sound which would be neat to learn
 **Result:** 
 Big TODO
 
+<br>
+<br>
+
+# More data artifacts
+
+**Context:** 
+The model is starting to learn the finer details in the dataset and unfortunately it's learning mid-frame spilt artifacts.
+![mid-frame split](pictures/split.png)
+
+**Approach:** 
+Prompt claude more carefully for a script to find frame splits (and "unnatural" scene-cuts).
+Check if frame spilts can be prevented with Mesen.
+
+**Result:** 
+TODO
+
 
 <!-- Template -->
 
