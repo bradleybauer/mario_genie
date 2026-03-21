@@ -1,6 +1,7 @@
 """Shared helpers for multi-machine remote operations."""
 
 import importlib.util
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -72,11 +73,20 @@ def load_workers(names: list[str] | None = None) -> list[Worker]:
 
 def ssh_base_args(worker: Worker) -> list[str]:
     """Return the common SSH args for connecting to a worker."""
+    return ["ssh", *_ssh_transport_args(worker)]
+
+
+def _ssh_transport_args(worker: Worker) -> list[str]:
+    """Return transport-only SSH args shared by ssh and rsync."""
     return [
-        "ssh", "-p", str(worker.port),
+        "-p", str(worker.port),
         "-o", "StrictHostKeyChecking=accept-new",
-        "-i", "~/.ssh/id_ed25519",
     ]
+
+
+def rsync_ssh_command(worker: Worker) -> str:
+    """Return the SSH command string rsync should use for this worker."""
+    return shlex.join(["ssh", *_ssh_transport_args(worker)])
 
 
 def ssh(
@@ -103,7 +113,7 @@ def rsync_to(
     """Rsync local files/dirs to a remote worker."""
     if isinstance(local_srcs, str):
         local_srcs = [local_srcs]
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519"]
+    cmd = ["rsync", "-avz", "-e", rsync_ssh_command(worker)]
     if extra_args:
         cmd.extend(extra_args)
     cmd.extend(local_srcs)
@@ -118,7 +128,7 @@ def rsync_from(
     *,
     extra_args: list[str] | None = None,    capture: bool = False,) -> subprocess.CompletedProcess:
     """Rsync files from a remote worker to local."""
-    cmd = ["rsync", "-avz", "-e", f"ssh -p {worker.port} -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519"]
+    cmd = ["rsync", "-avz", "-e", rsync_ssh_command(worker)]
     if extra_args:
         cmd.extend(extra_args)
     cmd.append(f"{worker.remote}:{remote_src}")

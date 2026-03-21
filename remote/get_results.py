@@ -15,7 +15,33 @@ from helpers import (
     rsync_from,
     run_on_all,
     show_workers,
+    ssh,
 )
+
+
+def _remote_result_roots(subdir: str | None) -> list[tuple[str, str]]:
+    """Return candidate remote roots and matching local destinations."""
+    candidates = []
+    for root in ("checkpoints", "results"):
+        remote_suffix = f"{root}/"
+        local_base = str(PROJECT_ROOT / "results")
+        if subdir:
+            remote_suffix += subdir + "/"
+            local_base = os.path.join(local_base, subdir)
+        candidates.append((remote_suffix, local_base))
+    return candidates
+
+
+def _resolve_remote_source(worker, subdir: str | None) -> tuple[str, str]:
+    """Find the first existing remote results directory for a worker."""
+    checked = []
+    for remote_suffix, local_base in _remote_result_roots(subdir):
+        remote_path = f"{worker.project_dir}/{remote_suffix}"
+        checked.append(remote_path)
+        result = ssh(worker, f"test -d {remote_path} && echo OK || true", check=False, capture=True)
+        if "OK" in (result.stdout or ""):
+            return remote_suffix, local_base
+    raise FileNotFoundError(f"No remote results directory found on {worker.name}: {checked}")
 
 
 def main():
@@ -34,12 +60,6 @@ def main():
 
     workers = load_workers(None if args.workers and "all" in args.workers else args.workers)
 
-    remote_suffix = "checkpoints/"
-    local_base = str(PROJECT_ROOT / "results")
-    if args.subdir:
-        remote_suffix += args.subdir + "/"
-        local_base = os.path.join(local_base, args.subdir)
-
     rsync_extras = []
     if args.images:
         rsync_extras = [
@@ -47,6 +67,7 @@ def main():
         ]
 
     def fetch(worker):
+        remote_suffix, local_base = _resolve_remote_source(worker, args.subdir)
         local_dst = local_base + "/"
         os.makedirs(local_dst, exist_ok=True)
         rsync_from(

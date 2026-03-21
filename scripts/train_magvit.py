@@ -514,7 +514,7 @@ def train():
 
     # ── LR schedule: linear warmup → cosine decay to 10 % of peak ────
     max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
-    min_lr = args.lr * 0.1
+    min_lr = args.lr * 0.25
     warmup_steps = args.warmup_steps
 
     # Estimate total training steps for the cosine T_max

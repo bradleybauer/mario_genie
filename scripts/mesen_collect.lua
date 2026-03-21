@@ -1,41 +1,43 @@
 -- Mesen data collection script
 --
--- Streams per-frame data (screenshot + RAM + WRAM + palette + input) over TCP
--- to a Python receiver that saves session .npz files.
+-- Writes per-frame data (screenshot + RAM + WRAM + palette + input) to a
+-- binary file on disk.  Run the Python converter afterwards:
+--
+--   python scripts/collect_mesen.py --input <recording.bin> --output data/smb3
 --
 -- Usage:
---   1. Start the Python receiver:
---      python scripts/collect_mesen.py --output data/smb3
---   2. Open Mesen, load your ROM
---   3. Load this script via Debug > Script Window > Open
---   4. Play the game — frames are streamed automatically
---   5. Stop the script or close Mesen to finalize the session
+--   1. Open Mesen, load your ROM
+--   2. Load this script via Debug > Script Window > Open
+--   3. Play the game — every frame is written to disk
+--   4. Stop the script or close Mesen to finalize
+--   5. Convert offline:  python scripts/collect_mesen.py ...
 --
--- Protocol (per frame):
---   [4]    magic "MESF"
---   [4]    frame number  (uint32 LE)
---   [1]    controller 1 input bitmask
---   [2048] internal RAM  ($0000-$07FF via cpuDebug)
---   [8192] work RAM      ($6000-$7FFF via cpuDebug)
---   [32]   palette RAM
---   [4]    PNG byte count (uint32 LE)
---   [N]    PNG data       (from emu.takeScreenshot)
-
-local socket = require("socket.core")
+-- File format:
+--   Header (5 bytes):
+--     [4]  magic "MESD"
+--     [1]  version = 1
+--   Per frame:
+--     [4]    frame number  (uint32 LE)
+--     [1]    controller 1 input bitmask
+--     [2048] internal RAM  ($0000-$07FF)
+--     [8192] work RAM      ($6000-$7FFF)
+--     [32]   palette RAM
+--     [4]    PNG byte count (uint32 LE)
+--     [N]    PNG data       (from emu.takeScreenshot)
 
 -- ======================== CONFIG ========================
-local HOST           = "127.0.0.1"
-local PORT           = 7275
+-- Set OUTPUT_DIR to control where recordings are saved.
+-- Default: Mesen's per-script data folder.
+local OUTPUT_DIR = nil   -- nil = use emu.getScriptDataFolder()
+
 local RAM_SIZE       = 2048   -- $0000-$07FF
 local WRAM_START     = 0x6000
 local WRAM_SIZE      = 8192   -- $6000-$7FFF
 local PALETTE_SIZE   = 32
-local RETRY_INTERVAL = 120    -- frames between reconnect attempts
 
 -- ======================== STATE =========================
-local client   = nil
+local outFile  = nil
 local frameNum = 0
-local retryCountdown = 0
 
 -- ======================== HELPERS =======================
 
@@ -48,7 +50,6 @@ local function pack_u32(n)
   )
 end
 
--- Bulk-read a contiguous memory region into a Lua string.
 local function readBlock(startAddr, size, memType)
   local t = {}
   for i = 0, size - 1 do
@@ -57,9 +58,6 @@ local function readBlock(startAddr, size, memType)
   return table.concat(t)
 end
 
--- Encode controller-1 state as a single bitmask byte.
--- Bit layout matches nes_py convention:
---   0=A  1=B  2=Select  3=Start  4=Up  5=Down  6=Left  7=Right
 local function encodeInput()
   local inp = emu.getInput(0)
   local b = 0
@@ -74,47 +72,58 @@ local function encodeInput()
   return b
 end
 
--- ======================== CONNECTION ====================
+-- ======================== FILE I/O ======================
 
-local function tryConnect()
-  local c = socket.tcp()
-  c:settimeout(0.05)
-  local ok, err = c:connect(HOST, PORT)
-  if ok or err == "already connected" then
-    c:settimeout(0.2)  -- allow short blocking sends
-    client = c
-    frameNum = 0
-    emu.log("[collect] Connected to " .. HOST .. ":" .. PORT)
-    return true
+local function openRecording()
+  local dir = OUTPUT_DIR or emu.getScriptDataFolder()
+
+  -- Find next available filename
+  local index = 0
+  while true do
+    local path = dir .. "/recording_" .. string.format("%04d", index) .. ".bin"
+    local f = io.open(path, "rb")
+    if f then
+      f:close()
+      index = index + 1
+    else
+      break
+    end
   end
-  c:close()
-  return false
+
+  local path = dir .. "/recording_" .. string.format("%04d", index) .. ".bin"
+  outFile = io.open(path, "wb")
+  if not outFile then
+    emu.log("[collect] ERROR: cannot open " .. path)
+    return
+  end
+
+  -- Write header
+  outFile:write("MESD")   -- magic
+  outFile:write("\1")     -- version 1
+  outFile:flush()
+
+  frameNum = 0
+  emu.log("[collect] Recording to: " .. path)
 end
 
-local function disconnect()
-  if client then
-    pcall(function() client:close() end)
-    client = nil
+local function closeRecording()
+  if outFile then
+    outFile:flush()
+    outFile:close()
+    emu.log("[collect] Closed recording — " .. frameNum .. " frames saved")
+    outFile = nil
   end
 end
 
 -- ======================== FRAME CALLBACK ================
 
 local function onEndFrame()
-  -- Reconnect logic
-  if not client then
-    retryCountdown = retryCountdown - 1
-    if retryCountdown <= 0 then
-      retryCountdown = RETRY_INTERVAL
-      tryConnect()
-    end
-    return
-  end
+  if not outFile then return end
 
   -- Internal RAM
   local ram = readBlock(0x0000, RAM_SIZE, emu.memType.cpuDebug)
 
-  -- Work RAM (may not exist — read via CPU debug address space)
+  -- Work RAM (may not exist for all mappers)
   local wram
   local ok, result = pcall(readBlock, WRAM_START, WRAM_SIZE, emu.memType.cpuDebug)
   if ok then
@@ -132,30 +141,27 @@ local function onEndFrame()
   -- Screenshot (PNG binary)
   local png = emu.takeScreenshot()
 
-  -- Assemble packet
-  local packet = "MESF"
-    .. pack_u32(frameNum)
-    .. string.char(inputByte)
-    .. ram
-    .. wram
-    .. pal
-    .. pack_u32(#png)
-    .. png
-
-  local _, err = client:send(packet)
-  if err then
-    emu.log("[collect] Send error: " .. tostring(err))
-    disconnect()
-    return
-  end
+  -- Write frame record
+  outFile:write(pack_u32(frameNum))
+  outFile:write(string.char(inputByte))
+  outFile:write(ram)
+  outFile:write(wram)
+  outFile:write(pal)
+  outFile:write(pack_u32(#png))
+  outFile:write(png)
 
   frameNum = frameNum + 1
+
+  if frameNum % 300 == 0 then
+    outFile:flush()
+    emu.log("[collect] " .. frameNum .. " frames written")
+  end
 end
 
 -- ======================== INIT ==========================
 
-tryConnect()
+openRecording()
 emu.addEventCallback(onEndFrame, emu.eventType.endFrame)
-emu.addEventCallback(function() disconnect() end, emu.eventType.scriptEnded)
+emu.addEventCallback(closeRecording, emu.eventType.scriptEnded)
 
-emu.log("[collect] Mesen data collector loaded — server " .. HOST .. ":" .. PORT)
+emu.log("[collect] Mesen data collector loaded — writing to disk")

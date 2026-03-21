@@ -201,6 +201,7 @@ dependencies:
       - protobuf==7.34.0
       - psutil==7.2.2
       - pyglet==1.5.21
+      - pyboy==2.7.0
       - pygments==2.19.2
       - pyparsing==3.3.2
       - python-dateutil==2.9.0.post0

@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""Receive streaming data from Mesen's Lua collector and save session .npz files.
+"""Convert Mesen binary recordings to session .npz files.
 
-Each session contains palette-indexed frames, actions, full RAM/WRAM dumps,
-and decoded game-state metadata.
+The Lua script (mesen_collect.lua) writes a .bin recording to disk.
+This script reads it offline and produces the same session format used
+by the rest of the training pipeline.
 
 Usage:
-    python scripts/collect_mesen.py --output data/smb3
-    python scripts/collect_mesen.py --output data/smb3 --max-session 18000
-
-Then load mesen_collect.lua in Mesen's script window and play the game.
+    python scripts/collect_mesen.py --input recording_0000.bin --output data/smb3
+    python scripts/collect_mesen.py --input /path/to/*.bin --output data/smb3
+    python scripts/collect_mesen.py --input /path/to/dir/ --output data/smb3
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import io
 import json
 import shutil
-import socket
 import struct
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -65,11 +64,9 @@ def input_byte_to_action(
     left  = bool(byte & 0x40)
     right = bool(byte & 0x80)
 
-    # Conflicting directions — prefer right
     if left and right:
         left = False
 
-    # "up" is only a standalone action in COMPLEX_MOVEMENT
     if up and not (a or b or left or right or down):
         return action_map.get(frozenset({"up"}), noop_idx)
 
@@ -90,10 +87,7 @@ def input_byte_to_action(
 # ---------------------------------------------------------------------------
 
 def decode_smb3_state(ram: np.ndarray, wram: np.ndarray) -> dict[str, int]:
-    """Extract game-state metadata from SMB3 RAM.
-
-    Uses the same addresses as game_decoders.decode_smb3.
-    """
+    """Extract game-state metadata from SMB3 RAM."""
     world    = int(ram[0x0727]) + 1
     objset   = int(ram[0x070A])
     x_pos    = int(ram[0x0075]) * 256 + int(ram[0x0090])
@@ -103,13 +97,12 @@ def decode_smb3_state(ram: np.ndarray, wram: np.ndarray) -> dict[str, int]:
     score    = (int(ram[0x0715]) << 16 | int(ram[0x0716]) << 8 | int(ram[0x0717])) * 10
     power    = int(ram[0x00ED])
 
-    # Coins from WRAM $7DA2
     coins_offset = 0x7DA2 - 0x6000
     coins = int(wram[coins_offset]) if coins_offset < len(wram) else 0
 
     return {
         "world":    world,
-        "stage":    objset,     # tileset acts as stage identifier in SMB3
+        "stage":    objset,
         "x_pos":    x_pos,
         "y_pos":    y_pos,
         "life":     life,
@@ -122,56 +115,62 @@ def decode_smb3_state(ram: np.ndarray, wram: np.ndarray) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Binary protocol
+# Binary file reader
 # ---------------------------------------------------------------------------
 
-MAGIC       = b"MESF"
-RAM_SIZE    = 2048
-WRAM_SIZE   = 8192
+MAGIC        = b"MESD"
+VERSION      = 1
+RAM_SIZE     = 2048
+WRAM_SIZE    = 8192
 PALETTE_SIZE = 32
-# magic(4) + frame(4) + input(1) + ram + wram + palette + png_len(4)
-FIXED_SIZE  = 4 + 4 + 1 + RAM_SIZE + WRAM_SIZE + PALETTE_SIZE + 4
+# Per-frame fixed portion: frame(4) + input(1) + ram + wram + palette + png_len(4)
+FRAME_FIXED  = 4 + 1 + RAM_SIZE + WRAM_SIZE + PALETTE_SIZE + 4
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(min(n - len(buf), 65536))
-        if not chunk:
-            raise ConnectionError("disconnected")
-        buf.extend(chunk)
-    return bytes(buf)
+def iter_frames(path: Path):
+    """Yield frame dicts from a Mesen .bin recording."""
+    with open(path, "rb") as f:
+        header = f.read(5)
+        if len(header) < 5:
+            raise ValueError(f"{path}: too short for header")
+        if header[:4] != MAGIC:
+            raise ValueError(f"{path}: bad magic {header[:4]!r}")
+        if header[4] != VERSION:
+            raise ValueError(f"{path}: unsupported version {header[4]}")
 
+        while True:
+            fixed = f.read(FRAME_FIXED)
+            if not fixed:
+                break
+            if len(fixed) < FRAME_FIXED:
+                print(f"  Warning: truncated frame at end of file, skipping")
+                break
 
-def recv_frame(sock: socket.socket) -> dict:
-    """Read one frame packet from the Mesen Lua script."""
-    fixed = _recv_exact(sock, FIXED_SIZE)
+            frame_num  = struct.unpack_from("<I", fixed, 0)[0]
+            input_byte = fixed[4]
 
-    if fixed[:4] != MAGIC:
-        raise ValueError(f"bad magic: {fixed[:4]!r}")
+            off = 5
+            ram = np.frombuffer(fixed, dtype=np.uint8, count=RAM_SIZE, offset=off).copy()
+            off += RAM_SIZE
+            wram = np.frombuffer(fixed, dtype=np.uint8, count=WRAM_SIZE, offset=off).copy()
+            off += WRAM_SIZE
+            palette = np.frombuffer(fixed, dtype=np.uint8, count=PALETTE_SIZE, offset=off).copy()
+            off += PALETTE_SIZE
+            png_len = struct.unpack_from("<I", fixed, off)[0]
 
-    frame_num  = struct.unpack_from("<I", fixed, 4)[0]
-    input_byte = fixed[8]
+            png_data = f.read(png_len)
+            if len(png_data) < png_len:
+                print(f"  Warning: truncated PNG at frame {frame_num}, skipping")
+                break
 
-    off = 9
-    ram = np.frombuffer(fixed, dtype=np.uint8, count=RAM_SIZE, offset=off).copy()
-    off += RAM_SIZE
-    wram = np.frombuffer(fixed, dtype=np.uint8, count=WRAM_SIZE, offset=off).copy()
-    off += WRAM_SIZE
-    palette = np.frombuffer(fixed, dtype=np.uint8, count=PALETTE_SIZE, offset=off).copy()
-    off += PALETTE_SIZE
-    png_len = struct.unpack_from("<I", fixed, off)[0]
-
-    png_data = _recv_exact(sock, png_len)
-
-    return {
-        "frame_num": frame_num,
-        "input":     input_byte,
-        "ram":       ram,
-        "wram":      wram,
-        "palette":   palette,
-        "png":       png_data,
-    }
+            yield {
+                "frame_num": frame_num,
+                "input":     input_byte,
+                "ram":       ram,
+                "wram":      wram,
+                "palette":   palette,
+                "png":       png_data,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +182,7 @@ META_KEYS = ("world", "stage", "x_pos", "y_pos",
 
 
 class MesenSessionWriter:
-    """Accumulates Mesen frames and writes session .npz + .meta.json."""
+    """Accumulates frames and writes session .npz + .meta.json."""
 
     _INIT_CAP = 4096
 
@@ -254,7 +253,7 @@ class MesenSessionWriter:
     def num_frames(self) -> int:
         return self._size
 
-    def write(self, elapsed: float) -> Path | None:
+    def write(self) -> Path | None:
         if self._size == 0 or self._frames is None:
             return None
         n = self._size
@@ -277,7 +276,6 @@ class MesenSessionWriter:
                 "session_id":      self.session_id,
                 "source":          "mesen",
                 "num_frames":      n,
-                "elapsed_seconds": round(elapsed, 2),
             }, f, indent=2)
         return npz_path
 
@@ -286,13 +284,30 @@ class MesenSessionWriter:
 # Main
 # ---------------------------------------------------------------------------
 
+def resolve_inputs(raw: list[str]) -> list[Path]:
+    """Expand globs, directories, and plain paths into .bin files."""
+    result: list[Path] = []
+    for item in raw:
+        p = Path(item)
+        if p.is_dir():
+            result.extend(sorted(p.glob("recording_*.bin")))
+        elif "*" in item or "?" in item:
+            result.extend(Path(m) for m in sorted(glob.glob(item)))
+        else:
+            result.append(p)
+    return result
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Mesen data collection receiver")
+    parser = argparse.ArgumentParser(
+        description="Convert Mesen .bin recordings to session .npz files"
+    )
+    parser.add_argument("--input", nargs="+", required=True,
+                        help=".bin file(s), glob pattern, or directory")
     parser.add_argument("--output", type=Path, required=True,
                         help="Directory to write session .npz files")
-    parser.add_argument("--port", type=int, default=7275)
     parser.add_argument("--max-session", type=int, default=0,
-                        help="Split sessions after this many frames (0 = unlimited)")
+                        help="Split sessions after this many frames (0 = one session per file)")
     args = parser.parse_args()
 
     action_map, _, noop_idx = _build_action_map()
@@ -306,78 +321,61 @@ def main() -> None:
             shutil.copy(src, palette_path)
     palette_mapper = PaletteMapper(palette_path)
 
-    # Write action meanings for downstream compatibility
+    # Write action meanings
     from mario_world_model.actions import ACTION_MEANINGS
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / "action_meanings.json").open("w") as f:
         json.dump({i: m for i, m in enumerate(ACTION_MEANINGS)}, f, indent=2)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", args.port))
-    srv.listen(1)
-    print(f"Listening on port {args.port} — load mesen_collect.lua in Mesen")
+    bin_files = resolve_inputs(args.input)
+    if not bin_files:
+        print("No .bin files found")
+        sys.exit(1)
 
-    try:
-        while True:
-            conn, addr = srv.accept()
-            print(f"Connected: {addr}")
+    total_frames = 0
+    total_sessions = 0
 
-            writer = MesenSessionWriter(args.output)
-            t0 = time.time()
+    for bin_path in bin_files:
+        print(f"\nProcessing {bin_path}")
+        writer = MesenSessionWriter(args.output)
 
-            try:
-                while True:
-                    pkt = recv_frame(conn)
+        for pkt in iter_frames(bin_path):
+            # PNG → RGB → pad 256×256 → palette index → (1, H, W)
+            rgb = np.array(
+                Image.open(io.BytesIO(pkt["png"])).convert("RGB"),
+                dtype=np.uint8,
+            )
+            padded = preprocess_frame(rgb)
+            idx_hw = palette_mapper.map_frame(padded)
+            frame_chw = idx_hw[np.newaxis, :, :]
 
-                    # PNG → RGB → pad 256×256 → palette index → (1, H, W)
-                    rgb = np.array(
-                        Image.open(io.BytesIO(pkt["png"])).convert("RGB"),
-                        dtype=np.uint8,
-                    )
-                    padded = preprocess_frame(rgb)
-                    idx_hw = palette_mapper.map_frame(padded)
-                    frame_chw = idx_hw[np.newaxis, :, :]  # (1, 256, 256)
+            action = input_byte_to_action(pkt["input"], action_map, noop_idx)
+            state  = decode_smb3_state(pkt["ram"], pkt["wram"])
 
-                    action = input_byte_to_action(pkt["input"], action_map, noop_idx)
-                    state  = decode_smb3_state(pkt["ram"], pkt["wram"])
+            writer.append(frame_chw, action, pkt["ram"], pkt["wram"], state)
 
-                    writer.append(frame_chw, action, pkt["ram"], pkt["wram"], state)
+            if pkt["frame_num"] % 1000 == 0:
+                print(
+                    f"  frame {pkt['frame_num']:>6d}  "
+                    f"W{state['world']} x={state['x_pos']}"
+                )
 
-                    if pkt["frame_num"] % 300 == 0:
-                        elapsed = time.time() - t0
-                        fps = writer.num_frames / max(elapsed, 0.001)
-                        print(
-                            f"  frame {pkt['frame_num']:>6d}  "
-                            f"n={writer.num_frames}  "
-                            f"{fps:.0f} fps  "
-                            f"W{state['world']} x={state['x_pos']}"
-                        )
+            # Session rotation
+            if 0 < args.max_session <= writer.num_frames:
+                path = writer.write()
+                print(f"  Saved {path} ({writer.num_frames} frames)")
+                total_frames += writer.num_frames
+                total_sessions += 1
+                writer = MesenSessionWriter(args.output)
 
-                    # Session rotation
-                    if 0 < args.max_session <= writer.num_frames:
-                        elapsed = time.time() - t0
-                        path = writer.write(elapsed)
-                        print(f"Saved {path} ({writer.num_frames} frames, {elapsed:.1f}s)")
-                        writer = MesenSessionWriter(args.output)
-                        t0 = time.time()
+        # Flush remaining
+        if writer.num_frames > 0:
+            path = writer.write()
+            print(f"  Saved {path} ({writer.num_frames} frames)")
+            total_frames += writer.num_frames
+            total_sessions += 1
 
-            except (ConnectionError, ConnectionResetError, BrokenPipeError):
-                print("Disconnected")
-            except ValueError as exc:
-                print(f"Protocol error: {exc}")
-            finally:
-                conn.close()
-                if writer.num_frames > 0:
-                    elapsed = time.time() - t0
-                    path = writer.write(elapsed)
-                    print(f"Saved {path} ({writer.num_frames} frames, {elapsed:.1f}s)")
-                print("Waiting for next connection...\n")
-
-    except KeyboardInterrupt:
-        print("\nShutdown")
-    finally:
-        srv.close()
+    print(f"\nDone: {total_sessions} session(s), {total_frames} total frames")
 
 
 if __name__ == "__main__":
