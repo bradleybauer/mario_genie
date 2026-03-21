@@ -184,17 +184,29 @@ def show_viewer(folder_path, fps, scale):
 
 
 class _LazyRun:
-    """Stores paths eagerly, loads frames per-image on demand."""
-    __slots__ = ("paths", "_frames")
+    """Stores paths eagerly, loads/validates frames per-image on demand."""
+    __slots__ = ("paths", "_frames", "_valid")
 
     def __init__(self, paths):
         self.paths = paths
         self._frames = [None] * len(paths)
+        self._valid = None  # indices of paths that produce valid frames
+
+    def _ensure_loaded(self, idx):
+        if self._frames[idx] is None:
+            self._frames[idx] = load_frames(self.paths[idx]) or []
 
     def frames(self, idx):
-        if self._frames[idx] is None:
-            self._frames[idx] = load_frames(self.paths[idx])
+        self._ensure_loaded(idx)
         return self._frames[idx]
+
+    def first_valid_frames(self):
+        """Load images one by one until we find one with frames."""
+        for i in range(len(self.paths)):
+            f = self.frames(i)
+            if f:
+                return f
+        return None
 
 
 def _discover_run(root, name):
@@ -247,7 +259,11 @@ def show_combined(root, subfolders, fps, scale):
 
     # Viewer sizing from first run's first frame
     first_run = _get_run(available[0])
-    first_frame = first_run.frames(0)[0]
+    first_frames = first_run.first_valid_frames()
+    if not first_frames:
+        print(f"No valid reconstruction frames found under {root}")
+        return
+    first_frame = first_frames[0]
     fh, fw = first_frame.shape[:2]
     viewer_w_pts = fw * scale
     viewer_h_pts = fh * scale + 80  # extra for controls
@@ -263,7 +279,6 @@ def show_combined(root, subfolders, fps, scale):
     ax_img = fig.add_axes([sidebar_frac + 0.02, 0.18, 1.0 - sidebar_frac - 0.04, 0.78])
     ax_img.set_axis_off()
 
-    first_frames = first_run.frames(0)
     im = ax_img.imshow(first_frames[0], interpolation="nearest")
     title = ax_img.set_title("", fontsize=10)
 
@@ -280,7 +295,7 @@ def show_combined(root, subfolders, fps, scale):
     btn_next = Button(ax_next, "Next \u25b6")
     ax_pause = fig.add_axes([ctrl_left + ctrl_w - 0.18, 0.05, 0.09, 0.05])
     btn_pause = Button(ax_pause, "Pause")
-    ax_save = fig.add_axes([ctrl_left + ctrl_w - 0.30, 0.05, 0.09, 0.05])
+    ax_save = fig.add_axes([ctrl_left, 0.00, 0.09, 0.05])
     btn_save = Button(ax_save, "Save GIF")
 
     # Run selector buttons (left sidebar)
@@ -316,7 +331,12 @@ def show_combined(root, subfolders, fps, scale):
         state["run_idx"] = idx
         state["img_idx"] = 0
         run = _cur_run()
-        cur_frames = run.frames(0)
+        cur_frames = run.first_valid_frames()
+        if not cur_frames:
+            title.set_text(f"{available[idx]} — no valid frames")
+            _highlight_button(idx)
+            fig.canvas.draw_idle()
+            return
         n = len(cur_frames)
         slider.valmin = 1
         slider.valmax = n
@@ -333,6 +353,8 @@ def show_combined(root, subfolders, fps, scale):
         new_idx = new_idx % len(run.paths)
         state["img_idx"] = new_idx
         cur_frames = run.frames(new_idx)
+        if not cur_frames:
+            return
         n = len(cur_frames)
         slider.valmin = 1
         slider.valmax = n
@@ -392,6 +414,8 @@ def show_combined(root, subfolders, fps, scale):
         run = _cur_run()
         cur_frames = run.frames(state["img_idx"])
         n_cur = len(cur_frames)
+        if n_cur == 0:
+            return [im]
         next_val = int(slider.val) % n_cur + 1
         slider.set_val(next_val)
         return [im]
