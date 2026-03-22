@@ -398,7 +398,7 @@ def main():
             print(f'  torch.compile failed ({e}), continuing without it')
 
     # Load palette
-    palette_mapper = PaletteMapper(args.palette)
+    palette_mapper = PaletteMapper(args.palette, freeze=True)
     with open(args.palette) as f:
         palette_list = json.load(f)
     palette_rgb = np.array(palette_list, dtype=np.uint8)

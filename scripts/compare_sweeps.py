@@ -638,9 +638,9 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
                     alpha=0.9,
                     linewidth=style["linewidth"],
                     marker=marker,
-                    markersize=2.8,
+                    markersize=6,
                     markerfacecolor="none",
-                    markeredgewidth=0.8,
+                    markeredgewidth=1.4,
                     markevery=markevery,
                 )
         ax.set_ylabel("Learning Rate")

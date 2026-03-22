@@ -31,9 +31,10 @@ class PaletteMapper:
     # 16 MB — acceptable.  Rebuilt only when new colours appear.
     _LUT_SIZE = (1 << 24)  # 16,777,216
 
-    def __init__(self, palette_path: str | Path):
+    def __init__(self, palette_path: str | Path, *, freeze: bool = False):
         self._path = Path(palette_path)
         self._lock = threading.Lock()
+        self._freeze = freeze
 
         # rgb_to_idx: packed int (r<<16 | g<<8 | b) → uint8 index
         self._rgb_to_idx: dict[int, int] = {}
@@ -77,6 +78,10 @@ class PaletteMapper:
             | flat[:, 1].astype(np.int32) << 8
             | flat[:, 2].astype(np.int32)
         )
+
+        if self._freeze and self._lut is not None:
+            # Frozen: unknown colours silently map to 0 (LUT default)
+            return self._lut[packed].reshape(h, w)
 
         if self._lut is not None and self._frames_since_new > 60:
             # Fast path: palette is settled, skip np.unique entirely

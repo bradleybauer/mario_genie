@@ -590,14 +590,15 @@ def train():
         else:
             # Rebuild the constant scheduler *after* optimizer restore so it
             # locks in the checkpoint's last LR as its base_lr.
-            # We must overwrite initial_lr (set by the original scheduler and
-            # saved inside the optimizer state_dict) so that LambdaLR picks up
-            # the current decayed LR rather than the original peak LR.
+            # If --lr differs from the checkpoint's LR, honour --lr as an
+            # explicit override; otherwise keep the checkpoint value.
             resumed_lr = optimizer.param_groups[0]['lr']
+            target_lr = args.lr if args.lr != resumed_lr else resumed_lr
             for pg in optimizer.param_groups:
-                pg['initial_lr'] = pg['lr']
+                pg['lr'] = target_lr
+                pg['initial_lr'] = target_lr
             scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
-            print(f"[resume] Constant LR locked to checkpoint value: {resumed_lr:.6e}")
+            print(f"[resume] Constant LR = {target_lr:.6e} (checkpoint was {resumed_lr:.6e})")
         start_step = ckpt['global_step']
         print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
 

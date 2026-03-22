@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=50,
                         help="Print the top-K best and worst samples to stdout")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--sample-fraction", type=float, default=1.0,
+                        help="Evaluate a random fraction of the dataset (e.g. 0.1 for 10%%)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,14 +79,23 @@ def main():
 
     data_dir = args.data_dir or config.get("data_dir", "data")
 
+    # ── Load weights ─────────────────────────────────────────────────
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # training_state has a 'model' key; raw .pt is the state_dict directly
+    state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+    step = ckpt.get("global_step", "?") if isinstance(ckpt, dict) else "?"
+    del ckpt
+
+    # Infer palette size from checkpoint (conv_out.conv.bias has num_palette_colors elements)
+    num_palette_colors = state_dict["conv_out.conv.bias"].shape[0]
+
     # ── Load palette ─────────────────────────────────────────────────
     palette_path = os.path.join(data_dir, "palette.json")
     if not os.path.isfile(palette_path):
         raise FileNotFoundError(f"No palette.json found at {palette_path}")
     with open(palette_path) as f:
         palette_rgb = json.load(f)
-    palette = torch.tensor(palette_rgb, dtype=torch.float32).to(device) / 255.0
-    num_palette_colors = palette.shape[0]
+    palette = torch.tensor(palette_rgb[:num_palette_colors], dtype=torch.float32).to(device) / 255.0
 
     # ── Build tokenizer layers ───────────────────────────────────────
     tokenizer_layers = tuple(
@@ -104,14 +115,9 @@ def main():
     tokenizer.discr = None
     tokenizer.multiscale_discrs = None
 
-    # ── Load weights ─────────────────────────────────────────────────
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    # training_state has a 'model' key; raw .pt is the state_dict directly
-    state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
     tokenizer.load_state_dict(state_dict)
-    step = ckpt.get("global_step", "?") if isinstance(ckpt, dict) else "?"
-    print(f"Loaded checkpoint from step {step}")
-    del ckpt
+    print(f"Loaded checkpoint from step {step} (palette size: {num_palette_colors})")
+    del state_dict
 
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, seq_len)
 
@@ -124,8 +130,19 @@ def main():
     )
     print(f"Dataset: {len(dataset)} samples")
 
+    if args.sample_fraction < 1.0:
+        n_total = len(dataset)
+        n_subset = max(1, int(n_total * args.sample_fraction))
+        generator = torch.Generator().manual_seed(42)
+        indices = torch.randperm(n_total, generator=generator)[:n_subset].tolist()
+        subset = torch.utils.data.Subset(dataset, indices)
+        print(f"Sampling {n_subset}/{n_total} ({args.sample_fraction:.0%})")
+    else:
+        subset = dataset
+        indices = None
+
     loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=False,
+        subset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
     )
 
@@ -138,7 +155,7 @@ def main():
         for batch in tqdm(loader, desc="Evaluating"):
             batch = batch.to(device, non_blocking=True)
             bs = batch.shape[0]
-            targets = batch.long()
+            targets = batch.long().clamp(max=num_palette_colors - 1)
             inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
 
             codes = tokenizer(inp, return_codes=True,
@@ -157,7 +174,10 @@ def main():
                 total = targets[i].numel()
                 pixel_acc = correct / total
 
-                global_idx = sample_offset + i
+                if indices is not None:
+                    global_idx = indices[sample_offset + i]
+                else:
+                    global_idx = sample_offset + i
                 file_idx, t_start = dataset.samples[global_idx]
                 file_path = dataset.data_files[file_idx]
 
@@ -230,7 +250,7 @@ def main():
                 chunk = _crop_chunk(chunk, crop_size)
 
             sample = torch.from_numpy(chunk.copy()).unsqueeze(0).to(device)  # (1, T, H, W)
-            targets = sample.long()
+            targets = sample.long().clamp(max=num_palette_colors - 1)
             inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
 
             with torch.no_grad():
