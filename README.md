@@ -47,7 +47,7 @@ I want to know if the model has an interesting representation for any of the num
 
 **Approach:** 
 
-Copy smart stuff from blogs I've seen recently.
+Copy (but learn from ofc) smart stuff from blogs I've seen recently.
 
 **Result:** 
 
@@ -283,6 +283,8 @@ Train more models
 **Result:**
 
 I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook.
+
+Tentatively claiming the context images idea worked quite nicely. Non-context images consistently have better reconstructions that context images (context image are delightfully glitched). Currently using 4 additional context images per sample. I am pretty sure 4 does not totally prevent temporal zero padding but adding more images may cost more than it's worth in flops.
 
 <!-- Template -->
 
