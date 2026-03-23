@@ -1,7 +1,7 @@
 # Table of Contents
 
 - [Single Sample Overfit Baseline](#single-sample-overfit-baseline)
-- [Which Tokens Correspond To Which World And Stages](#which-tokens-correspond-to-which-world-and-stages)
+- [How Does The Model Represent Counts](#how-does-the-model-represent-counts)
 - [Uniform Data Collection](#uniform-data-collection)
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
@@ -39,15 +39,15 @@ This was fixed by using `tokenize()` + `decode_from_code_indices()`.
 <br>
 <br>
 
-# Which Tokens Correspond To Which World And Stages
+# How Does The Model Represent Counts
 
 **Context:**
 
-During inference I want the initial world and stage to be configurable.
+I want to know if the model has an interesting representation for any of the numeric features of the data. For ex, time, score, number of coins, lives, world-stage, mario progression through the level.
 
 **Approach:** 
 
-I will use the trained autoencoder to encode the initial frame for each world and stage. Those encodings will later be used as the initial tokens during inference.
+Copy smart stuff from blogs I've seen recently.
 
 **Result:** 
 
