@@ -9,3 +9,4 @@ Super Mario Land 2 from the gameboy 1 would be a better next game than smb3
 Would be really interested to see a no-image-encoder model that uses attention over a time sequence of nes ram dumps to produce the tokens that the transformer predits and decoder generates images from.....
 
 Use tf32 or amp son
+Remeber to write down some thoughts on the bottleneck bitwidth calculations
