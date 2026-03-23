@@ -587,6 +587,7 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
     # --- LFQ loss breakdown ---
     if "lfq" in panels:
         ax = axes[panels.index("lfq")]
+        ax2 = ax.twinx()
         for run in sorted_runs:
             style = run_styles[run["name"]]
             x_vals, batch_h = get_metric_series(run["metrics"], "lfq_batch_entropy", x_axis)
@@ -597,14 +598,17 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
                         alpha=0.9, linewidth=style["linewidth"])
             x_vals, commit = get_metric_series(run["metrics"], "lfq_commitment", x_axis)
             if x_vals:
-                ax.plot(x_vals, smooth(commit, smooth_window),
-                        label=f"{run['name']} (commit)",
-                        color=style["color"], linestyle=":",
-                        alpha=0.6, linewidth=max(0.8, style["linewidth"] * 0.6))
-        ax.set_ylabel("LFQ Metrics")
-        ax.set_title("Quantizer Health (batch entropy + commitment)")
+                ax2.plot(x_vals, smooth(commit, smooth_window),
+                         label=f"{run['name']} (commit)",
+                         color=style["color"], linestyle=":",
+                         alpha=0.5, linewidth=max(0.8, style["linewidth"] * 0.6))
+        ax.set_ylabel("Batch Entropy")
+        ax2.set_ylabel("Commitment", alpha=0.5)
+        ax.set_title("Quantizer Health: Batch Entropy (solid) + Commitment (dotted)")
         if show_legend:
-            ax.legend(fontsize=6, ncol=2, frameon=True, handlelength=3.0)
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6, ncol=2, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
     # --- Learning rate schedule ---

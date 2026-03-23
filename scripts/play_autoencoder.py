@@ -4,10 +4,10 @@ Encodes each frame through the MAGVIT-2 tokenizer and decodes it back,
 showing the original and reconstructed views side-by-side in real time.
 
 Usage:
-    python scripts/play_autoencoder.py --checkpoint results/asha_sweep/dim16_cb4096_genie_base_1t
-    python scripts/play_autoencoder.py --checkpoint results/asha_sweep/dim16_cb4096_genie_base_1t --rom mario
-    python scripts/play_autoencoder.py --checkpoint results/asha_sweep/dim16_cb4096_genie_base_1t --scale 2
-    python scripts/play_autoencoder.py --checkpoint results/asha_sweep/dim16_cb4096_genie_base_1t --recon-only
+    python scripts/play_autoencoder.py --checkpoint results/sweep/dim16_cb4096_genie_base_1t
+    python scripts/play_autoencoder.py --checkpoint results/sweep/dim16_cb4096_genie_base_1t --rom mario
+    python scripts/play_autoencoder.py --checkpoint results/sweep/dim16_cb4096_genie_base_1t --scale 2
+    python scripts/play_autoencoder.py --checkpoint results/sweep/dim16_cb4096_genie_base_1t --recon-only
 """
 import sys
 import os

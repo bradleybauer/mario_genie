@@ -30,6 +30,10 @@ class ModelConfig:
     layers: str
     scale_name: str
     attention_name: str
+    num_codebooks: int = 1
+    sequence_length: int = 16
+    context_frames: int = 4
+    model_type: str = "magvit2"  # "magvit2" or "genie2"
 
 
 def build_open_genie_layers(
@@ -54,7 +58,7 @@ def build_open_genie_layers(
         f"consecutive_residual:{blocks_1}",
         f"compress_space:{init_dim}",
         f"consecutive_residual:{blocks_2}",
-        f"compress_time:{stage2_dim}",
+        *([] if temporal_compressions < 1 else [f"compress_time:{stage2_dim}"]),
         f"compress_space:{stage2_dim}",
         *attention_layers,
         f"consecutive_residual:{blocks_3}",
@@ -80,7 +84,7 @@ def build_vanilla_layers(init_dim: int, *, temporal_compressions: int = 2) -> st
         f"residual:{init_dim}",
         f"compress_space:{init_dim}",
         f"residual:{dim2}",
-        f"compress_time:{dim2}",
+        *([] if temporal_compressions < 1 else [f"compress_time:{dim2}"]),
         f"compress_space:{dim2}",
         f"residual:{dim4}",
         *([] if temporal_compressions < 2 else [f"compress_time:{dim4}"]),
@@ -104,76 +108,120 @@ ATTENTION_VARIANTS = {
 }
 
 # Controlling model width.
-DIMS = [32, 16, 8]
+DIMS = [32, 16]
 
-# More or less controls bottleneck dimension. Although, it also introduces a huge matrix in the tokenizer during training as this codebook size increases.
-# "This produces a (B*N, num_codebooks, codebook_size) tensor, then softmax over the codebook axis. For a 16×16 latent grid with codebook_size=65536, that's (B*256, 1, 65536) — 16× larger than the 4096 case. This is why those models use more memory and are slower.""
-#
-CODEBOOK_SIZES = [65536, 4096]
+# (codebook_size, num_codebooks) — name uses "cb{size}" for 1 codebook,
+# "cb{size}x{n}" for multiple.
+CODEBOOK_VARIANTS = [
+    (16384, 1),
+    (256, 4),
+    (512, 4),
+    (1024, 4),
+]
 
 # ── Generated registry ────────────────────────────────────────────
 
-TEMPORAL_VARIANTS = [2, 1]
+# (suffix, temporal_compressions)
+TEMPORAL_VARIANTS = [("_1t", 1), ("_0t", 0)]
 
-
-def _temporal_suffix(t: int) -> str:
-    return "" if t == 2 else "_1t"
-
+DEFAULT_SEQ_LEN = 16
+HALF_SEQ_LEN = 8
 
 MODEL_CONFIGS: list[ModelConfig] = [
     # Vanilla (residual + compress_space + compress_time)
     *(
         ModelConfig(
-            name=f"dim{dim}_cb{cb}_vanilla{_temporal_suffix(t)}",
+            name=f"dim{dim}_cb{cb}_ncb{ncb}_vanilla{tsuf}{seq_suffix}",
             init_dim=dim,
             codebook_size=cb,
-            layers=build_vanilla_layers(dim, temporal_compressions=t),
+            layers=build_vanilla_layers(dim, temporal_compressions=tc),
             scale_name="vanilla",
             attention_name="plain",
+            num_codebooks=ncb,
+            sequence_length=seq_len,
         )
         for dim in DIMS
-        for cb in CODEBOOK_SIZES
-        for t in TEMPORAL_VARIANTS
+        for cb, ncb in CODEBOOK_VARIANTS
+        for tsuf, tc in TEMPORAL_VARIANTS
+        for seq_len, seq_suffix in [
+            (DEFAULT_SEQ_LEN, ""),
+            (HALF_SEQ_LEN, f"_s{HALF_SEQ_LEN}"),
+        ]
     ),
     # Open-Genie variants
     *(
         ModelConfig(
-            name=f"dim{dim}_cb{cb}_{scale.name}{variant.suffix}{_temporal_suffix(t)}",
+            name=f"dim{dim}_cb{cb}_ncb{ncb}_{scale.name}{variant.suffix}{tsuf}{seq_suffix}",
             init_dim=dim,
             codebook_size=cb,
             layers=build_open_genie_layers(
                 dim,
                 scale.residual_blocks,
                 use_attention=variant.enabled,
-                temporal_compressions=t,
+                temporal_compressions=tc,
             ),
             scale_name=scale.name,
             attention_name=variant.name,
+            num_codebooks=ncb,
+            sequence_length=seq_len,
         )
         for dim in DIMS
-        for cb in CODEBOOK_SIZES
+        for cb, ncb in CODEBOOK_VARIANTS
         for scale in SCALE_CONFIGS.values()
         for variant in ATTENTION_VARIANTS.values()
-        for t in TEMPORAL_VARIANTS
+        for tsuf, tc in TEMPORAL_VARIANTS
+        for seq_len, seq_suffix in [
+            (DEFAULT_SEQ_LEN, ""),
+            (HALF_SEQ_LEN, f"_s{HALF_SEQ_LEN}"),
+        ]
     ),
 ]
 
 MODEL_CONFIGS_BY_NAME: dict[str, ModelConfig] = {m.name: m for m in MODEL_CONFIGS}
 
 
+# ── Genie 2 VAE config ────────────────────────────────────────────
+
+GENIE2_CONFIG = ModelConfig(
+    name="genie2_vae",
+    init_dim=32,
+    codebook_size=0,     # continuous latents, no codebook
+    layers="",           # not used — FrameVAE has its own architecture
+    scale_name="genie2",
+    attention_name="plain",
+    num_codebooks=0,
+    sequence_length=1,   # frame-independent
+    model_type="genie2",
+)
+
+MODEL_CONFIGS.append(GENIE2_CONFIG)
+MODEL_CONFIGS_BY_NAME[GENIE2_CONFIG.name] = GENIE2_CONFIG
+
+
 if __name__ == "__main__":
+    import sys, os, math
+
+    magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
+    profile = "--profile" in sys.argv
+
+    IMAGE_SIZE = 224
+    NUM_PALETTE_COLORS = 23
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from magvit2_pytorch import VideoTokenizer
 
-    NUM_PALETTE_COLORS = 23
-    IMAGE_SIZE = 256
+    if profile:
+        import torch
+        from torch.utils.flop_counter import FlopCounterMode
+        from tqdm import tqdm
 
-    print(f"{len(MODEL_CONFIGS)} models\n")
-    print(f"{'Name':<45} {'Params':>12}")
-    print("-" * 59)
-    for mc in MODEL_CONFIGS:
+    rows = []
+    iterator = tqdm(magvit_configs, desc="Profiling") if profile else magvit_configs
+    for mc in iterator:
+        layer_tokens = [t.strip() for t in mc.layers.split(",") if t.strip()]
         layers = tuple(
             (name, int(val)) if ":" in tok else tok
-            for tok in mc.layers.split(",")
+            for tok in layer_tokens
             for name, _, val in [tok.partition(":")]
         )
         model = VideoTokenizer(
@@ -186,5 +234,47 @@ if __name__ == "__main__":
             perceptual_loss_weight=0.0,
         )
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"{mc.name:<45} {n_params:>12,}")
-    print("-" * 59)
+
+        flops = None
+        if profile:
+            from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
+            model.eval()
+            total_frames = mc.sequence_length + mc.context_frames
+            x = torch.randn(1, NUM_PALETTE_COLORS, total_frames, IMAGE_SIZE, IMAGE_SIZE)
+            vcff = resolve_video_contains_first_frame(model, total_frames)
+            flop_counter = FlopCounterMode(display=False)
+            with torch.no_grad(), flop_counter:
+                model(x, return_recon_loss_only=True, video_contains_first_frame=vcff)
+            flops = flop_counter.get_total_flops()
+
+        n_spatial = sum(1 for t in layer_tokens if t.startswith("compress_space"))
+        n_temporal = sum(1 for t in layer_tokens if t.startswith("compress_time"))
+        spatial_positions = (IMAGE_SIZE // (2 ** n_spatial)) ** 2
+        latent_frames = mc.sequence_length / (2 ** n_temporal)
+        codes_per_frame = int(spatial_positions * mc.num_codebooks * latent_frames / mc.sequence_length)
+        bits_per_frame = codes_per_frame * math.log2(mc.codebook_size)
+        total_bits = bits_per_frame * mc.sequence_length
+        vocab_size = mc.num_codebooks * mc.codebook_size
+
+        rows.append((mc.name, n_params, flops, bits_per_frame, total_bits, vocab_size, mc.sequence_length, mc.context_frames))
+
+    rows.sort(key=lambda r: (r[1] or 0, r[0]))
+
+    def _fmt_flops(f: float) -> str:
+        if f >= 1e12:
+            return f"{f / 1e12:.1f}T"
+        if f >= 1e9:
+            return f"{f / 1e9:.1f}G"
+        return f"{f / 1e6:.0f}M"
+
+    print(f"\n{len(magvit_configs)} magvit2 models, {len(MODEL_CONFIGS)} total\n")
+    if profile:
+        print(f"{'Name':<55} {'Params':>12}  {'FLOPs':>7}  {'Bits/Img':>8}  {'TotalBits':>9}  {'Vocab':>9}  {'Imgs':>4}  {'Ctx':>3}")
+        print("-" * 118)
+        for name, n_params, flops, bits, total_bits, vocab, seq_len, ctx in rows:
+            print(f"{name:<55} {n_params:>12,}  {_fmt_flops(flops):>7}  {bits:>8.0f}  {total_bits:>9.0f}  {vocab:>9,}  {seq_len:>4}  {ctx:>3}")
+    else:
+        print(f"{'Name':<55} {'Params':>12}  {'Bits/Img':>8}  {'TotalBits':>9}  {'Vocab':>9}  {'Imgs':>4}  {'Ctx':>3}")
+        print("-" * 110)
+        for name, n_params, _, bits, total_bits, vocab, seq_len, ctx in rows:
+            print(f"{name:<55} {n_params:>12,}  {bits:>8.0f}  {total_bits:>9.0f}  {vocab:>9,}  {seq_len:>4}  {ctx:>3}")

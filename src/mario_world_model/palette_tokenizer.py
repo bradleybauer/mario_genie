@@ -62,6 +62,7 @@ class PaletteVideoTokenizer(VideoTokenizer):
         video_contains_first_frame: bool = True,
         *,
         targets: Tensor | None = None,
+        context_frames: int = 0,
     ):
         """Forward pass with optional cross-entropy loss.
 
@@ -105,7 +106,10 @@ class PaletteVideoTokenizer(VideoTokenizer):
             video_contains_first_frame=video_contains_first_frame,
         )
 
-        # Cross-entropy loss over palette classes
+        # Cross-entropy loss over palette classes (skip context frames)
+        if context_frames > 0:
+            logits = logits[:, :, context_frames:]
+            targets = targets[:, context_frames:]
         ce_loss = F.cross_entropy(logits, targets)
         total_loss = ce_loss + self.quantizer_aux_loss_weight * aux_losses
 

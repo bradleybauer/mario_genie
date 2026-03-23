@@ -74,37 +74,6 @@ Initial training runs for small models (<2M params) trained for an hour or two w
 24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule. Each run trained for 4 hours on an RTX 4090, across 8 machines.
 
 **Result:** 
-<p align="center">
-  <img src="pictures/sweep.png" alt="Training curves">
-</p>
-
-| name | params | best MSE | final MSE | max CB usage | steps |
-|------|-------:|---------:|----------:|-------------:|------:|
-| dim32_cb32768_genie_small | 5.5M | 0.0154 | 0.0181 | 6,562 | 42,473 |
-| dim32_cb32768_genie_base | 9.4M | 0.0161 | 0.0200 | 4,405 | 46,834 |
-| dim32_cb16384_genie_base | 9.4M | 0.0165 | 0.0192 | 5,862 | 32,917 |
-| dim32_cb65536_genie_base | 9.4M | 0.0174 | 0.0184 | 4,609 | 40,808 |
-| dim32_cb65536_genie_small | 5.5M | 0.0174 | 0.0194 | 7,107 | 28,080 |
-| dim64_cb32768_genie_small | 21.9M | 0.0179 | 0.0181 | 4,403 | 34,114 |
-| dim64_cb65536_genie_small | 21.9M | 0.0181 | 0.0262 | 3,771 | 40,599 |
-| dim32_cb16384_genie_small | 5.5M | 0.0186 | 0.0231 | 5,893 | 28,485 |
-| dim64_cb16384_genie_small | 21.9M | 0.0190 | 0.0237 | 4,018 | 38,838 |
-| dim64_cb16384_genie_base | 37.5M | 0.0202 | 0.0253 | 2,621 | 42,758 |
-| dim64_cb65536_genie_base | 37.5M | 0.0202 | 0.0241 | 1,866 | 57,434 |
-| dim32_cb65536_genie_small_attn | 7.0M | 0.0214 | 0.0254 | 4,547 | 43,767 |
-| dim32_cb32768_genie_base_attn | 10.9M | 0.0224 | 0.0247 | 4,223 | 38,876 |
-| dim64_cb32768_genie_base | 37.5M | 0.0226 | 0.0371 | 2,734 | 41,241 |
-| dim32_cb65536_genie_base_attn | 10.9M | 0.0227 | 0.0244 | 4,506 | 31,674 |
-| dim64_cb32768_genie_base_attn | 41.8M | 0.0233 | 0.0233 | 1,856 | 49,008 |
-| dim64_cb65536_genie_small_attn | 26.1M | 0.0241 | 0.0259 | 2,723 | 46,109 |
-| dim64_cb16384_genie_small_attn | 26.1M | 0.0250 | 0.0256 | 2,627 | 39,133 |
-| dim32_cb32768_genie_small_attn | 7.0M | 0.0252 | 0.0305 | 6,293 | 28,740 |
-| dim64_cb16384_genie_base_attn | 41.8M | 0.0255 | 0.0384 | 2,239 | 37,431 |
-| dim32_cb16384_genie_base_attn | 10.9M | 0.0258 | 0.0311 | 3,927 | 37,932 |
-| dim32_cb16384_genie_small_attn | 7.0M | 0.0303 | 0.0412 | 5,495 | 20,033 |
-| dim64_cb32768_genie_small_attn | 26.1M | 0.0790 | 0.1085 | 35 | 38,318 |
-| dim64_cb65536_genie_base_attn | 41.8M | 0.0889 | 0.1109 | 18 | 51,076 |
-
 None of the configurations pushed the error below the target threshold (MSE < 0.0008). The best reconstruction MSE was 0.0154 (`dim32_cb32768_genie_small`). Smaller dim-32 models without attention consistently outperformed their dim-64 and attention-equipped counterparts. Two dim-64 attention runs collapsed entirely (codebook usage = 1).
 
 Models more or less performed similarly — at this training scale, none of the hyperparameters made a huge difference.
@@ -255,12 +224,34 @@ TODO
 
 **Context:**
 Reconstruction of frame 1 (0-indexed) is consistently worse than all other frames in a sample. Consider adding context frames.
+Those causal conv filters will have to be "dual purpose" to account for being applied on images with zero padding. I imagine that wouldn't be very efficient.
 
 **Approach:**
 Prepend extra context frames during both training and inference. The dataset returns `seq_len + N_CTX` frames, and the loss is computed only on the final `seq_len` frames, discarding the context prefix from the output. This gives early frames real temporal context instead of zero-padding.
 
 **Result:**
 TODO
+
+<br>
+<br>
+
+# Tokenizer variables to explore
+
+**Context:**
+I'm interested in testing different LFQ params. Specifically the num_codebooks and codebook_size params. Currently num_codebooks=1 and codebook_size=65536.
+I would like to test num_codebooks=2 and codebook_size=256 which will result in the overall same number of potential discrete codes and the same bottleneck dimension but would decrease the number of entries in the softmax calculation which could improve optimization performance.
+
+Additionally I want to test a version of the video autoencoder with more context frames, a version without temporal downsampling, and a version trained on a cleaner dataset.
+
+A previous result from a single-image VAE, named "FrameVAE", that claude whipped up was quite surprising. It fit a small subset of data perfectly and within a few minutes of training.
+
+Given that result I'm also interested in what the most significant difference is between FrameVAE and my VideoTokenizer. Is it the discrete bottleneck or the temporal convs that explain the difference in training efficiency best? I think it's the bottle neck size... VideoTokenizer has 1/16th the number of bits in the bottleneck per frame as FrameVAE, wow.
+
+**Approach:**
+Train more models
+
+**Result:**
+I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook.
 
 <!-- Template -->
 

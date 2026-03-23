@@ -257,7 +257,7 @@ def train():
                         help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
-    parser.add_argument("--eval-samples", type=int, default=256,
+    parser.add_argument("--eval-samples", type=int, default=5000,
                         help="Number of held-out samples for end-of-training evaluation (0 to disable)")
     _default_workers = min(get_effective_cpu_count(), 64)
     parser.add_argument("--num-workers", type=int, default=_default_workers,
@@ -325,10 +325,11 @@ def train():
     )
     parser.add_argument(
         "--crop-224",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Center-crop preprocessed 256x256 frames to 224x224 by removing 16px "
-            "on each edge. Useful when you want a 14x14 latent grid instead of 15x15."
+            "on each edge for a 14x14 latent grid. Enabled by default; use --no-crop-224 to disable."
         ),
     )
     args = parser.parse_args()
@@ -344,19 +345,29 @@ def train():
 
     image_size = crop_size or DEFAULT_IMAGE_SIZE
 
+    magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
+    magvit_configs_by_name = {c.name: c for c in magvit_configs}
+
     if args.list_models:
-        for name in sorted(MODEL_CONFIGS_BY_NAME):
+        for name in sorted(magvit_configs_by_name):
             print(name)
         return
 
     if args.model is None:
-        mc = random.choice(MODEL_CONFIGS)
+        mc = random.choice(magvit_configs)
         args.model = mc.name
         print(f"[random] Selected model: {args.model}")
-    elif args.model not in MODEL_CONFIGS_BY_NAME:
+    elif args.model not in magvit_configs_by_name:
+        if args.model in MODEL_CONFIGS_BY_NAME:
+            parser.error(f"Model {args.model!r} is not a magvit2 model. Use scripts/train_genie2.py instead.")
         parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
     else:
-        mc = MODEL_CONFIGS_BY_NAME[args.model]
+        mc = magvit_configs_by_name[args.model]
+
+    seq_len = mc.sequence_length
+    ctx_frames = mc.context_frames
+    total_frames = seq_len + ctx_frames
+
     tokenizer_layers = tuple(
         (name, int(val)) if ":" in tok else tok
         for tok in mc.layers.split(",")
@@ -403,7 +414,7 @@ def train():
     print_system_info(system_info)
 
     dataset = MarioVideoDataset(
-        args.data_dir, seq_len=SEQUENCE_LENGTH,
+        args.data_dir, seq_len=total_frames,
         subset_n=args.overfit_n,
         seed=args.seed,
         num_workers=args.num_workers,
@@ -411,8 +422,8 @@ def train():
         crop_size=crop_size,
     )
     print(
-        f"Found {len(dataset)} sequence segments of length {SEQUENCE_LENGTH} frames "
-        f"(image_size={image_size})."
+        f"Found {len(dataset)} sequence segments of {total_frames} frames "
+        f"({ctx_frames} context + {seq_len} target, image_size={image_size})."
     )
 
     # ── Split eval set (deterministic via torch seed) ────────────────
@@ -480,13 +491,14 @@ def train():
         image_size=image_size,
         init_dim=mc.init_dim,
         codebook_size=mc.codebook_size,
+        num_codebooks=mc.num_codebooks,
         layers=tokenizer_layers,
     ).to(device)
     # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
     tokenizer.discr = None
     tokenizer.multiscale_discrs = None
     palette = palette.to(device)
-    video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, SEQUENCE_LENGTH)
+    video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, total_frames)
 
     # ── Auto batch-size ──
     if args.auto_batch_size and device.type == "cuda" and not args.resume_from:
@@ -497,7 +509,7 @@ def train():
         args.batch_size = find_max_batch_size(
             tokenizer,
             image_size=image_size,
-            seq_len=SEQUENCE_LENGTH,
+            seq_len=total_frames,
             device=device,
             floor=1,
             ceiling=ceiling,
@@ -561,7 +573,9 @@ def train():
     # Save config for reproducibility
     config = vars(args).copy()
     config["image_size"] = image_size
-    config["sequence_length"] = SEQUENCE_LENGTH
+    config["sequence_length"] = seq_len
+    config["context_frames"] = ctx_frames
+    config["total_frames"] = total_frames
     config["layers"] = [list(l) if isinstance(l, tuple) else l for l in tokenizer_layers]
     config["git_hash"] = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or None
     config["timestamp"] = datetime.now().isoformat()
@@ -586,7 +600,10 @@ def train():
         unwrapped.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         if not args.constant_lr:
-            scheduler.load_state_dict(ckpt['scheduler'])
+            try:
+                scheduler.load_state_dict(ckpt['scheduler'])
+            except (KeyError, TypeError):
+                print("[resume] Scheduler state incompatible (likely changed schedule type), rebuilding from current step")
         else:
             # Rebuild the constant scheduler *after* optimizer restore so it
             # locks in the checkpoint's last LR as its base_lr.
@@ -614,7 +631,7 @@ def train():
     _perf_window_samples = 0
     _PERF_WINDOW = 20  # rolling window size in steps
     # Bytes per sample for throughput: one-hot input (B, K, T, H, W) float32
-    _bytes_per_sample = num_palette_colors * SEQUENCE_LENGTH * image_size * image_size * 4
+    _bytes_per_sample = num_palette_colors * total_frames * image_size * image_size * 4
 
     def _gpu_stats():
         """Return dict of GPU stats, or empty dict if unavailable."""
@@ -711,10 +728,13 @@ def train():
                     codes, video_contains_first_frame=video_contains_first_frame,
                 )
                 del codes, inp
-                eval_losses.append(F.cross_entropy(recon_video, targets).item())
-                recon_idx = recon_video.argmax(dim=1)
-                total_pixels += targets.numel()
-                correct_pixels += (recon_idx == targets).sum().item()
+                # Mask context frames from eval metrics
+                eval_recon = recon_video[:, :, ctx_frames:] if ctx_frames > 0 else recon_video
+                eval_tgt = targets[:, ctx_frames:] if ctx_frames > 0 else targets
+                eval_losses.append(F.cross_entropy(eval_recon, eval_tgt).item())
+                recon_idx = eval_recon.argmax(dim=1)
+                total_pixels += eval_tgt.numel()
+                correct_pixels += (recon_idx == eval_tgt).sum().item()
                 del recon_video, recon_idx, targets
 
         eval_recon_loss = sum(eval_losses) / len(eval_losses)
@@ -780,6 +800,7 @@ def train():
                 targets=targets,
                 return_loss=True,
                 video_contains_first_frame=video_contains_first_frame,
+                context_frames=ctx_frames,
             )
             loss.backward()
         except torch.cuda.OutOfMemoryError:
@@ -993,7 +1014,7 @@ def train():
     torch.save(model_sd, ckpt_path)
     print(f"Checkpoint saved to {ckpt_path} ({len(model_sd)} keys)")
 
-    # Full training state for ASHA / resume
+    # Full training state for resume
     training_state = {
         'model': model_sd,
         'optimizer': optimizer.state_dict(),

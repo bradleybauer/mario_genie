@@ -6,8 +6,8 @@ directory picker first.  Click a run to view its reconstructions, then use
 the Back button (or Escape) to return to the picker.
 
 Usage:
-    python scripts/view_reconstruction.py results/asha_sweep/
-    python scripts/view_reconstruction.py results/asha_sweep/some_run/ --fps 8
+    python scripts/view_reconstruction.py results/sweep/
+    python scripts/view_reconstruction.py results/sweep/some_run/ --fps 8
     python scripts/view_reconstruction.py checkpoints/magvit2/step_000200.png
 """
 

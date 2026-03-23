@@ -124,8 +124,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--crop-224",
-        action="store_true",
-        help="Use 224x224 image size (center-crop from 256x256).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use 224x224 image size (center-crop from 256x256). Enabled by default; use --no-crop-224 to disable.",
     )
     parser.add_argument(
         "--model",

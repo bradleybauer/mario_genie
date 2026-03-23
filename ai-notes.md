@@ -308,3 +308,48 @@ Concretely:
 Gradients pass through the quantization via the straight-through estimator (`x + (quantized - x).detach()`). An entropy auxiliary loss encourages codebook utilization: per-sample entropy is minimized (confident predictions) while batch-wide entropy is maximized (uniform code usage). The discrete indices are just the binary pattern of positive/negative dimensions packed into integers.
 
 
+# Testing image-only AE with continuous latent and diffusion
+Prompted claude to generate a small model that more closely resembles what genie-2 might look like.
+
+It produced a 1.3 million parameter image-only autoencoder which very quickly memorized a small dataset of 5 images.
+
+1. **Frame VAE** — 2D conv encoder/decoder compresses 224×224 palette-indexed frames to continuous 4×14×14 latents (~1.6M params).
+2. **Dynamics model** — Causal transformer (6 layers, 256 dim) processes context latents + action embeddings, then a small U-Net denoiser generates the next frame's latent via DDPM (~5.6M params total).
+
+No discrete tokens — continuous latents with diffusion sampling.
+
+
+### Streaming Decode Investigation
+
+I investigated whether `scripts/play_autoencoder.py` could be sped up by carrying forward causal decoder state so each new frame would be reconstructed exactly as if the full 16-frame window had been decoded together.
+
+**What was verified:**
+- The MAGVIT decoder is temporally causal (`CausalConv3d`, causal time downsampling, time upsampling).
+- A cached **decoder-only** streaming implementation can reproduce standard full-window decoding to numerical precision **when the discrete latent tokens are already known**.
+- This means decoder-state caching is a good fit for a future **world-model rollout path** where the dynamics transformer already emits discrete tokens.
+
+**What failed in `play_autoencoder.py`:**
+- `play_autoencoder.py` does not start from discrete tokens. It first encodes live frames, then applies LFQ, then decodes.
+- I built a streaming encoder + decoder path and compared it to standard 16-frame encode/decode.
+- The streamed encoder matched the full encoder only up to very small floating-point differences.
+- Those tiny differences matter because LFQ is sign-based: small pre-quantization changes can flip bits in the discrete code.
+- Once LFQ indices differ, reconstructions are no longer equivalent to the normal 16-frame forward pass.
+
+**Conclusion:**
+- For the autoencoder viewer, **decoder-state carry alone is not enough** to preserve exact behavior.
+- Exact equivalence would require a bit-identical streaming encoder before LFQ, not just a cached decoder.
+- Because of that, `play_autoencoder.py` should remain on the correctness-first **full-window encode + decode** path unless approximation is acceptable.
+
+**Practical implication:**
+- Use full-window autoencoder reconstruction for live input visualization.
+- Revisit decoder-state caching later in the **autoregressive world-model inference** path, where the model operates on already-discrete latent tokens and exact streaming is much more straightforward.
+
+## Theoretical Minimum Reconstruction Loss
+
+The palette tokenizer uses **cross-entropy** (`F.cross_entropy` with default mean reduction) over all pixels. For a single wrong pixel with optimal logits (probability ~0.5 on the correct class), the minimum recon loss is:
+
+$$\text{recon\_loss} = \frac{\ln 2}{B \times T \times H \times W}$$
+
+Example: batch=6, seq_len=16, image_size=224 → $N = 4{,}816{,}896$ pixels → minimum loss ≈ $1.44 \times 10^{-7}$.
+
+
