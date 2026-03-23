@@ -7,7 +7,7 @@
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
 - [Disentangling Hidden State From RAM](#disentangling-hidden-state-from-ram)
-- [SMB3/SuperMarioLand2](#smb3)
+- [SMB3 x Super Mario Land 2](#smb3-x-super-mario-land-2)
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
 - [Tokenizer Variables To Explore](#tokenizer-variables-to-explore)
@@ -106,7 +106,7 @@ It turns out Super Mario Bros. on the NES only uses ~30 colors. Across my datase
 
 **Approach:** 
 
-It was not realistic to change only the VideoTokenizer's output shape, so I proposed changing both the input and output representations. After all, if it is easier for the decoder to produce palette probabilities, then it may also be easier for the encoder to disentangle information from those probabilities. The change was straightforward — `magvit2-pytorch` exposes a "number of channels" argument that we set to the number of palette colors. As a bonus, the palette-indexed representation also provides:
+It was not realistic to change only the VideoTokenizer's output shape, so I proposed changing both the input and output representations. After all, if it is easier for the decoder to produce palette probabilities, then it may also be easier for the encoder to disentangle information from that same representation. The change was straightforward — `magvit2-pytorch` exposes a "number of channels" argument that we set to the number of palette colors. As a bonus, the palette-indexed representation also provides:
 
 - Smaller CPU->GPU bandwidth requirement
 - Smaller dataset size on disk and lower network bandwidth usage
@@ -189,7 +189,7 @@ TODO
 <br>
 <br>
 
-# SMB3
+# SMB3 x Super Mario Land 2
 
 **Context:**
 
@@ -274,7 +274,7 @@ Additionally I want to test a version of the video autoencoder with more context
 
 A previous result from a single-image VAE, named "FrameVAE", that claude whipped up was quite surprising. It fit a small subset of data perfectly and within a few minutes of training.
 
-Given that result I'm also interested in what the most significant difference is between FrameVAE and my VideoTokenizer. Is it the discrete bottleneck or the temporal convs that explain the difference in training efficiency best? I think it's the bottle neck size... VideoTokenizer has 1/16th the number of bits in the bottleneck per frame as FrameVAE, wow.
+Given that result I'm also interested in what the most significant difference is between FrameVAE and my VideoTokenizer. Is it the discrete bottleneck or the temporal convs/downsampling that explain the difference in training efficiency best? I think it's the bottleneck size... VideoTokenizer has 1/16th the number of bits in the bottleneck per frame as FrameVAE, wow.
 
 **Approach:**
 
