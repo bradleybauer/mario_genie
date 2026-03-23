@@ -84,8 +84,8 @@ Initial training runs for small models (<2M params) trained for an hour or two w
 
 **Approach:** 
 
-24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule.
-Each run trained for 4 hours on an RTX 4090, across 8 machines.
+I trained 24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule.
+Each model trained for 4 hours on an RTX 4090, across 8 machines.
 
 **Result:** 
 
