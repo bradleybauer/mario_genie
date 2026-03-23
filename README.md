@@ -22,11 +22,16 @@
 
 # Single Sample Overfit Baseline
 
-**Context:** Initial tests showed that validation reconstruction was exceptionally bad. So much so that I suspected the training implementation contained a bug.
+**Context:**
 
-**Approach:** As a sanity check I thought to verify the tokenizer can reconstruct a single video sequence near-perfectly.
+Initial tests showed that validation reconstruction was exceptionally bad. So much so that I suspected the training implementation contained a bug.
+
+**Approach:**
+
+As a sanity check I thought to verify the tokenizer can reconstruct a single video sequence near-perfectly.
 
 **Result:**
+
 The validation reconstruction was still extremely poor even on the single sample dataset.
 I then found a **codebook bypass bug**: `encode()`/`decode()` skipped quantization entirely in the validation path.
 This was fixed by using `tokenize()` + `decode_from_code_indices()`.
@@ -36,13 +41,16 @@ This was fixed by using `tokenize()` + `decode_from_code_indices()`.
 
 # Which Tokens Correspond To Which World And Stages
 
-**Context:** 
+**Context:**
+
 During inference I want the initial world and stage to be configurable.
 
 **Approach:** 
+
 I will use the trained autoencoder to encode the initial frame for each world and stage. Those encodings will later be used as the initial tokens during inference.
 
 **Result:** 
+
 TODO
 
 <br>
@@ -50,13 +58,16 @@ TODO
 
 # Uniform Data Collection
 
-**Context:** 
+**Context:**
+
 I want a uniform distribution of training data across all world/stage/x-position bins. However, the emulator can only initialize Mario at the start of a stage, so later portions of each stage are naturally underrepresented — reaching them requires playing through the earlier parts first.
 
 **Approach:** 
+
 During collection, every episode's actions and x-positions are recorded as rollouts. At periodic rebalance intervals the collector scans progression coverage across the existing data, computes per-bin deficits (inverse sampling weights), and builds a replay pool of recorded action sequences that reach underrepresented bins. On each episode reset, the environment samples a target bin proportional to its deficit weight, replays the corresponding recorded actions to fast-forward the emulator to that position, and then resumes live collection from there.
 
 **Result:** 
+
 This is not fully solved — some bins remain under represented — but the distribution is significantly more uniform than naive sequential play.
 <p align="center">
   <img src="pictures/data_balance.png" alt="Progression distribution across world-stage bins">
@@ -72,9 +83,11 @@ This is not fully solved — some bins remain under represented — but the dist
 Initial training runs for small models (<2M params) trained for an hour or two were unsuccessful. Would a better GPU help? More training steps? Different codebook size? To answer these questions, I decided to launch a larger and more organized parameter sweep.
 
 **Approach:** 
+
 24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule. Each run trained for 4 hours on an RTX 4090, across 8 machines.
 
 **Result:** 
+
 None of the configurations pushed the error below the target threshold (MSE < 0.0008). The best reconstruction MSE was 0.0154 (`dim32_cb32768_genie_small`). Smaller dim-32 models without attention consistently outperformed their dim-64 and attention-equipped counterparts. Two dim-64 attention runs collapsed entirely (codebook usage = 1).
 
 Models more or less performed similarly — at this training scale, none of the hyperparameters made a huge difference.
@@ -91,16 +104,19 @@ Chatting with AI I found that using a different loss function would likely help.
 
 # Dense Cross-Entropy And NES Color Palette
 
-**Context:** 
+**Context:**
+
 It turns out Super Mario Bros. on the NES only uses ~30 colors. Across my dataset of a million images (covering nearly the entire game), I observe just 23 distinct colors. AI suggested changing the model to use cross-entropy loss on palette probability distributions instead of MSE loss on raw RGB pixels.
 
 **Approach:** 
+
 It was not realistic to change only the VideoTokenizer's output shape, so I proposed changing both the input and output representations. After all, if it is easier for the decoder to produce palette probabilities, then it may also be easier for the encoder to disentangle information from those probabilities. The change was straightforward — `magvit2-pytorch` exposes a "number of channels" argument that we set to the number of palette colors. As a bonus, the palette-indexed representation also provides:
 
 - Significantly smaller CPU->GPU bandwidth requirement, meaning faster training
 - Significantly smaller dataset size on disk and lower network bandwidth usage
 
 **Result:** 
+
 The new model trained significantly faster on my 3070, completing ~60k steps in 3 hours.
 It clearly has a much better grasp of spatial layout within the image.
 
@@ -110,13 +126,16 @@ It clearly has a much better grasp of spatial layout within the image.
 
 # Dataset Refactor Number 32515123
 
-**Context:** 
+**Context:**
+
 All previous data designs were fundamentally flawed — they used random level selection and even included completely random scene cuts mid-sequence. This project demands a dataset that reflects real game mechanics: contiguous gameplay with natural transitions only.
 
 **Approach:** 
+
 The old pipeline ran multiple environments in parallel, writing fixed-length chunks `(B, T, C, H, W)` with random level selection and mid-sequence scene cuts. The new pipeline produces contiguous sessions `(N, C, H, W)` — one per collection run — where every frame-to-frame transition is a real gameplay transition. The existing chunk-based dataset was converted into the new session format, and all chunk-related code was removed from the codebase.
 
 **Result:**
+
 Data collection now produces sessions that faithfully represent real gameplay. Training code is simpler and no longer needs to detect and skip corrupted sequences at load time.
 
 <br>
@@ -124,7 +143,8 @@ Data collection now produces sessions that faithfully represent real gameplay. T
 
 # Disentangling Hidden State From RAM
 
-**Context:** 
+**Context:**
+
 If Mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training. The game's "hidden state" — which blocks have been hit, which items collected, which enemies defeated — lives in the NES's 2KB of internal RAM and is not fully recoverable from the image alone.
 
 The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`, divided into four regions:
@@ -144,6 +164,7 @@ For embedding purposes, **Zero Page + Game Data (1,536 bytes)** captures all mea
 The NES CPU runs at ~1.79 MHz (~29,781 cycles per frame), but the game loop is frame-synchronized: the PPU fires a Vertical Blank NMI (Non-Maskable Interrupt) at 60 Hz, the game logic runs atomically within that window, then idles until the next NMI. The emulator's `env.step()` advances one full NMI-to-NMI cycle and then exposes RAM — this is the only coherent snapshot where all variables agree with each other. One RAM snapshot per frame = zero information loss.
 
 **Approach:** 
+
 Potentially add a temporal embedding of the NES 2KB of RAM to the latent space.
 Wonder how that would affect what the encoder learns to encode. Probably a shift toward more visual features?
 An idea is you could side-step the image encoder altogether. Just predict pixels based on RAM embeddings.
@@ -158,6 +179,7 @@ Using both images and RAM should perform better than either alone. The image emb
 For storage, the RAM is delta-encoded (XOR against previous frame) before `savez_compressed` — frame-to-frame deltas are ~90% zeros, and zlib compresses that extremely well.
 
 **Result:** 
+
 Added a NES RAM visualizer to both `play_ram_viz.py` (SMB1) and `play_nes.py --ram` (any ROM).
 <p align="center">
   <img src="pictures/smb1ram.png" alt="nes ram in game visualization">
@@ -174,6 +196,7 @@ TODO
 # SMB3
 
 **Context:**
+
 I'm interested in building an smb3 world model as well (lol). I imagine this would be MUCH harder.
 One idea I had for how to make things easier would be to clean the data a bit.
 Specifically fixing flickering in the smb3 status bar and removing the max 8 sprite limit.
@@ -183,6 +206,7 @@ I do not want the model to have to spend capacity to reverse engineer exactly ho
 (Edit: I think I'll attempt super mario land 2 before smb3.)
 
 **Approach:**
+
 The status bar flickering can be fixed by writing 5 bytes to the ROM file. The three `0xEA` bytes are 6502 NOP instructions, effectively disabling the code that caused the flicker. This will cause a minor floor-shaking glitch during the end credits.
 
 | Address   | Before | After  | Note |
@@ -197,6 +221,7 @@ To fix the sprite limit will require using a different emulator.
 A good candidate is Mesen which also emulates sound which would be neat to learn how to model (as if an smb3 world model was't ambitions enough lol)
 
 **Result:**
+
 Big TODO
 
 <br>
@@ -204,7 +229,8 @@ Big TODO
 
 # More data artifacts
 
-**Context:** 
+**Context:**
+
 The model is starting to learn the finer details in the dataset and unfortunately it's learning mid-frame spilt artifacts.
 ![mid-frame split](pictures/split.png)
 
@@ -212,10 +238,12 @@ BTW here is an example of a "scene-cut". This one is "natural" meaning it repres
 ![scene-cut](pictures/scene-cut.gif)
 
 **Approach:** 
+
 Prompt claude more carefully for a script to find frame splits (and "unnatural" scene-cuts).
 Check if frame spilts can be prevented with Mesen.
 
 **Result:** 
+
 TODO
 
 <br>
@@ -224,13 +252,16 @@ TODO
 # Causal Conv Temporal Padding
 
 **Context:**
+
 Reconstruction of frame 1 (0-indexed) is consistently worse than all other frames in a sample. Consider adding context frames.
 Those causal conv filters will have to be "dual purpose" to account for being applied on images with zero padding. I imagine that wouldn't be very efficient.
 
 **Approach:**
+
 Prepend extra context frames during both training and inference. The dataset returns `seq_len + N_CTX` frames, and the loss is computed only on the final `seq_len` frames, discarding the context prefix from the output. This gives early frames real temporal context instead of zero-padding.
 
 **Result:**
+
 TODO
 
 <br>
@@ -239,6 +270,7 @@ TODO
 # Tokenizer variables to explore
 
 **Context:**
+
 I'm interested in testing different LFQ params. Specifically the num_codebooks and codebook_size params. Currently num_codebooks=1 and codebook_size=65536.
 I would like to test num_codebooks=2 and codebook_size=256 which will result in the overall same number of potential discrete codes and the same bottleneck dimension but would decrease the number of entries in the softmax calculation which could improve optimization performance.
 
@@ -249,9 +281,11 @@ A previous result from a single-image VAE, named "FrameVAE", that claude whipped
 Given that result I'm also interested in what the most significant difference is between FrameVAE and my VideoTokenizer. Is it the discrete bottleneck or the temporal convs that explain the difference in training efficiency best? I think it's the bottle neck size... VideoTokenizer has 1/16th the number of bits in the bottleneck per frame as FrameVAE, wow.
 
 **Approach:**
+
 Train more models
 
 **Result:**
+
 I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook.
 
 <!-- Template -->
