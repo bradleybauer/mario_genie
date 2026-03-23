@@ -10,7 +10,7 @@
 - [SMB3/SuperMarioLand2](#smb3)
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
-- [Tokenizer variables to explore](#tokenizer-variables-to-explore)
+- [Tokenizer Variables To Explore](#tokenizer-variables-to-explore)
 
 <br>
 
@@ -263,7 +263,7 @@ TODO
 <br>
 <br>
 
-# Tokenizer variables to explore
+# Tokenizer Variables To Explore
 
 **Context:**
 
