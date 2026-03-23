@@ -80,23 +80,19 @@ This is not fully solved — some bins remain under represented — but the dist
 
 **Context:**
 
-Initial training runs for small models (<2M params) trained for an hour or two were unsuccessful. Would a better GPU help? More training steps? Different codebook size? To answer these questions, I decided to launch a larger and more organized parameter sweep.
+Initial training runs for small models (<2M params) trained for an hour or two were unsuccessful. I want to understand if any of the variables I know how tune will give a significant decrease in reconstruction loss.
 
 **Approach:** 
 
-24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule. Each run trained for 4 hours on an RTX 4090, across 8 machines.
+24 configurations varying `init_dim` (32, 64), `codebook_size` (16k, 32k, 64k), model size (small, base), and attention (with/without), along with a smarter learning rate schedule.
+Each run trained for 4 hours on an RTX 4090, across 8 machines.
 
 **Result:** 
 
-None of the configurations pushed the error below the target threshold (MSE < 0.0008). The best reconstruction MSE was 0.0154 (`dim32_cb32768_genie_small`). Smaller dim-32 models without attention consistently outperformed their dim-64 and attention-equipped counterparts. Two dim-64 attention runs collapsed entirely (codebook usage = 1).
-
 Models more or less performed similarly — at this training scale, none of the hyperparameters made a huge difference.
-All models learned throughout training, with a clear downward trend in loss over time.
-Two of the attention models failed to utilize the codebook, and their loss remained nearly constant.
+All models learned throughout training, with a clear, but not very steep, downward trend in loss over time.
 
-Given the downward trend, I expect that significantly longer training would bring the models much closer to convergence.
-
-But I would rather not run this experiment for 6 days because $$$ :'( and I'm concerned the reconstructions would be more blurry than I'd like.
+Given the trend, I think longer training could improve quality to an acceptable degree.
 Chatting with AI I found that using a different loss function would likely help.
 
 <br>
@@ -112,12 +108,12 @@ It turns out Super Mario Bros. on the NES only uses ~30 colors. Across my datase
 
 It was not realistic to change only the VideoTokenizer's output shape, so I proposed changing both the input and output representations. After all, if it is easier for the decoder to produce palette probabilities, then it may also be easier for the encoder to disentangle information from those probabilities. The change was straightforward — `magvit2-pytorch` exposes a "number of channels" argument that we set to the number of palette colors. As a bonus, the palette-indexed representation also provides:
 
-- Significantly smaller CPU->GPU bandwidth requirement, meaning faster training
-- Significantly smaller dataset size on disk and lower network bandwidth usage
+- Smaller CPU->GPU bandwidth requirement
+- Smaller dataset size on disk and lower network bandwidth usage
 
 **Result:** 
 
-The new model trained significantly faster on my 3070, completing ~60k steps in 3 hours.
+The new model trained faster on my 3070, completing ~60k steps in 3 hours.
 It clearly has a much better grasp of spatial layout within the image.
 
 
@@ -132,7 +128,7 @@ All previous data designs were fundamentally flawed — they used random level s
 
 **Approach:** 
 
-The old pipeline ran multiple environments in parallel, writing fixed-length chunks `(B, T, C, H, W)` with random level selection and mid-sequence scene cuts. The new pipeline produces contiguous sessions `(N, C, H, W)` — one per collection run — where every frame-to-frame transition is a real gameplay transition. The existing chunk-based dataset was converted into the new session format, and all chunk-related code was removed from the codebase.
+The old pipeline stored fixed-length chunks `(B, T, C, H, W)` with random level selection and mid-sequence scene cuts. The new pipeline produces contiguous sessions `(N, C, H, W)` — one per collection run — where every frame-to-frame transition is a real gameplay transition. The existing chunk-based dataset was converted into the new session format, and all chunk-related code was removed from the codebase.
 
 **Result:**
 
