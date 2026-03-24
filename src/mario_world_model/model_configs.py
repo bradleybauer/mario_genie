@@ -32,7 +32,7 @@ class ModelConfig:
     attention_name: str
     num_codebooks: int = 1
     sequence_length: int = 16
-    context_frames: int = 4
+    context_frames: int = 8
     model_type: str = "magvit2"  # "magvit2" or "genie2"
 
 
@@ -58,11 +58,11 @@ def build_open_genie_layers(
         f"consecutive_residual:{blocks_1}",
         f"compress_space:{init_dim}",
         f"consecutive_residual:{blocks_2}",
-        *([] if temporal_compressions < 1 else [f"compress_time:{stage2_dim}"]),
+        *([] if temporal_compressions < 2 else [f"compress_time:{stage2_dim}"]),
         f"compress_space:{stage2_dim}",
         *attention_layers,
         f"consecutive_residual:{blocks_3}",
-        *([] if temporal_compressions < 2 else [f"compress_time:{stage3_dim}"]),
+        *([] if temporal_compressions < 1 else [f"compress_time:{stage3_dim}"]),
         f"compress_space:{stage3_dim}",
         *attention_layers,
         f"consecutive_residual:{blocks_4}",
@@ -115,7 +115,7 @@ DIMS = [32, 16]
 CODEBOOK_VARIANTS = [
     (16384, 1),
     (256, 4),
-    (512, 4),
+    (512, 2),
     (1024, 4),
 ]
 
@@ -123,7 +123,6 @@ CODEBOOK_VARIANTS = [
 
 # (suffix, temporal_compressions)
 TEMPORAL_VARIANTS = [("_1t", 1), ("_0t", 0)]
-
 DEFAULT_SEQ_LEN = 16
 HALF_SEQ_LEN = 8
 

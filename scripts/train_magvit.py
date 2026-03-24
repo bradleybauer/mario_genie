@@ -233,7 +233,7 @@ def train():
         help="Cap batch size (0 = no cap). Use with --auto-batch-size to "
              "limit large batches for faster convergence.",
     )
-    parser.add_argument("--lr", type=float, default=8e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000,
                         help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
     parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
@@ -253,8 +253,10 @@ def train():
         action="store_true",
         help="Print available model configs and exit.",
     )
-    parser.add_argument("--tf32", action="store_true",
-                        help="Enable TF32 tensor cores for matmul (Ampere+ GPUs)")
+    parser.add_argument("--tf16", action="store_true",
+                        help="Enable TF16")
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable graph compilation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
     parser.add_argument("--eval-samples", type=int, default=5000,
@@ -493,6 +495,7 @@ def train():
         codebook_size=mc.codebook_size,
         num_codebooks=mc.num_codebooks,
         layers=tokenizer_layers,
+        lfq_spherical=True
     ).to(device)
     # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
     tokenizer.discr = None
@@ -527,8 +530,11 @@ def train():
           print(f"Capped batch_size {args.batch_size} -> {num_unique_samples} (unique samples)")
           args.batch_size = num_unique_samples
 
-    # ── TF32 ─────────────────────────────────────────────────────────
-    if args.tf32 and torch.cuda.is_available():
+    # ── Float Precision ─────────────────────────────────────────────────────────
+    if args.tf16:
+        torch.set_float32_matmul_precision('medium')
+        print("[tf16] TF16 matmul precision enabled")
+    elif torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
         print("[tf32] TF32 matmul precision enabled")
 
@@ -622,6 +628,12 @@ def train():
         if args.max_steps > 0 and start_step >= args.max_steps:
             print(f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do.")
             return
+
+    # ── Torch Compile ─────────────────────────────────────────────────────────
+    if args.compile:
+        print("[compile] Compiling the model with torch.compile()…")
+        tokenizer = torch.compile(tokenizer)
+        print("[compile] Compilation complete.")
 
     # ── Perf tracking ────────────────────────────────────────────────
     _perf_step_count = start_step

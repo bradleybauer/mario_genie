@@ -10,3 +10,7 @@ Would be really interested to see a no-image-encoder model that uses attention o
 
 Use tf32 or amp son
 Remeber to write down some thoughts on the bottleneck bitwidth calculations
+
+Skimmed the magvit2 paper, notes: Increase warmup period, push the temporal downsampling layer deeper, codebook size of 2^18 should be enough which would be two 512 sized codebooks
+
+Instead of all combinations of architecture variables maybe just define an order to test them as additions to some base model

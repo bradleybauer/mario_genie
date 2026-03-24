@@ -216,6 +216,9 @@ The status bar flickering can be fixed by writing 5 bytes to the ROM file. The t
 To fix the sprite limit will require using a different emulator.
 A good candidate is Mesen which also emulates sound which would be neat to learn how to model (as if an smb3 world model was't ambitions enough lol)
 
+Sprite limit example
+![Sprite limit example](pictures/spritelimit.png)
+
 **Result:**
 
 Big TODO
