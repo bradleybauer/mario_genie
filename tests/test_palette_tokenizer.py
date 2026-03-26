@@ -39,6 +39,25 @@ def test_palette_tokenizer_defaults_to_replicate_padding() -> None:
     assert tokenizer.decoder_layers[0].fn[0].pad_mode == "replicate"
 
 
+def test_conv_in_temporal_padding_disabled() -> None:
+    tokenizer = _build_tokenizer()
+
+    # Temporal padding removed from conv_in — caller supplies context frames
+    assert tokenizer.conv_in.time_pad == 0
+    assert tokenizer.conv_in.time_causal_padding[4] == 0  # time left
+    assert tokenizer.conv_in.time_causal_padding[5] == 0  # time right
+
+    # Original value preserved so callers know how many extra frames to supply
+    assert tokenizer.conv_in_time_pad > 0
+
+    # Spatial padding still present
+    assert tokenizer.conv_in.time_causal_padding[0] > 0  # width
+    assert tokenizer.conv_in.time_causal_padding[2] > 0  # height
+
+    # conv_out and residual blocks keep their temporal padding
+    assert tokenizer.conv_out.time_pad > 0
+
+
 def test_palette_tokenizer_propagates_explicit_pad_mode_override() -> None:
     tokenizer = _build_tokenizer(pad_mode="constant")
 

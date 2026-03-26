@@ -141,7 +141,7 @@ Data collection now produces sessions that faithfully represent real gameplay. T
 
 **Context:**
 
-If Mario collects a 1UP mushroom then dies, then on the subsequent run through the level that mushroom cannot be collected again. A transformer with a short fixed context length will not be able to learn this in training. The game's "hidden state" — which blocks have been hit, which items collected, which enemies defeated — lives in the NES's 2KB of internal RAM and is not fully recoverable from the image alone.
+There is some hidden state surrounding 1UP mushrooms and a few other things. A transformer with a short fixed context length will not be able to learn this in training. The game's "hidden state" — which blocks have been hit, which items collected, which enemies defeated — lives in the NES's 2KB of internal RAM and is not fully recoverable from the image alone.
 
 The NES has 2KB (2048 bytes) of internal RAM mapped to `$0000`–`$07FF`, divided into four regions:
 
@@ -193,11 +193,14 @@ TODO
 
 **Context:**
 
-I'm interested in building an smb3 world model as well (lol). I imagine this would be MUCH harder.
-One idea I had for how to make things easier would be to clean the data a bit.
+I imagine building a SMB3 world model would be hard.
+One idea I had for how to make it easier is to clean the data a bit.
 Specifically fixing flickering in the smb3 status bar and removing the max 8 sprite limit.
 The nes has certain limits on the max number of sprites that can appear on a scan line.
-If the game attempts to draw more than the max the sprites begin to flicker in time.
+If the game attempts to draw more than the max the sprites begin to flicker in time. Example,
+
+![Sprite limit example](pictures/spritelimit.png)
+
 I do not want the model to have to spend capacity to reverse engineer exactly how this flicker mechanic works.
 (Edit: I think I'll attempt super mario land 2 before smb3.)
 
@@ -215,9 +218,6 @@ The status bar flickering can be fixed by writing 5 bytes to the ROM file. The t
 
 To fix the sprite limit will require using a different emulator.
 A good candidate is Mesen which also emulates sound which would be neat to learn how to model (as if an smb3 world model was't ambitions enough lol)
-
-Sprite limit example
-![Sprite limit example](pictures/spritelimit.png)
 
 **Result:**
 

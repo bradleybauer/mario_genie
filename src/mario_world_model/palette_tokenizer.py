@@ -79,6 +79,13 @@ class PaletteVideoTokenizer(VideoTokenizer):
             super().__init__(**kwargs)
         self.num_palette_colors = num_palette_colors
 
+        # Disable temporal padding on conv_in — the caller supplies extra
+        # context frames instead.  Spatial (replicate) padding is kept.
+        self.conv_in_time_pad = self.conv_in.time_pad
+        self.conv_in.time_pad = 0
+        w1, w2, h1, h2, _t1, _t2 = self.conv_in.time_causal_padding
+        self.conv_in.time_causal_padding = (w1, w2, h1, h2, 0, 0)
+
     # ── helpers ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -145,20 +152,21 @@ class PaletteVideoTokenizer(VideoTokenizer):
             video_contains_first_frame=video_contains_first_frame,
         )
 
-        if context_frames > 0:
-          B, D, latent_T, H, W = x.shape
-          downsampling_factor = video_or_images.shape[2] / latent_T
-          latent_context_frames = int(context_frames / downsampling_factor)
-          mask = torch.ones((B, latent_T, H, W), dtype=torch.bool, device=x.device)
-          mask[:, :latent_context_frames, :, :] = False
-          mask = mask.reshape(B, -1)
-        else:
-          mask = None
+        # if context_frames > 0:
+        #   B, D, latent_T, H, W = x.shape
+        #   downsampling_factor = video_or_images.shape[2] / latent_T
+        #   latent_context_frames = int(context_frames / downsampling_factor)
+        #   mask = torch.ones((B, latent_T, H, W), dtype=torch.bool, device=x.device)
+        #   mask[:, :latent_context_frames, :, :] = False
+        #   mask = mask.reshape(B, -1)
+        # else:
+        #   mask = None
+        mask = None
 
         # Quantize
         (quantized, codes, aux_losses), quantizer_loss_breakdown = (
-            self.quantizers(x, inv_temperature = 5.0, return_loss_breakdown=True, mask=mask)
-            # self.quantizers(x, return_loss_breakdown=True, mask=mask)
+            # self.quantizers(x, inv_temperature = 5.0, return_loss_breakdown=True, mask=mask)
+            self.quantizers(x, return_loss_breakdown=True, mask=mask)
         )
 
         # Decode → (B, K, T, H, W) logits
@@ -167,9 +175,12 @@ class PaletteVideoTokenizer(VideoTokenizer):
             video_contains_first_frame=video_contains_first_frame,
         )
 
-        # Cross-entropy loss over palette classes (skip context frames)
+        # Cross-entropy loss over palette classes (skip context frames).
+        # conv_in consumes conv_in_time_pad input frames (no temporal F.pad),
+        # so the decoder already outputs that many fewer frames than the input.
         if context_frames > 0:
-            logits = logits[:, :, context_frames:]
+            skip_logits = context_frames - self.conv_in_time_pad
+            logits = logits[:, :, skip_logits:]
             targets = targets[:, context_frames:]
         ce_loss = F.cross_entropy(logits, targets)
         total_loss = ce_loss + self.quantizer_aux_loss_weight * aux_losses

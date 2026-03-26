@@ -495,7 +495,7 @@ def train():
         codebook_size=mc.codebook_size,
         num_codebooks=mc.num_codebooks,
         layers=tokenizer_layers,
-        lfq_spherical=True
+        # quantizer_aux_loss_weight=.2
     ).to(device)
     # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
     tokenizer.discr = None
@@ -703,7 +703,10 @@ def train():
                 codes,
                 video_contains_first_frame=video_contains_first_frame,
             )
-            original_rgb = palette[batch[0].long()]
+            # recon has fewer temporal frames (conv_in eats conv_in_time_pad)
+            unwrapped_model = getattr(tokenizer, '_orig_mod', tokenizer)
+            time_pad = getattr(unwrapped_model, 'conv_in_time_pad', 0)
+            original_rgb = palette[batch[0, time_pad:].long()]
             original_frames = original_rgb.permute(0, 3, 1, 2)
             recon_idx = recon_video[0].argmax(dim=0)
             recon_rgb = palette[recon_idx]
@@ -740,9 +743,14 @@ def train():
                     codes, video_contains_first_frame=video_contains_first_frame,
                 )
                 del codes, inp
-                # Mask context frames from eval metrics
-                eval_recon = recon_video[:, :, ctx_frames:] if ctx_frames > 0 else recon_video
-                eval_tgt = targets[:, ctx_frames:] if ctx_frames > 0 else targets
+                # Mask context frames from eval metrics.
+                # conv_in eats conv_in_time_pad frames (no temporal F.pad),
+                # so recon has that many fewer frames than the input.
+                unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
+                time_pad = getattr(unwrapped, 'conv_in_time_pad', 0)
+                skip_recon = max(ctx_frames - time_pad, 0) if ctx_frames > 0 else 0
+                eval_recon = recon_video[:, :, skip_recon:]
+                eval_tgt = targets[:, ctx_frames:]
                 eval_losses.append(F.cross_entropy(eval_recon, eval_tgt).item())
                 recon_idx = eval_recon.argmax(dim=1)
                 total_pixels += eval_tgt.numel()

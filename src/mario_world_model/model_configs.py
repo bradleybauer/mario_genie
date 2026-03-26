@@ -32,7 +32,7 @@ class ModelConfig:
     attention_name: str
     num_codebooks: int = 1
     sequence_length: int = 16
-    context_frames: int = 8
+    context_frames: int = 12
     model_type: str = "magvit2"  # "magvit2" or "genie2"
 
 
