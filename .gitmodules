@@ -1,0 +1,3 @@
+[submodule "mesen"]
+	path = mesen
+	url = https://github.com/bradleybauer/Mesen2
