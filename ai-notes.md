@@ -112,13 +112,3 @@ Inside each frame record:
 2. **RAM Dump**: Raw bytes of NES internal RAM (`RAM_size`, usually 2048 bytes).
 3. **WRAM Dump**: Raw bytes of NES Work RAM, if available in the cart map (`WRAM_size`, usually 8192 bytes or 0).
 4. **Input State**: Raw bytes of the controller bitmasks. The first byte corresponds to player 1's standard 8-button bitmask.
-
-### Data Conversion
-The raw `.mdat` payload is extracted and processed using `scripts/convert_mdat.py`. It pairs the binary frames with the `.avi` video to output standard multi-dimensional `.npz` arrays:
-- `frame_numbers`: 1D uint32 array
-- `actions`: 1D uint8 array
-- `ram`: 2D uint8 array containing full or delta-encoded memory tensors
-- `wram`: 2D uint8 array containing full or delta-encoded memory tensors 
-- `frames` (optional): Synchronized RGB video frames extracted into a 4D array `(N, H, W, 3)`.
-
-

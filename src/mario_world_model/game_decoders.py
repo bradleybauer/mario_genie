@@ -58,34 +58,36 @@ _SMB1_ENEMY_TYPES = {
 
 def decode_smb1(ram: np.ndarray) -> list[tuple[str, list[str]]]:
     """Decode Super Mario Bros. 1 RAM."""
-    ps = ram[0x000E]
+    # int() casts avoid uint8 overflow when the array comes from mdat parsing.
+    r = lambda addr: int(ram[addr])
+    ps = r(0x000E)
     player_state = _SMB1_PLAYER_STATES.get(ps, f"0x{ps:02X}")
-    player_status = _SMB1_PLAYER_STATUS.get(ram[0x0756], f"0x{ram[0x0756]:02X}")
-    x_pos = ram[0x006D] * 256 + ram[0x0086]
-    y_pos = ram[0x00CE]
-    y_viewport = ram[0x00B5]
+    player_status = _SMB1_PLAYER_STATUS.get(r(0x0756), f"0x{r(0x0756):02X}")
+    x_pos = r(0x006D) * 256 + r(0x0086)
+    y_pos = r(0x00CE)
+    y_viewport = r(0x00B5)
     x_speed = np.int8(ram[0x0057])
     y_speed = np.int8(ram[0x001D])
-    moving_dir = "R" if ram[0x0045] == 1 else ("L" if ram[0x0045] == 2 else "?")
+    moving_dir = "R" if r(0x0045) == 1 else ("L" if r(0x0045) == 2 else "?")
 
-    world = ram[0x075F] + 1
-    stage = ram[0x075C] + 1
-    lives = ram[0x075A]
-    time_val = ram[0x07F8] * 100 + ram[0x07F9] * 10 + ram[0x07FA]
-    coins = ram[0x07ED] * 10 + ram[0x07EE]
+    world = r(0x075F) + 1
+    stage = r(0x075C) + 1
+    lives = r(0x075A)
+    time_val = r(0x07F8) * 100 + r(0x07F9) * 10 + r(0x07FA)
+    coins = r(0x07ED) * 10 + r(0x07EE)
     score = 0
     for i in range(6):
-        score = score * 10 + ram[0x07DE + i]
+        score = score * 10 + r(0x07DE + i)
 
-    gameplay_mode = ram[0x0770]
+    gameplay_mode = r(0x0770)
     gameplay = {0: "Demo", 1: "Playing", 2: "World End"}.get(
         gameplay_mode, f"0x{gameplay_mode:02X}")
 
     enemies = []
     for i in range(5):
-        etype = ram[0x0016 + i]
+        etype = r(0x0016 + i)
         if etype != 0:
-            ex, ey = ram[0x0087 + i], ram[0x00CF + i]
+            ex, ey = r(0x0087 + i), r(0x00CF + i)
             enemies.append((_SMB1_ENEMY_TYPES.get(etype, f"0x{etype:02X}"), ex, ey))
 
     sections: list[tuple[str, list[str]]] = [
