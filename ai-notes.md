@@ -79,4 +79,46 @@ $$\text{recon\_loss} = \frac{\ln 2}{B \times T \times H \times W}$$
 
 Example: batch=6, seq_len=16, image_size=224 → $N = 4{,}816{,}896$ pixels → minimum loss ≈ $1.44 \times 10^{-7}$.
 
+## Mesen Research Recording Data Format
+
+The custom DataCollector module in our modified Mesen2 emulator creates perfectly, frame-synchronized datasets of gameplay runs. A single "Recording" yields a group of companion files under the same file basename:
+
+- **`.mdat`** – Fixed-length binary file containing frame-by-frame memory states (RAM, WRAM) and controller input.
+- **`.avi`** – Perfect lossless video and audio capture of the run encoded with the ZMBV codec.
+- **`.mss`** – Initial Mesen save state captured at the very first frame of the recording.
+- **`_states/`** – A directory containing periodic `.mss` save states captured continuously throughout the recording (e.g., at 1Hz or once every 60 frames) to allow resuming or jumping into any point of the run exactly.
+
+### MDAT Binary Structure
+
+The `.mdat` file is designed for fast, streaming writes within the emulator's real-time loops. It uses a little-endian binary structure.
+
+**Header (32 bytes):**
+- **0–3** (4 bytes): Magic identifier `"MSDC"`
+- **4–5** (2 bytes, uint16): Version (currently `1`)
+- **6–7** (2 bytes, uint16): Console Type ID (e.g. NES)
+- **8–11** (4 bytes, uint32): Size of RAM dump per frame in bytes
+- **12–15** (4 bytes, uint32): Size of WRAM dump per frame in bytes
+- **16–17** (2 bytes, uint16): Controller input size per frame in bytes
+- **18–19** (2 bytes, uint16): Number of connected controllers
+- **20–23** (4 bytes, uint32): Start frame number
+- **24–27** (4 bytes, uint32): Emulator FPS multiplied by 1000 (e.g. `60000` for 60.0 fps)
+- **28–31** (4 bytes, uint32): Reserved / Padding (Zeros)
+
+**Frame Records:**
+Following the header is a continuous sequence of fixed-size records, one for every frame. The size of each frame record is exactly `4 + RAM_size + WRAM_size + Input_size` bytes.
+
+Inside each frame record:
+1. **Frame Number**: `uint32` (4 bytes).
+2. **RAM Dump**: Raw bytes of NES internal RAM (`RAM_size`, usually 2048 bytes).
+3. **WRAM Dump**: Raw bytes of NES Work RAM, if available in the cart map (`WRAM_size`, usually 8192 bytes or 0).
+4. **Input State**: Raw bytes of the controller bitmasks. The first byte corresponds to player 1's standard 8-button bitmask.
+
+### Data Conversion
+The raw `.mdat` payload is extracted and processed using `scripts/convert_mdat.py`. It pairs the binary frames with the `.avi` video to output standard multi-dimensional `.npz` arrays:
+- `frame_numbers`: 1D uint32 array
+- `actions`: 1D uint8 array
+- `ram`: 2D uint8 array containing full or delta-encoded memory tensors
+- `wram`: 2D uint8 array containing full or delta-encoded memory tensors 
+- `frames` (optional): Synchronized RGB video frames extracted into a 4D array `(N, H, W, 3)`.
+
 
