@@ -15,5 +15,3 @@ Skimmed the magvit2 paper, notes: Increase warmup period, push the temporal down
 
 Instead of all combinations of architecture variables maybe just define an order to test them as additions to some base model
 
-
-How can I best leverage mesen for data collection (image, sound, ram, wram, actions, palette) in this application? I have clone 

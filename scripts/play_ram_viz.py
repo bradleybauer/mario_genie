@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Play Mario with a live NES 2KB RAM visualizer.
+"""Play Mario with a live NES RAM visualizer.
 
-Uses the same shimmed environment and heuristic/human policies as collect.py,
-but renders the full 2048-byte NES RAM as a structured visualization alongside
+Renders the full 2048-byte NES RAM as a structured visualization alongside
 the game frame in a single pygame window.
 
 Features:
@@ -13,14 +12,7 @@ Features:
     - OAM sprite position mini-map (256x240 NES resolution)
 
 Usage:
-    # Heuristic bot with RAM visualization
-    python scripts/play_ram_viz.py --mode heuristic --world 1 --stage 1
-
-    # Human play
     python scripts/play_ram_viz.py --mode human --world 1 --stage 1
-
-    # Random agent, natural progression
-    python scripts/play_ram_viz.py --mode random
 
 Controls (human mode):
     Arrow keys / WASD  - D-Pad
