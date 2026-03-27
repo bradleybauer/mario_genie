@@ -2,7 +2,7 @@
 
 - [Single Sample Overfit Baseline](#single-sample-overfit-baseline)
 - [How Does The Model Represent Counts](#how-does-the-model-represent-counts)
-- [Uniform Data Collection](#uniform-data-collection)
+- [Mesen-Based Data Collection](#mesen-based-data-collection)
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
 - [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
@@ -56,22 +56,19 @@ TODO
 <br>
 <br>
 
-# Uniform Data Collection
+# Mesen-Based Data Collection
 
 **Context:**
 
-I want a uniform distribution of training data across all world/stage/x-position bins. However, the emulator can only initialize Mario at the start of a stage, so later portions of each stage are naturally underrepresented — reaching them requires playing through the earlier parts first.
+I switched data collection over to Mesen. Unlike my previous data collection scripts, Mesen can save emulator state at frequent intervals during collection, which opens the door to restarting from many points in a run instead of always from the beginning of a stage.
 
 **Approach:** 
 
-During collection, every episode's actions and x-positions are recorded as rollouts. At periodic rebalance intervals the collector scans progression coverage across the existing data, computes per-bin deficits (inverse sampling weights), and builds a replay pool of recorded action sequences that reach underrepresented bins. On each episode reset, the environment samples a target bin proportional to its deficit weight, replays the corresponding recorded actions to fast-forward the emulator to that position, and then resumes live collection from there.
+Mesen records raw gameplay data to disk, and an offline conversion step turns those recordings into session `.npz` files. The important next step is to use the frequent save states as replay anchors, so collection can resume from underrepresented regions and push the dataset toward a more uniform distribution over game world progression.
 
 **Result:** 
 
-This is not fully solved — some bins remain under represented — but the distribution is significantly more uniform than naive sequential play.
-<p align="center">
-  <img src="pictures/data_balance.png" alt="Progression distribution across world-stage bins">
-</p>
+TODO
 
 <br>
 <br>
@@ -116,23 +113,6 @@ It was not realistic to change only the VideoTokenizer's output shape, so I prop
 The new model trained faster on my 3070, completing ~60k steps in 3 hours.
 It clearly has a much better grasp of spatial layout within the image.
 
-
-<br>
-<br>
-
-# Dataset Refactor Number 32515123
-
-**Context:**
-
-All previous data designs were fundamentally flawed — they used random level selection and even included completely random scene cuts mid-sequence. This project demands a dataset that reflects real game mechanics: contiguous gameplay with natural transitions only.
-
-**Approach:** 
-
-The old pipeline stored fixed-length chunks `(B, T, C, H, W)` with random level selection and mid-sequence scene cuts. The new pipeline produces contiguous sessions `(N, C, H, W)` — one per collection run — where every frame-to-frame transition is a real gameplay transition. The existing chunk-based dataset was converted into the new session format, and all chunk-related code was removed from the codebase.
-
-**Result:**
-
-Data collection now produces sessions that faithfully represent real gameplay. Training code is simpler and no longer needs to detect and skip corrupted sequences at load time.
 
 <br>
 <br>
@@ -202,7 +182,6 @@ If the game attempts to draw more than the max the sprites begin to flicker in t
 ![Sprite limit example](pictures/spritelimit.png)
 
 I do not want the model to have to spend capacity to reverse engineer exactly how this flicker mechanic works.
-(Edit: I think I'll attempt super mario land 2 before smb3.)
 
 **Approach:**
 
@@ -221,7 +200,7 @@ A good candidate is Mesen which also emulates sound which would be neat to learn
 
 **Result:**
 
-Big TODO
+TODO
 
 <br>
 <br>
@@ -238,12 +217,11 @@ BTW here is an example of a "scene-cut". This one is "natural" meaning it repres
 
 **Approach:** 
 
-Prompt claude more carefully for a script to find frame splits (and "unnatural" scene-cuts).
 Check if frame spilts can be prevented with Mesen.
 
 **Result:** 
 
-TODO
+I have not seen any frame splits with mesen but I have seen some other graphical glitches. I'm not sure if there is a reasonable way to deal with those. Luckily they are sparse and affect only a small amount of pixels.
 
 <br>
 <br>
@@ -261,7 +239,7 @@ Prepend extra context frames during both training and inference. The dataset ret
 
 **Result:**
 
-TODO
+Prepending context frames works great to reduce reconstruction error on frames early in the sample. Unsurprisingly, reconstruction of the context frames is not very good.
 
 <br>
 <br>
