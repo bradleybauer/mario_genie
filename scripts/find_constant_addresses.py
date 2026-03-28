@@ -15,7 +15,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.npy_db import load_recordings, SMB1_RAM_LABELS
+from mario_world_model.npy_db import load_recordings
+from mario_world_model.smb1_memory_map import SMB1_RAM_LABELS
 
 
 def find_constant_addresses():

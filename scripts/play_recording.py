@@ -10,10 +10,8 @@ Features:
     - Decoded SMB1 game variables (auto-detected from RAM)
     - OAM sprite position mini-map
     - NES controller input display
-    - Pause, step, speed controls
 
 Controls:
-    Space       - pause / resume
     Escape / Q  - quit
 
 Usage:
@@ -264,7 +262,6 @@ def run(recording_path: Path, scale: int,
     frame_idx = 0
     cap_next = 0          # next frame index the VideoCapture will read
     current_frame_rgb: np.ndarray | None = None
-    paused = False
     running = True
 
     # --- Clock state ---
@@ -291,10 +288,6 @@ def run(recording_path: Path, scale: int,
         if audio_playing:
             pygame.mixer.music.stop()
             audio_playing = False
-
-    def _pause_audio() -> None:
-        if audio_playing:
-            pygame.mixer.music.pause()
 
     def _reset_wall_clock(from_frame: int) -> None:
         """Reset the wall-clock reference for non-audio playback."""
@@ -331,31 +324,17 @@ def run(recording_path: Path, scale: int,
 
     # Kick off playback
     _reset_wall_clock(0)
-    _start_audio(0)
-
-    try:
-        while running:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                        running = False
-                    elif event.key == pygame.K_SPACE:
-                        paused = not paused
-                        if paused:
                             _pause_audio()
                         else:
                             # Resume — unpause keeps the exact sample position
                             # so get_pos() stays consistent with no startup gap.
                             _reset_wall_clock(frame_idx)
-                            if audio_playing:
-                                pygame.mixer.music.unpause()
-                            else:
-                                _start_audio(frame_idx)
-
-            if not running:
-                break
+            frame_idx = _current_target_frame()
+            if frame_idx >= n_frames - 1:
+                # Loop
+                frame_idx = 0
+                _reset_wall_clock(0)
+                _start_audio(0)
 
             # --- Derive current frame from clock ---
             if not paused:
@@ -446,8 +425,6 @@ def run(recording_path: Path, scale: int,
             parts.append(f"#{int(frame_numbers[frame_idx])}")
             elapsed = frame_idx / fps
             parts.append(f"{elapsed:.1f}s")
-            if paused:
-                parts.append("PAUSED")
             info = hud_font.render("  ".join(parts), True, (190, 190, 190))
             screen.blit(info, (8, hud_y + (hud_h - info.get_height()) // 2))
 

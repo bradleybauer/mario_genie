@@ -37,7 +37,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.npy_db import load_recordings, build_dataframe, SMB1_RAM_LABELS
+from mario_world_model.npy_db import load_recordings, build_dataframe
+from mario_world_model.smb1_memory_map import SMB1_RAM_LABELS
 
 
 def parse_args() -> argparse.Namespace:
