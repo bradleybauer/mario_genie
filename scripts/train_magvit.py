@@ -214,7 +214,7 @@ class MarioVideoDataset(Dataset):
         return torch.from_numpy(chunk.copy())
 
 
-def train():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data-dir",
@@ -338,6 +338,11 @@ def train():
 
     if args.crop_240 and args.crop_224:
         parser.error("Use at most one of --crop-240 and --crop-224.")
+    return args
+
+
+def train():
+    args = parse_args()
 
     crop_size = None
     if args.crop_240:
@@ -361,8 +366,8 @@ def train():
         print(f"[random] Selected model: {args.model}")
     elif args.model not in magvit_configs_by_name:
         if args.model in MODEL_CONFIGS_BY_NAME:
-            parser.error(f"Model {args.model!r} is not a magvit2 model. Use scripts/train_genie2.py instead.")
-        parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
+            raise SystemExit(f"Model {args.model!r} is not a magvit2 model. Use scripts/train_genie2.py instead.")
+        raise SystemExit(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
     else:
         mc = magvit_configs_by_name[args.model]
 

@@ -18,6 +18,12 @@ from helpers import (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Send data to remotes")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
+    return parser.parse_args()
+
+
 def send_data(worker):
     ssh(worker, f"mkdir -p {worker.project_dir}/data", capture=True)
     rsync_to(
@@ -29,9 +35,7 @@ def send_data(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Send data to remotes")
-    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
-    args = parser.parse_args()
+    args = parse_args()
 
     if not args.workers:
         show_workers()

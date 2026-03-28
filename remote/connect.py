@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import load_workers, show_workers, ssh_base_args
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SSH to a remote worker")
     parser.add_argument("worker", nargs="?", default=None, help="Worker name from config")
     parser.add_argument("--port-forward", type=int, default=8080,
@@ -26,7 +26,11 @@ def main():
                         help="Open a plain interactive SSH session without tmux attach")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Pass -vvv to SSH for debug output")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     if not args.worker:
         show_workers()

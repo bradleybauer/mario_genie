@@ -768,7 +768,7 @@ def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | N
         plt.show()
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/magvit2"],
                         help="One or more directories containing run folders anywhere under them")
@@ -790,7 +790,11 @@ def main():
                         help="Gaussian sigma for plot smoothing (0 = no smoothing)")
     parser.add_argument("--no-legend", action="store_true",
                         help="Hide the legend on plots")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     runs = discover_runs(args.results_dir)
     if args.filter:

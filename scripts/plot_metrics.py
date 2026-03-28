@@ -10,6 +10,17 @@ import sys
 import matplotlib.pyplot as plt
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("metrics_json", nargs="*", default=["checkpoints/magvit2/metrics.json"],
+                        help="Paths to metrics.json (default: checkpoints/magvit2/metrics.json)")
+    parser.add_argument("-l", "--labels", nargs="*", default=None,
+                        help="Labels for each metrics file")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Save plot to file instead of showing (e.g. metrics.png)")
+    return parser.parse_args()
+
+
 def load_metrics(path):
     with open(path) as f:
         return json.load(f)
@@ -63,14 +74,7 @@ def plot_metrics(all_metrics, labels, max_codes, output_path=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("metrics_json", nargs="*", default=["checkpoints/magvit2/metrics.json"],
-                        help="Paths to metrics.json (default: checkpoints/magvit2/metrics.json)")
-    parser.add_argument("-l", "--labels", nargs="*", default=None,
-                        help="Labels for each metrics file")
-    parser.add_argument("-o", "--output", type=str, default=None,
-                        help="Save plot to file instead of showing (e.g. metrics.png)")
-    args = parser.parse_args()
+    args = parse_args()
 
     default_labels = []
     max_codes = []

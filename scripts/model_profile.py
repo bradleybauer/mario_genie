@@ -111,7 +111,7 @@ def estimate_forward_gflops(
     return flops_per_forward / 1e9
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--image-size", type=int, default=IMAGE_SIZE)
@@ -164,16 +164,21 @@ def main() -> None:
     elif args.crop_224:
         args.image_size = 224
 
+    if not args.list_models:
+        if args.model is None:
+            parser.error("--model is required. Use --list-models to see available configs.")
+        if args.model not in MODEL_CONFIGS_BY_NAME:
+            parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+
     if args.list_models:
         for name in sorted(MODEL_CONFIGS_BY_NAME):
             print(name)
         return
-
-    if args.model is None:
-        parser.error("--model is required. Use --list-models to see available configs.")
-
-    if args.model not in MODEL_CONFIGS_BY_NAME:
-        parser.error(f"Unknown model {args.model!r}. Use --list-models to see available configs.")
 
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"

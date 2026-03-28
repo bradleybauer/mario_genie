@@ -479,8 +479,8 @@ def _write_config(instances: list[dict]) -> None:
 # ── CLI ──────────────────────────────────────────────────────────
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
         description="Vast.ai instance manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
@@ -502,7 +502,7 @@ sort keys (comma-separated):
   bw       GPU memory bandwidth descending
 """,
     )
-    sub = p.add_subparsers(dest="cmd")
+    sub = parser.add_subparsers(dest="cmd")
 
     up = sub.add_parser("up", help="Search & provision instances",
                         description="Search Vast.ai for GPU offers matching filters, display results, and provision selected instances.")
@@ -523,10 +523,15 @@ sort keys (comma-separated):
     sub.add_parser("update-config", help="Regenerate config.py",
                    description="Regenerate remote/config.py from all currently running instances.")
 
-    args = p.parse_args()
+    args = parser.parse_args()
     if not args.cmd:
-        p.print_help()
+        parser.print_help()
         sys.exit(1)
+    return args
+
+
+def main() -> None:
+    args = parse_args()
 
     key = _api_key()
     {"up": cmd_up, "ls": cmd_ls, "down": cmd_down, "update-config": cmd_update_config}[args.cmd](key, args)

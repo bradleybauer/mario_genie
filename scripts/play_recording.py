@@ -448,7 +448,7 @@ def run(recording_path: Path, scale: int,
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Play a Mesen recording (.avi + .npy) with RAM visualization",
     )
@@ -463,7 +463,11 @@ def main():
     parser.add_argument("--audio-offset", type=float, default=0.0,
                         help="Seconds to skip into audio track to fix A/V sync "
                              "(positive = audio was ahead, default: 0.0)")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     run(args.path, scale=args.scale,
         ram_scale=args.ram_scale, audio_offset=args.audio_offset)

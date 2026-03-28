@@ -10,14 +10,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import load_workers, report_results, run_on_all, show_workers, ssh
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Clean checkpoints on remote workers")
     parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     parser.add_argument("--subdir", type=str, default=None,
                         help="Only remove this subdirectory under checkpoints/")
     parser.add_argument("--yes", action="store_true",
                         help="Skip confirmation prompt")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     if not args.workers:
         show_workers()

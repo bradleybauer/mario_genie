@@ -36,6 +36,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Visualize crop amounts on NES frames")
+    parser.add_argument("path", type=Path, help="Session .npz file or data directory")
+    parser.add_argument("--scale", type=int, default=3, help="Display scale factor (default: 3)")
+    return parser.parse_args()
+
+
 def load_palette(data_dir: Path) -> np.ndarray | None:
     current = data_dir.resolve()
     while True:
@@ -92,10 +99,7 @@ def list_sessions(path: Path) -> list[Path]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize crop amounts on NES frames")
-    parser.add_argument("path", type=Path, help="Session .npz file or data directory")
-    parser.add_argument("--scale", type=int, default=3, help="Display scale factor (default: 3)")
-    args = parser.parse_args()
+    args = parse_args()
 
     session_paths = list_sessions(args.path)
     session_path = resolve_session(args.path)

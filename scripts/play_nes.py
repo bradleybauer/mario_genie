@@ -20,6 +20,7 @@ Controls:
     Escape / Q         - Quit
     Gamepad also supported via evdev.
 """
+import argparse
 import sys
 import os
 import glob
@@ -221,6 +222,17 @@ KEY_MAP = {
 }
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Play NES ROMs using nes_py or stable-retro.")
+    parser.add_argument("--rom", default=None, help="ROM number or partial name match.")
+    parser.add_argument("--ram", action="store_true", help="Enable the RAM visualizer panel.")
+    parser.add_argument("--scale", type=int, default=DEFAULT_SCALE,
+                        help=f"Game frame scale factor (default: {DEFAULT_SCALE})")
+    parser.add_argument("--ram-scale", type=int, default=1,
+                        help="RAM grid scale multiplier (default: 1)")
+    return parser.parse_args()
+
+
 class GamepadController:
     """Reads keyboard + gamepad and returns an NES controller byte."""
     def __init__(self):
@@ -276,28 +288,16 @@ class GamepadController:
 
 
 def main():
-    # Extract optional flags before ROM selection (choose_rom reads sys.argv[1])
-    show_ram = '--ram' in sys.argv
-    if show_ram:
-        sys.argv.remove('--ram')
+    args = parse_args()
+    show_ram = args.ram
+    rom_query = args.rom
+    scale = args.scale
+    ram_scale = args.ram_scale
 
-    rom_query = None
-    if '--rom' in sys.argv:
-        idx = sys.argv.index('--rom')
-        rom_query = sys.argv[idx + 1]
-        del sys.argv[idx:idx + 2]
-
-    scale = DEFAULT_SCALE
-    if '--scale' in sys.argv:
-        idx = sys.argv.index('--scale')
-        scale = int(sys.argv[idx + 1])
-        del sys.argv[idx:idx + 2]
-
-    ram_scale = 1
-    if '--ram-scale' in sys.argv:
-        idx = sys.argv.index('--ram-scale')
-        ram_scale = int(sys.argv[idx + 1])
-        del sys.argv[idx:idx + 2]
+    if scale < 1:
+        raise SystemExit("--scale must be at least 1")
+    if ram_scale < 1:
+        raise SystemExit("--ram-scale must be at least 1")
 
     ram_cell = RAM_CELL * ram_scale
 

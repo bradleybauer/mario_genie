@@ -454,12 +454,16 @@ def show_combined(root, subfolders, fps, scale):
     plt.show()
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="View reconstruction PNG(s) as video")
     parser.add_argument("path", help="Path to a reconstruction PNG or a directory of PNGs")
     parser.add_argument("--fps", type=int, default=4, help="Playback frames per second (default: 4)")
     parser.add_argument("--scale", type=float, default=4.0, help="Display scale factor (default: 4)")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     # If it's a file or a directory that directly has PNGs, go straight to viewer
     if os.path.isfile(args.path) or glob.glob(os.path.join(args.path, "*.png")):

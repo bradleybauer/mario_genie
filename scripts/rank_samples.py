@@ -38,7 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from train_magvit import MarioVideoDataset, OVERSCAN_CROP_SIZE, CROP_224_SIZE, _crop_chunk
 
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rank dataset samples by reconstruction loss")
     parser.add_argument("checkpoint", type=str,
                         help="Path to training_state*.pt or magvit2*.pt file")
@@ -54,7 +54,11 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--sample-fraction", type=float, default=1.0,
                         help="Evaluate a random fraction of the dataset (e.g. 0.1 for 10%%)")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
@@ -62,7 +66,7 @@ def main():
     # ── Load config ──────────────────────────────────────────────────
     config_path = os.path.join(ckpt_dir, "config.json")
     if not os.path.exists(config_path):
-        parser.error(f"No config.json found at {config_path}")
+        raise SystemExit(f"No config.json found at {config_path}")
     with open(config_path) as f:
         config = json.load(f)
 

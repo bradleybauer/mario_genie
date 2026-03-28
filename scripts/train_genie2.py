@@ -867,7 +867,7 @@ def visualize(args):
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genie 2 – small latent diffusion world model")
     parser.add_argument("--phase", choices=["autoencoder", "dynamics", "visualize"], required=True)
     parser.add_argument("--data-dir", type=str, default="data")
@@ -887,7 +887,11 @@ def main():
                         help="Path to dynamics checkpoint (for visualize phase)")
     parser.add_argument("--vis-n", type=int, default=8,
                         help="Number of samples to visualize")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -898,7 +902,7 @@ def main():
         train_autoencoder(args)
     elif args.phase == "dynamics":
         if not args.ae_checkpoint:
-            parser.error("--ae-checkpoint is required for dynamics phase")
+            raise SystemExit("--ae-checkpoint is required for dynamics phase")
         train_dynamics(args)
     elif args.phase == "visualize":
         visualize(args)

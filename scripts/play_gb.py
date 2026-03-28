@@ -76,7 +76,7 @@ KEY_MAP = {
 }
 
 
-def build_parser() -> argparse.ArgumentParser:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play Game Boy ROMs with PyBoy.")
     parser.add_argument("--rom", help="ROM number or partial name match.")
     parser.add_argument("--path", help="Direct path to a .gb or .gbc ROM.")
@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list", action="store_true", help="List discovered ROMs and exit.")
     parser.add_argument("--save", action="store_true", help="Persist cartridge save RAM on exit.")
     parser.add_argument("--sound", action="store_true", help="Enable sound (off by default due to WSL2 choppiness).")
-    return parser
+    return parser.parse_args()
 
 
 def _normalize_name(name: str) -> str:
@@ -355,8 +355,7 @@ def resolve_path(path_arg: str) -> tuple[str, str]:
 
 
 def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
+    args = parse_args()
 
     if PyBoy is None:
         print("PyBoy is not installed. Install it with: pip install pyboy")

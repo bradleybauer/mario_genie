@@ -18,6 +18,12 @@ from helpers import (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Setup remote machines")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
+    return parser.parse_args()
+
+
 def setup_worker(worker):
     ssh(worker, f"mkdir -p {worker.project_dir}", capture=True)
     rsync_to(
@@ -44,9 +50,7 @@ def setup_worker(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Setup remote machines")
-    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
-    args = parser.parse_args()
+    args = parse_args()
 
     if not args.workers:
         show_workers()

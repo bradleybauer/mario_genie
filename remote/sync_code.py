@@ -17,6 +17,12 @@ from helpers import (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Sync code to remotes")
+    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
+    return parser.parse_args()
+
+
 def sync_worker(worker):
     rsync_to(
         worker,
@@ -40,9 +46,7 @@ def sync_worker(worker):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sync code to remotes")
-    parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
-    args = parser.parse_args()
+    args = parse_args()
 
     if not args.workers:
         show_workers()

@@ -19,6 +19,17 @@ from helpers import (
 )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Get results from remotes")
+    parser.add_argument("subdir", nargs="?", default=None,
+                        help="Checkpoint subdirectory to fetch (default: all)")
+    parser.add_argument("--workers", nargs="+",
+                        help="Worker names, or 'all' (omit to list available)")
+    parser.add_argument("--images", action="store_true",
+                        help="Only sync images and JSON (skip model weights)")
+    return parser.parse_args()
+
+
 def _remote_result_roots(subdir: str | None) -> list[tuple[str, str]]:
     """Return candidate remote roots and matching local destinations."""
     candidates = []
@@ -45,14 +56,7 @@ def _resolve_remote_source(worker, subdir: str | None) -> tuple[str, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Get results from remotes")
-    parser.add_argument("subdir", nargs="?", default=None,
-                        help="Checkpoint subdirectory to fetch (default: all)")
-    parser.add_argument("--workers", nargs="+",
-                        help="Worker names, or 'all' (omit to list available)")
-    parser.add_argument("--images", action="store_true",
-                        help="Only sync images and JSON (skip model weights)")
-    args = parser.parse_args()
+    args = parse_args()
 
     if not args.subdir and not args.workers:
         show_workers()
