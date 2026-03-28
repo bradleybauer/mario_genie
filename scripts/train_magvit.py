@@ -27,191 +27,13 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, 
 
 from tqdm import tqdm
 
-from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
-from mario_world_model.auto_batch_sizer import find_max_batch_size
-from mario_world_model.dataset_paths import find_session_files
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
 
 
-DEFAULT_IMAGE_SIZE = IMAGE_SIZE
-OVERSCAN_CROP_SIZE = 240
-CROP_224_SIZE = 224
-
-
-def _format_elapsed(seconds):
-    seconds = max(int(seconds), 0)
-    minutes, secs = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{hours}h{minutes:02d}m{secs:02d}s"
-    if minutes > 0:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
-
-
-
-
-def _crop_chunk(chunk: np.ndarray, crop_size: int) -> np.ndarray:
-    """Crop padded 256x256 frames to a centered square size.
-
-    Assumes the preprocessing pipeline padded 240x256 gameplay frames to 256x256,
-    so reducing the square size removes equal borders on all sides.
-    """
-    height, width = chunk.shape[-2:]
-    if (height, width) == (crop_size, crop_size):
-        return chunk
-    if (height, width) != (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE):
-        raise ValueError(
-            f"crop expects frames of shape 256x256 or {crop_size}x{crop_size}, got {height}x{width}"
-        )
-    border = (DEFAULT_IMAGE_SIZE - crop_size) // 2
-    return chunk[..., border:-border, border:-border]
-
-
-def _index_file(file_idx, filepath, seq_len):
-    """Index a session file.
-
-    Returns (file_idx, frame_count, samples) where samples is a list of
-    (file_idx, t_start) tuples.
-    """
-    try:
-        # Try reading frame count from the lightweight .meta.json sidecar
-        meta_path = filepath.replace('.npz', '.meta.json')
-        total_t = None
-        if os.path.exists(meta_path):
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            if 'num_frames' in meta:
-                total_t = meta['num_frames']
-
-        if total_t is None:
-            # Fallback: open the npz to get the frame count
-            npz = np.load(filepath, mmap_mode='r')
-            frames = npz['frames']
-            if frames.ndim != 4:
-                print(f"Skipping {filepath}: expected session format (N,C,H,W), got ndim={frames.ndim}")
-                return file_idx, 0, []
-            total_t = frames.shape[0]
-
-        if total_t < seq_len:
-            return file_idx, 0, []
-        samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
-        return file_idx, total_t, samples
-    except Exception as e:
-        print(f"Skipping {filepath} due to error: {e}")
-        return file_idx, 0, []
-
-class MarioVideoDataset(Dataset):
-    def __init__(
-        self,
-        data_dir,
-        seq_len=4,
-        subset_n=0,
-        seed=42,
-        num_workers=None,
-        system_info=None,
-        crop_size=None,
-    ):
-        if num_workers is None:
-            num_workers = get_effective_cpu_count(system_info)
-        self.data_files = find_session_files(data_dir)
-        self.seq_len = seq_len
-        self.samples = []
-        self.crop_size = crop_size
-        
-        n_files = len(self.data_files)
-        print(f"Indexing {n_files} data files (stride=1)...")
-        frame_counts = [0] * n_files
-        index_workers = max(num_workers, 1)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
-            futures = {
-                pool.submit(_index_file, idx, f, seq_len): idx
-                for idx, f in enumerate(self.data_files)
-            }
-            with tqdm(total=n_files, desc="Indexing files", unit="file") as pbar:
-                for future in concurrent.futures.as_completed(futures):
-                    file_idx, total_t, samples = future.result()
-                    frame_counts[file_idx] = total_t
-                    self.samples.extend(samples)
-                    pbar.update(1)
-
-        # Remove files with no usable frames and remap indices
-        valid = [i for i in range(n_files) if frame_counts[i] > 0]
-        if len(valid) < n_files:
-            skipped = n_files - len(valid)
-            print(f"Dropped {skipped} file(s) with no usable frames")
-            old_to_new = {old: new for new, old in enumerate(valid)}
-            self.data_files = [self.data_files[i] for i in valid]
-            frame_counts = [frame_counts[i] for i in valid]
-            self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
-            n_files = len(self.data_files)
-
-        self.samples.sort()  # deterministic order regardless of thread completion
-
-        if subset_n > 0 and subset_n < len(self.samples):
-            total = len(self.samples)
-            rng = np.random.RandomState(seed)
-            indices = rng.choice(total, size=subset_n, replace=False)
-            self.samples = [self.samples[i] for i in indices]
-            print(f"Subset: kept {subset_n} of {total} samples")
-
-        # Decide whether to decompress all frames into RAM or use mmap
-        total_frames = sum(frame_counts)
-        self.frames_by_file = None
-        if total_frames > 0:
-            available = get_available_memory(system_info)
-            probe = np.load(self.data_files[0], mmap_mode='r')['frames']
-            bytes_per_frame = math.prod(probe.shape[1:])  # C*H*W, uint8
-            total_bytes = total_frames * bytes_per_frame
-            headroom = 2 * 2**30  # keep 2 GB free
-
-            if available > 0 and total_bytes < available - headroom:
-                print(f"Loading all frames into RAM ({total_bytes / 2**30:.0f} GB, "
-                      f"{available / 2**30:.0f} GB available)...")
-                self.frames_by_file = [None] * n_files
-
-                def _load_file(idx):
-                    return idx, np.load(self.data_files[idx])['frames']
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
-                    futures = [pool.submit(_load_file, i) for i in range(n_files)]
-                    with tqdm(total=n_files, desc="Loading into RAM", unit="file") as pbar:
-                        for future in concurrent.futures.as_completed(futures):
-                            idx, frames = future.result()
-                            self.frames_by_file[idx] = frames
-                            pbar.update(1)
-                actual = sum(f.nbytes for f in self.frames_by_file)
-                print(f"Loaded {actual / 2**30:.0f} GB into RAM (COW-shared with workers)")
-            else:
-                print(f"Dataset too large for RAM ({total_bytes / 2**30:.0f} GB, "
-                      f"{available / 2**30:.0f} GB available). Using mmap.")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def _get_frames_mmap(self, file_idx):
-        """Return the mmap'd frames array for a file, caching the handle."""
-        if not hasattr(self, '_mmap_cache'):
-            self._mmap_cache = {}
-        if file_idx not in self._mmap_cache:
-            self._mmap_cache[file_idx] = np.load(
-                self.data_files[file_idx], mmap_mode='r'
-            )['frames']
-        return self._mmap_cache[file_idx]
-
-    def __getitem__(self, idx):
-        file_idx, t_start = self.samples[idx]
-        if self.frames_by_file is not None:
-            frames = self.frames_by_file[file_idx]
-        else:
-            frames = self._get_frames_mmap(file_idx)
-        chunk = frames[t_start:t_start+self.seq_len, 0]  # (T, H, W) uint8
-        if self.crop_size is not None:
-            chunk = _crop_chunk(chunk, self.crop_size)
-        return torch.from_numpy(chunk.copy())
+IMAGE_SIZE = 224
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,8 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="data",
-        help="Path to session files or a parent directory containing nested session folders",
+        default="data/normalized",
+        help="Directory containing normalized .npz files and palette.json",
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument(
@@ -316,41 +138,184 @@ def parse_args() -> argparse.Namespace:
         "--resume-from", type=str, default=None,
         help="Path to a training_state*.pt file to resume training from.",
     )
-    parser.add_argument(
-        "--crop-240",
-        action="store_true",
-        help=(
-            "Center-crop preprocessed 256x256 frames to 240x240 by removing 8px "
-            "on each edge. Useful for SMB1/SMB3-style overscan cleanup while "
-            "preserving the original 240px gameplay height."
-        ),
-    )
-    parser.add_argument(
-        "--crop-224",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Center-crop preprocessed 256x256 frames to 224x224 by removing 16px "
-            "on each edge for a 14x14 latent grid. Enabled by default; use --no-crop-224 to disable."
-        ),
-    )
     args = parser.parse_args()
 
-    if args.crop_240 and args.crop_224:
-        parser.error("Use at most one of --crop-240 and --crop-224.")
     return args
+
+
+def _format_elapsed(seconds):
+    seconds = max(int(seconds), 0)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def find_max_batch_size(
+    tokenizer, *, num_palette_colors, image_size, seq_len, device,
+    floor=1, ceiling=256, video_contains_first_frame=True,
+):
+    """Binary-search for the largest batch size that fits in GPU memory."""
+    best = floor
+    lo, hi = floor, ceiling
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        torch.cuda.empty_cache()
+        try:
+            dummy = torch.randint(0, num_palette_colors, (mid, seq_len, image_size, image_size), device=device)
+            inp = PaletteVideoTokenizer.indices_to_onehot(dummy, num_palette_colors)
+            loss, _ = tokenizer(inp, targets=dummy, return_loss=True,
+                                video_contains_first_frame=video_contains_first_frame)
+            loss.backward()
+            tokenizer.zero_grad(set_to_none=True)
+            del dummy, inp, loss
+            torch.cuda.empty_cache()
+            best = mid
+            lo = mid + 1
+        except torch.cuda.OutOfMemoryError:
+            tokenizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            hi = mid - 1
+    return best
+
+
+
+
+def _index_file(file_idx, filepath, seq_len):
+    """Index a normalized .npz file.
+
+    Returns (file_idx, frame_count, samples) where samples is a list of
+    (file_idx, t_start) tuples.
+    """
+    try:
+        npz = np.load(filepath, mmap_mode='r')
+        frames = npz['frames']
+        if frames.ndim != 3:
+            print(f"Skipping {filepath}: expected (N, H, W), got ndim={frames.ndim}")
+            return file_idx, 0, []
+        total_t = frames.shape[0]
+
+        if total_t < seq_len:
+            return file_idx, 0, []
+        samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
+        return file_idx, total_t, samples
+    except Exception as e:
+        print(f"Skipping {filepath} due to error: {e}")
+        return file_idx, 0, []
+
+class MarioVideoDataset(Dataset):
+    def __init__(
+        self,
+        data_dir,
+        seq_len=4,
+        subset_n=0,
+        seed=42,
+        num_workers=None,
+        system_info=None,
+    ):
+        if num_workers is None:
+            num_workers = get_effective_cpu_count(system_info)
+        self.data_files = sorted(str(p) for p in Path(data_dir).glob('*.npz'))
+        self.seq_len = seq_len
+        self.samples = []
+        
+        n_files = len(self.data_files)
+        print(f"Indexing {n_files} data files (stride=1)...")
+        frame_counts = [0] * n_files
+        index_workers = max(num_workers, 1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
+            futures = {
+                pool.submit(_index_file, idx, f, seq_len): idx
+                for idx, f in enumerate(self.data_files)
+            }
+            with tqdm(total=n_files, desc="Indexing files", unit="file") as pbar:
+                for future in concurrent.futures.as_completed(futures):
+                    file_idx, total_t, samples = future.result()
+                    frame_counts[file_idx] = total_t
+                    self.samples.extend(samples)
+                    pbar.update(1)
+
+        # Remove files with no usable frames and remap indices
+        valid = [i for i in range(n_files) if frame_counts[i] > 0]
+        if len(valid) < n_files:
+            skipped = n_files - len(valid)
+            print(f"Dropped {skipped} file(s) with no usable frames")
+            old_to_new = {old: new for new, old in enumerate(valid)}
+            self.data_files = [self.data_files[i] for i in valid]
+            frame_counts = [frame_counts[i] for i in valid]
+            self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
+            n_files = len(self.data_files)
+
+        self.samples.sort()  # deterministic order regardless of thread completion
+
+        if subset_n > 0 and subset_n < len(self.samples):
+            total = len(self.samples)
+            rng = np.random.RandomState(seed)
+            indices = rng.choice(total, size=subset_n, replace=False)
+            self.samples = [self.samples[i] for i in indices]
+            print(f"Subset: kept {subset_n} of {total} samples")
+
+        # Decide whether to decompress all frames into RAM or use mmap
+        total_frames = sum(frame_counts)
+        self.frames_by_file = None
+        if total_frames > 0:
+            available = get_available_memory(system_info)
+            probe = np.load(self.data_files[0], mmap_mode='r')['frames']
+            bytes_per_frame = math.prod(probe.shape[1:])  # C*H*W, uint8
+            total_bytes = total_frames * bytes_per_frame
+            headroom = 2 * 2**30  # keep 2 GB free
+
+            if available > 0 and total_bytes < available - headroom:
+                print(f"Loading all frames into RAM ({total_bytes / 2**30:.0f} GB, "
+                      f"{available / 2**30:.0f} GB available)...")
+                self.frames_by_file = [None] * n_files
+
+                def _load_file(idx):
+                    return idx, np.load(self.data_files[idx])['frames']
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
+                    futures = [pool.submit(_load_file, i) for i in range(n_files)]
+                    with tqdm(total=n_files, desc="Loading into RAM", unit="file") as pbar:
+                        for future in concurrent.futures.as_completed(futures):
+                            idx, frames = future.result()
+                            self.frames_by_file[idx] = frames
+                            pbar.update(1)
+                actual = sum(f.nbytes for f in self.frames_by_file)
+                print(f"Loaded {actual / 2**30:.0f} GB into RAM (COW-shared with workers)")
+            else:
+                print(f"Dataset too large for RAM ({total_bytes / 2**30:.0f} GB, "
+                      f"{available / 2**30:.0f} GB available). Using mmap.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _get_frames_mmap(self, file_idx):
+        """Return the mmap'd frames array for a file, caching the handle."""
+        if not hasattr(self, '_mmap_cache'):
+            self._mmap_cache = {}
+        if file_idx not in self._mmap_cache:
+            self._mmap_cache[file_idx] = np.load(
+                self.data_files[file_idx], mmap_mode='r'
+            )['frames']
+        return self._mmap_cache[file_idx]
+
+    def __getitem__(self, idx):
+        file_idx, t_start = self.samples[idx]
+        if self.frames_by_file is not None:
+            frames = self.frames_by_file[file_idx]
+        else:
+            frames = self._get_frames_mmap(file_idx)
+        chunk = frames[t_start:t_start+self.seq_len]  # (T, H, W) uint8
+        return torch.from_numpy(chunk.copy())
 
 
 def train():
     args = parse_args()
 
-    crop_size = None
-    if args.crop_240:
-        crop_size = OVERSCAN_CROP_SIZE
-    elif args.crop_224:
-        crop_size = CROP_224_SIZE
-
-    image_size = crop_size or DEFAULT_IMAGE_SIZE
+    image_size = IMAGE_SIZE
 
     magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
     magvit_configs_by_name = {c.name: c for c in magvit_configs}
@@ -426,7 +391,6 @@ def train():
         seed=args.seed,
         num_workers=args.num_workers,
         system_info=system_info,
-        crop_size=crop_size,
     )
     print(
         f"Found {len(dataset)} sequence segments of {total_frames} frames "
@@ -451,8 +415,8 @@ def train():
     if not os.path.isfile(palette_path):
         raise FileNotFoundError(f"No palette.json found in {args.data_dir}")
     with open(palette_path) as f:
-        palette_rgb = json.load(f)
-    palette = torch.tensor(palette_rgb, dtype=torch.float32) / 255.0  # (K, 3)
+        palette_info = json.load(f)
+    palette = torch.tensor(palette_info["colors_rgb"], dtype=torch.float32) / 255.0  # (K, 3)
     num_palette_colors = palette.shape[0]
     print(f"[palette] Loaded {num_palette_colors} colours from {palette_path}")
 
@@ -516,6 +480,7 @@ def train():
             ceiling = min(ceiling, args.max_batch_size)
         args.batch_size = find_max_batch_size(
             tokenizer,
+            num_palette_colors=num_palette_colors,
             image_size=image_size,
             seq_len=total_frames,
             device=device,
