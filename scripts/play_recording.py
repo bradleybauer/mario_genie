@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Play back a Mesen research recording (.avi + .mdat) with RAM visualization.
+"""Play back a Mesen research recording (.avi + .npy) with RAM visualization.
 
 Plays the lossless AVI video with audio while displaying synchronized
-RAM/WRAM data from the companion .mdat file.
+RAM/WRAM data from the companion .npy files.
 
 Features:
     - Video + audio playback from the .avi (OpenCV + pygame.mixer)
     - RAM value grid and activity heat-map
     - Decoded SMB1 game variables (auto-detected from RAM)
     - OAM sprite position mini-map
-    - NES controller input display (all connected controllers)
+    - NES controller input display
     - Pause, step, speed controls
 
 Controls:
@@ -17,14 +17,13 @@ Controls:
     Escape / Q  - quit
 
 Usage:
-    python scripts/play_recording.py path/to/recording.mdat
     python scripts/play_recording.py path/to/recording.avi
+    python scripts/play_recording.py path/to/recording.ram.npy
 """
 from __future__ import annotations
 
 import argparse
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -48,58 +47,41 @@ from mario_world_model.game_decoders import decode_smb1, draw_decoded_sections
 
 
 # ---------------------------------------------------------------------------
-# MDAT parsing
+# NPY recording loading
 # ---------------------------------------------------------------------------
 
-MDAT_MAGIC = b"MSDC"
-HEADER_SIZE = 32
-HEADER_FMT = "<4sHHIIHHIII"
 
+def _resolve_base(recording_path: Path) -> tuple[Path, Path]:
+    """Derive the base name and avi path from any recording file path.
 
-def parse_mdat(path: Path):
-    """Parse an .mdat file.
-
-    Returns (header_dict, frame_numbers, ram, wram_or_None, inputs).
+    Accepts paths ending in .avi, .ram.npy, .frames.npy, .input.npy, etc.
+    Returns (base_path_without_ext, avi_path).
     """
-    data = path.read_bytes()
-    if len(data) < HEADER_SIZE:
-        raise ValueError(f"File too small: {len(data)} bytes")
+    name = recording_path.name
+    parent = recording_path.parent
+    for suffix in (".ram.npy", ".frames.npy", ".input.npy", ".wram.npy",
+                   ".meta.json", ".mss", ".avi"):
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+    base = parent / name
+    avi_path = parent / (name + ".avi")
+    return base, avi_path
 
-    fields = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-    (magic, version, console_type, ram_size, wram_size,
-     input_bytes, num_controllers, start_frame, fps_x1000, _) = fields
 
-    if magic != MDAT_MAGIC:
-        raise ValueError(f"Invalid magic: {magic!r}")
+def load_npy_recording(base: Path):
+    """Load .npy sidecar files.
 
-    header = {
-        "console_type": console_type,
-        "ram_size": ram_size,
-        "wram_size": wram_size,
-        "input_bytes_per_frame": input_bytes,
-        "num_controllers": num_controllers,
-        "start_frame": start_frame,
-        "fps": fps_x1000 / 1000.0,
-        "record_size": 4 + ram_size + wram_size + input_bytes,
-    }
+    Returns (frame_numbers, ram, wram_or_None, inputs).
+    """
+    frame_numbers = np.load(str(base) + ".frames.npy")
+    ram = np.load(str(base) + ".ram.npy")
+    inputs = np.load(str(base) + ".input.npy")
 
-    record_size = header["record_size"]
-    payload = data[HEADER_SIZE:]
-    num_frames = len(payload) // record_size
-    if len(payload) % record_size != 0:
-        payload = payload[:num_frames * record_size]
+    wram_path = Path(str(base) + ".wram.npy")
+    wram = np.load(str(wram_path)) if wram_path.exists() else None
 
-    # Parse all records into contiguous arrays
-    all_records = np.frombuffer(payload, dtype=np.uint8).reshape(num_frames, record_size)
-    frame_numbers = np.frombuffer(
-        all_records[:, :4].tobytes(), dtype=np.uint32
-    ).copy()
-    ram = all_records[:, 4:4 + ram_size].copy()
-    wram = (all_records[:, 4 + ram_size:4 + ram_size + wram_size].copy()
-            if wram_size > 0 else None)
-    inputs = all_records[:, 4 + ram_size + wram_size:].copy()
-
-    return header, frame_numbers, ram, wram, inputs
+    return frame_numbers, ram, wram, inputs
 
 
 # ---------------------------------------------------------------------------
@@ -134,45 +116,42 @@ def _draw_circle_btn(surface, font, label, cx, cy, pressed):
 def draw_controller(
     surface: pygame.Surface,
     font: pygame.font.Font,
-    input_bytes: np.ndarray,
+    input_byte: int,
     x: int, y: int,
-    num_controllers: int,
 ) -> int:
-    """Draw NES controller state for each controller. Returns y after drawing."""
-    for ctrl in range(min(num_controllers, len(input_bytes))):
-        bval = int(input_bytes[ctrl])
-        lbl = font.render(f"P{ctrl + 1}", True, (200, 200, 200))
-        surface.blit(lbl, (x, y))
-        cy = y + 16
+    """Draw NES controller state for port 1. Returns y after drawing."""
+    bval = input_byte
+    lbl = font.render("P1", True, (200, 200, 200))
+    surface.blit(lbl, (x, y))
+    cy = y + 16
 
-        # D-pad  (3x3 grid, centre empty)
-        dx = x
-        _draw_rect_btn(surface, font, "U", dx + _BTN_STEP, cy,
-                        bool(bval & (1 << 0)))
-        _draw_rect_btn(surface, font, "L", dx, cy + _BTN_STEP,
-                        bool(bval & (1 << 2)))
-        _draw_rect_btn(surface, font, "R", dx + 2 * _BTN_STEP, cy + _BTN_STEP,
-                        bool(bval & (1 << 3)))
-        _draw_rect_btn(surface, font, "D", dx + _BTN_STEP, cy + 2 * _BTN_STEP,
-                        bool(bval & (1 << 1)))
+    # D-pad  (3x3 grid, centre empty)
+    dx = x
+    _draw_rect_btn(surface, font, "U", dx + _BTN_STEP, cy,
+                    bool(bval & (1 << 0)))
+    _draw_rect_btn(surface, font, "L", dx, cy + _BTN_STEP,
+                    bool(bval & (1 << 2)))
+    _draw_rect_btn(surface, font, "R", dx + 2 * _BTN_STEP, cy + _BTN_STEP,
+                    bool(bval & (1 << 3)))
+    _draw_rect_btn(surface, font, "D", dx + _BTN_STEP, cy + 2 * _BTN_STEP,
+                    bool(bval & (1 << 1)))
 
-        # Select / Start (pill-shaped)
-        mx = dx + 3 * _BTN_STEP + 14
-        _draw_rect_btn(surface, font, "Sel", mx, cy + _BTN_STEP,
-                        bool(bval & (1 << 5)), w=30, h=_BTN_SIZE - 4)
-        _draw_rect_btn(surface, font, "Str", mx + 34, cy + _BTN_STEP,
-                        bool(bval & (1 << 4)), w=30, h=_BTN_SIZE - 4)
+    # Select / Start (pill-shaped)
+    mx = dx + 3 * _BTN_STEP + 14
+    _draw_rect_btn(surface, font, "Sel", mx, cy + _BTN_STEP,
+                    bool(bval & (1 << 5)), w=30, h=_BTN_SIZE - 4)
+    _draw_rect_btn(surface, font, "Str", mx + 34, cy + _BTN_STEP,
+                    bool(bval & (1 << 4)), w=30, h=_BTN_SIZE - 4)
 
-        # B / A (circles)
-        bx = mx + 74
-        _draw_circle_btn(surface, font, "B", bx, cy + _BTN_STEP + _BTN_SIZE // 2,
-                          bool(bval & (1 << 6)))
-        _draw_circle_btn(surface, font, "A", bx + _BTN_SIZE + 6,
-                          cy + _BTN_STEP + _BTN_SIZE // 2,
-                          bool(bval & (1 << 7)))
+    # B / A (circles)
+    bx = mx + 74
+    _draw_circle_btn(surface, font, "B", bx, cy + _BTN_STEP + _BTN_SIZE // 2,
+                      bool(bval & (1 << 6)))
+    _draw_circle_btn(surface, font, "A", bx + _BTN_SIZE + 6,
+                      cy + _BTN_STEP + _BTN_SIZE // 2,
+                      bool(bval & (1 << 7)))
 
-        y = cy + 3 * _BTN_STEP + 6
-
+    y = cy + 3 * _BTN_STEP + 6
     return y
 
 
@@ -206,33 +185,22 @@ def extract_audio_to_wav(avi_path: Path) -> Path | None:
 
 def run(recording_path: Path, scale: int,
         ram_scale: int, audio_offset: float = 0.0):
-    # Resolve companion files from either .mdat or .avi path.
-    # Use stem manipulation instead of with_suffix() because filenames like
-    # "Super Mario Bros. (World) 3_26_2026 10:51:16 PM.avi" contain dots
-    # that with_suffix("") would incorrectly split on.
-    name = recording_path.name
-    for ext in (".mdat", ".avi"):
-        if name.endswith(ext):
-            name = name[:-len(ext)]
-            break
-    parent = recording_path.parent
-    mdat_path = parent / (name + ".mdat")
-    avi_path = parent / (name + ".avi")
+    base, avi_path = _resolve_base(recording_path)
+    name = base.name
 
-    if not mdat_path.exists():
-        raise FileNotFoundError(f"MDAT not found: {mdat_path}")
+    ram_npy_path = Path(str(base) + ".ram.npy")
+    if not ram_npy_path.exists():
+        raise FileNotFoundError(f"RAM data not found: {ram_npy_path}")
     if not avi_path.exists():
         raise FileNotFoundError(f"AVI not found: {avi_path}")
 
-    # --- Load MDAT ---
-    print(f"Loading {mdat_path.name} ...")
-    header, frame_numbers, ram_data, wram_data, input_data = parse_mdat(mdat_path)
-    n_mdat = len(frame_numbers)
-    fps = round(header["fps"])
-    print(f"  {n_mdat} frames, {header['ram_size']}B RAM, "
-          f"{header['wram_size']}B WRAM, "
-          f"{header['num_controllers']} controller(s), "
-          f"{header['fps']:.1f} FPS")
+    # --- Load npy data ---
+    print(f"Loading {name} ...")
+    frame_numbers, ram_data, wram_data, input_data = load_npy_recording(base)
+    n_data = len(frame_numbers)
+    ram_size = ram_data.shape[1]
+    wram_size = wram_data.shape[1] if wram_data is not None else 0
+    print(f"  {n_data} frames, {ram_size}B RAM, {wram_size}B WRAM")
 
     # --- Open AVI ---
     cap = cv2.VideoCapture(str(avi_path))
@@ -241,8 +209,9 @@ def run(recording_path: Path, scale: int,
     avi_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    n_frames = min(n_mdat, avi_total)
-    print(f"  AVI: {avi_total} frames, {vid_w}x{vid_h}")
+    fps = round(cap.get(cv2.CAP_PROP_FPS)) or 60
+    n_frames = min(n_data, avi_total)
+    print(f"  AVI: {avi_total} frames, {vid_w}x{vid_h}, {fps} FPS")
     print(f"  Synchronized frames: {n_frames}")
 
     # --- Extract audio ---
@@ -262,7 +231,7 @@ def run(recording_path: Path, scale: int,
 
     oam_map_w, oam_map_h = 192, 180
     oam_section_h = 18 + oam_map_h + 6
-    ctrl_section_h = 16 + (3 * _BTN_STEP + 22) * min(header["num_controllers"], 4)
+    ctrl_section_h = 16 + (3 * _BTN_STEP + 22)
 
     panel_w = ram_label_margin + ram_grid_w + 16
     panel_h = (top_margin + (ram_grid_h + 16) * 2 + grid_gap
@@ -439,8 +408,7 @@ def run(recording_path: Path, scale: int,
             screen.blit(
                 font.render("-- INPUT --", True, (200, 200, 100)),
                 (4, oy))
-            draw_controller(screen, font, inp, 4, oy + 16,
-                            header["num_controllers"])
+            draw_controller(screen, font, int(inp), 4, oy + 16)
 
             # --- Right panel ---
             gx = game_w + ram_label_margin
@@ -505,11 +473,11 @@ def run(recording_path: Path, scale: int,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Play a Mesen recording (.avi + .mdat) with RAM visualization",
+        description="Play a Mesen recording (.avi + .npy) with RAM visualization",
     )
     parser.add_argument(
         "path", type=Path,
-        help="Path to the .mdat or .avi file (companion file auto-detected)",
+        help="Path to any recording file (.avi, .ram.npy, etc.)",
     )
     parser.add_argument("--scale", type=int, default=2,
                         help="Video scale factor (default: 2)")

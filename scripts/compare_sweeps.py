@@ -183,22 +183,6 @@ def abbreviate_layer_component(component: str) -> str:
     return f"{abbreviated_name}{sep}{value}"
 
 
-def format_layers(layers: object) -> str:
-    """Render layer definitions with abbreviated component names."""
-    if not isinstance(layers, list):
-        return str(layers)
-
-    formatted_layers = []
-    for layer in layers:
-        if isinstance(layer, list) and len(layer) == 2:
-            formatted_layers.append(
-                abbreviate_layer_component(f"{layer[0]}:{layer[1]}")
-            )
-        else:
-            formatted_layers.append(abbreviate_layer_component(str(layer)))
-    return ",".join(formatted_layers)
-
-
 def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
     """Fit codebook-usage axis limits to observed values only."""
     usages = [

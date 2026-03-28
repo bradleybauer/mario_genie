@@ -34,6 +34,11 @@ def _wram(ram: np.ndarray, nes_addr: int) -> int:
         return int(ram[idx])
     return 0
 
+
+def _signed_byte(value: int) -> int:
+    """Interpret an unsigned byte as a signed 8-bit integer."""
+    return value - 256 if value >= 0x80 else value
+
 # ---------------------------------------------------------------------------
 # SMB1 decoder
 # ---------------------------------------------------------------------------
@@ -58,7 +63,7 @@ _SMB1_ENEMY_TYPES = {
 
 def decode_smb1(ram: np.ndarray) -> list[tuple[str, list[str]]]:
     """Decode Super Mario Bros. 1 RAM."""
-    # int() casts avoid uint8 overflow when the array comes from mdat parsing.
+    # int() casts avoid uint8 overflow when the array comes from npy parsing.
     r = lambda addr: int(ram[addr])
     ps = r(0x000E)
     player_state = _SMB1_PLAYER_STATES.get(ps, f"0x{ps:02X}")
@@ -66,8 +71,8 @@ def decode_smb1(ram: np.ndarray) -> list[tuple[str, list[str]]]:
     x_pos = r(0x006D) * 256 + r(0x0086)
     y_pos = r(0x00CE)
     y_viewport = r(0x00B5)
-    x_speed = np.int8(ram[0x0057])
-    y_speed = np.int8(ram[0x001D])
+    x_speed = _signed_byte(r(0x0057))
+    y_speed = _signed_byte(r(0x001D))
     moving_dir = "R" if r(0x0045) == 1 else ("L" if r(0x0045) == 2 else "?")
 
     world = r(0x075F) + 1
@@ -131,32 +136,34 @@ _SMB3_PLAYER_ACTIONS = {
 
 def decode_smb3(ram: np.ndarray) -> list[tuple[str, list[str]]]:
     """Decode Super Mario Bros. 3 RAM."""
+    r = lambda addr: int(ram[addr])
+
     # Power-up state at $00ED
-    power_byte = ram[0x00ED]
+    power_byte = r(0x00ED)
     power = _SMB3_POWER_STATES.get(power_byte, f"0x{power_byte:02X}")
 
     # Player position and motion
     # $0075 is a context-dependent coarse/high byte field used for level X and map Y.
     # In-level horizontal position still tracks with $0075/$0090.
-    x_pos = ram[0x0075] * 256 + ram[0x0090]
-    y_pos = ram[0x0087] * 256 + ram[0x00A2]
-    x_speed = np.int8(ram[0x00BD])
-    y_speed = np.int8(ram[0x00CF])
+    x_pos = r(0x0075) * 256 + r(0x0090)
+    y_pos = r(0x0087) * 256 + r(0x00A2)
+    x_speed = _signed_byte(r(0x00BD))
+    y_speed = _signed_byte(r(0x00CF))
 
     # Facing direction at $00EF (bit 6 set = right, clear = left)
-    direction = "R" if (ram[0x00EF] & 0x40) else "L"
+    direction = "R" if (r(0x00EF) & 0x40) else "L"
 
     # In-air flag at $00D8 (0 = ground, else airborne)
-    airborne = "Air" if ram[0x00D8] != 0 else "Ground"
+    airborne = "Air" if r(0x00D8) != 0 else "Ground"
 
     # World (no documented stage counter — SMB3 overworld is non-linear)
-    world = ram[0x0727] + 1
+    world = r(0x0727) + 1
 
     # Lives at $0736
-    lives = ram[0x0736]
+    lives = r(0x0736)
 
     # Timer: 3 decimal digits at $05EE-$05F0
-    time_val = ram[0x05EE] * 100 + ram[0x05EF] * 10 + ram[0x05F0]
+    time_val = r(0x05EE) * 100 + r(0x05EF) * 10 + r(0x05F0)
 
     # Score: big-endian 3 bytes at $0715-$0717, multiply by 10
     score = (int(ram[0x0715]) << 16 | int(ram[0x0716]) << 8 | int(ram[0x0717])) * 10
@@ -171,32 +178,32 @@ def decode_smb3(ram: np.ndarray) -> list[tuple[str, list[str]]]:
         0x0A: "Ship", 0x0B: "Giant", 0x0C: "Ice", 0x0D: "Cloudy",
         0x0E: "Underground",
     }
-    objset = ram[0x070A]
+    objset = r(0x070A)
     in_level = time_val > 0 and objset > 0
     mode = f"In Level ({_OBJSET_NAMES.get(objset, '?')})" if in_level else "Overworld"
 
     # P-meter at $03DD: bits 0-5 = arrows, bit 6 = P
-    pmeter = ram[0x03DD]
+    pmeter = r(0x03DD)
     p_arrows = sum((pmeter >> i) & 1 for i in range(6))
     p_full = "P!" if (pmeter & 0x40) else ""
     p_str = f"{p_arrows}/6 {p_full}".strip()
 
     # Flight / duck / swim / boot
-    flying = ram[0x057B] != 0
-    ducking = ram[0x056F] != 0
-    swimming = ram[0x0575] != 0
-    boot = ram[0x0577] != 0
+    flying = r(0x057B) != 0
+    ducking = r(0x056F) != 0
+    swimming = r(0x0575) != 0
+    boot = r(0x0577) != 0
 
     # Star and invincibility timers
-    star_timer = ram[0x0553]
-    hit_inv = ram[0x0552]
+    star_timer = r(0x0553)
+    hit_inv = r(0x0552)
 
     # Flight timer at $056E (countdown while raccoon/tanooki P-fly)
-    flight_timer = ram[0x056E]
+    flight_timer = r(0x056E)
     # P-switch timer at $0567 (countdown after stomping P-switch)
-    pswitch_timer = ram[0x0567]
+    pswitch_timer = r(0x0567)
     # Stomp counter at $05F4 (consecutive stomps for 1-up chain)
-    stomp_count = ram[0x05F4]
+    stomp_count = r(0x05F4)
 
     # Progress (WRAM)
     mario_cleared = None
