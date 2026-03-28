@@ -14,5 +14,3 @@ Skimmed the magvit2 paper, notes: Increase warmup period, push the temporal down
 
 
 Instead of all combinations of architecture variables maybe just define an order to test them as additions to some base model
-
-The frames will be reduced to a minimal set of palette indices and the ram/wram will be reduced to a minimal set of ram addresses. The idea is I will need a post step after collection that considers the whole dataset and that reduce redundancies in the data. And similarly for the actions.

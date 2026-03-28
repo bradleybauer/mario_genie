@@ -25,7 +25,7 @@ from typing import NamedTuple, Optional
 
 import numpy as np
 
-DEFAULT_DATA_DIR = Path.cwd() / "data"
+DEFAULT_DATA_DIR = Path.cwd() / "data" / "raw"
 
 _STATE_FRAME_RE = re.compile(r"frame_(\d+)\.mss$")
 

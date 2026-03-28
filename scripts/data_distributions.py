@@ -101,12 +101,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+_NES_BUTTONS = [
+    (0, "Up"), (1, "Down"), (2, "Left"), (3, "Right"),
+    (4, "Start"), (5, "Select"), (6, "B"), (7, "A"),
+]
+
+
+def action_label(byte_val: int) -> str:
+    """Convert a NES controller bitmask to a human-readable button string."""
+    parts = [name for bit, name in _NES_BUTTONS if byte_val & (1 << bit)]
+    return "+".join(parts) if parts else "None"
+
+
 def _sort_by_value(series) -> bool:
     """Return True if the series should default to value-sorted output."""
     return series.dtype.kind in ("i", "u", "f")
 
 
-def print_value_counts(series, top: int, show_bars: bool = True, sort: str | None = None):
+def print_value_counts(series, top: int, show_bars: bool = True,
+                       sort: str | None = None, label_fn=None):
     """Print a frequency table for a pandas Series."""
     total = len(series)
     nunique = series.nunique()
@@ -121,22 +134,33 @@ def print_value_counts(series, top: int, show_bars: bool = True, sort: str | Non
             pass
     print()
 
+    if nunique <= 255:
+        top = nunique
+
     use_value = (sort == "value") if sort else _sort_by_value(series)
     if use_value:
         vc_freq = series.value_counts().sort_index().head(top)
     else:
         vc_freq = series.value_counts().head(top)
-    max_val_width = max(len(str(v)) for v in vc_freq.index)
+
+    def _fmt(v):
+        s = str(v)
+        if label_fn is not None:
+            return f"{s} ({label_fn(v)})"
+        return s
+
+    labels = [_fmt(v) for v in vc_freq.index]
+    max_val_width = max(len(l) for l in labels)
     max_cnt_width = max(len(f"{c:,}") for c in vc_freq.values)
 
-    for val, cnt in vc_freq.items():
+    for label, (val, cnt) in zip(labels, vc_freq.items()):
         pct = 100 * cnt / total
         if show_bars:
             bar_len = int(pct / 2)
             bar = "#" * bar_len
-            print(f"  {str(val):>{max_val_width}}: {cnt:>{max_cnt_width},}  ({pct:5.1f}%)  {bar}")
+            print(f"  {label:>{max_val_width}}: {cnt:>{max_cnt_width},}  ({pct:5.1f}%)  {bar}")
         else:
-            print(f"  {str(val):>{max_val_width}}: {cnt:>{max_cnt_width},}  ({pct:5.1f}%)")
+            print(f"  {label:>{max_val_width}}: {cnt:>{max_cnt_width},}  ({pct:5.1f}%)")
 
     if nunique > top:
         print(f"  ... and {nunique - top} more values")
@@ -404,10 +428,14 @@ def main():
             print(f"  {col}  →  {label}: {desc}")
         print()
 
+    def _label_fn(col):
+        return action_label if col == "action" else None
+
     if len(args.columns) == 1:
         col = args.columns[0]
         print(f"Distribution of '{col}':")
-        print_value_counts(df[col], top=args.top, show_bars=not args.counts, sort=args.sort)
+        print_value_counts(df[col], top=args.top, show_bars=not args.counts,
+                           sort=args.sort, label_fn=_label_fn(col))
 
     elif len(args.columns) == 2:
         col_a, col_b = args.columns
@@ -419,7 +447,8 @@ def main():
         for col in args.columns:
             print(f"\n{'='*50}")
             print(f"Distribution of '{col}':")
-            print_value_counts(df[col], top=args.top, show_bars=not args.counts, sort=args.sort)
+            print_value_counts(df[col], top=args.top, show_bars=not args.counts,
+                               sort=args.sort, label_fn=_label_fn(col))
 
     # Optional plot
     if args.plot:
