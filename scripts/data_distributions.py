@@ -270,6 +270,93 @@ def plot_progression(df):
         print(f"  World {lvl[0]+1}-{lvl[1]+1}: {lvl_frames:>8,} frames ({pct:5.1f}%)")
 
     plt.tight_layout()
+
+    # --- Per-powerup figures: same two-row layout, one figure each ---
+    _POWERUP_NAMES = {0: "Small", 1: "Big", 2: "Fire"}
+    _POWERUP_COLOURS = {0: "#4dabf7", 1: "#51cf66", 2: "#ff6b6b"}
+
+    if "ram_0756" not in df.columns:
+        print("Warning: ram_0756 (powerup_state) not available, "
+              "skipping powerup breakdown.", file=sys.stderr)
+        plt.show()
+        return
+
+    powerup = df["ram_0756"].values
+    powerup_ids = sorted({int(v) for v in np.unique(powerup)})
+
+    # Count per (world, stage, x_page, powerup)
+    prog_pw = list(zip(world.tolist(), stage.tolist(),
+                       x_page.tolist(), powerup.tolist()))
+    counts_pw = Counter(prog_pw)
+
+    for pw_id in powerup_ids:
+        pw_name = _POWERUP_NAMES.get(pw_id, f"pw={pw_id}")
+        pw_colour = _POWERUP_COLOURS.get(pw_id, cmap(0))
+        pw_total = int(np.sum(powerup == pw_id))
+
+        fig_pw, axes_pw = plt.subplots(2, 1, figsize=(14, 7))
+
+        for row_idx, sl in enumerate(row_slices):
+            ax = axes_pw[row_idx]
+            row_bins = bins_sorted[sl]
+            x = np.arange(len(row_bins))
+
+            if len(row_bins) == 0:
+                ax.set_visible(False)
+                continue
+
+            heights = np.array(
+                [counts_pw.get((w, s, xp, pw_id), 0) / total
+                 for w, s, xp in row_bins]
+            )
+            ax.bar(x, heights, width=1.0, color=pw_colour,
+                   edgecolor="none", linewidth=0)
+            ax.axhline(uniform, color="red", linewidth=1.2, linestyle="--",
+                       label=f"uniform = {uniform:.5f}" if row_idx == 0 else None)
+
+            # Vertical separators between levels
+            prev_level = None
+            for i, (w, s, _) in enumerate(row_bins):
+                lvl = (w, s)
+                if prev_level is not None and lvl != prev_level:
+                    ax.axvline(i - 0.5, color="grey", linewidth=0.4, alpha=0.5)
+                prev_level = lvl
+
+            # X-axis labels
+            level_spans_pw: dict[tuple[int, int], list[int]] = defaultdict(list)
+            for i, (w, s, _) in enumerate(row_bins):
+                level_spans_pw[(w, s)].append(i)
+            tick_positions = []
+            tick_labels = []
+            for lvl in levels_ordered:
+                if lvl not in level_spans_pw:
+                    continue
+                indices = level_spans_pw[lvl]
+                tick_positions.append(indices[len(indices) // 2])
+                tick_labels.append(f"{lvl[0]+1}-{lvl[1]+1}")
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels, fontsize=7, rotation=45, ha="right")
+            ax.set_xlim(-0.5, len(row_bins) - 0.5)
+            ax.set_ylim(0, y_max)
+            ax.set_ylabel("Density")
+
+        pct = 100 * pw_total / total
+        axes_pw[0].set_title(
+            f"{pw_name} — {pw_total:,} frames ({pct:.1f}%) across "
+            f"{num_bins} (world, stage, x_page) bins"
+        )
+        axes_pw[0].legend(fontsize=8)
+        axes_pw[1].set_xlabel("World-Stage")
+        plt.tight_layout()
+
+    # Text summary for powerup breakdown
+    print(f"\nPowerup breakdown:")
+    for pw_id in powerup_ids:
+        pw_frames = int(np.sum(powerup == pw_id))
+        pct = 100 * pw_frames / total
+        name = _POWERUP_NAMES.get(pw_id, f"pw={pw_id}")
+        print(f"  {name:>5}: {pw_frames:>8,} frames ({pct:5.1f}%)")
+
     plt.show()
 
 
@@ -359,7 +446,7 @@ def main():
 
     # --- Determine which RAM columns to expand into the DataFrame ---
     ram_columns = None
-    _PROGRESSION_ADDRS = [0x075F, 0x075C, 0x006D]
+    _PROGRESSION_ADDRS = [0x075F, 0x075C, 0x006D, 0x0756]
 
     if args.ram_only is not None:
         ram_columns = [int(a, 16) for a in args.ram_only]
