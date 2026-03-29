@@ -48,9 +48,6 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.actions import NUM_ACTIONS
-from mario_world_model.dataset_paths import find_session_files
-
 # ---------------------------------------------------------------------------
 # Hyperparameters (small model)
 # ---------------------------------------------------------------------------

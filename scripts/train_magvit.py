@@ -14,6 +14,9 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, RandomSampler
 import sys
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Add src to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,13 +30,14 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, 
 
 from tqdm import tqdm
 
+from mario_world_model.config import IMAGE_SIZE
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
 
 
-IMAGE_SIZE = 224
+CHECKPOINTS_DIR = "checkpoints"
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,21 +48,11 @@ def parse_args() -> argparse.Namespace:
         default="data/normalized",
         help="Directory containing normalized .npz files and palette.json",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
-        "--auto-batch-size", action="store_true",
-        help="Probe GPU to find the largest batch size that fits in VRAM. "
-             "Overrides --batch-size.",
-    )
-    parser.add_argument(
-        "--max-batch-size", type=int, default=0,
-        help="Cap batch size (0 = no cap). Use with --auto-batch-size to "
-             "limit large batches for faster convergence.",
-    )
-    parser.add_argument("--lr", type=float, default=5e-4)
+        "--lr", type=float, default=7e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000,
                         help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
-    parser.add_argument("--output-dir", type=str, default="checkpoints/magvit2")
     parser.add_argument("--val-interval", type=int, default=200)
     parser.add_argument("--image-interval-secs", type=float, default=300,
                         help="Minimum seconds between saving reconstruction images (default: 300)")
@@ -80,13 +74,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true",
                         help="Enable graph compilation")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-shuffle", action="store_true", help="Disable shuffling of the dataset")
     parser.add_argument("--eval-samples", type=int, default=5000,
                         help="Number of held-out samples for end-of-training evaluation (0 to disable)")
     _default_workers = min(get_effective_cpu_count(), 64)
     parser.add_argument("--num-workers", type=int, default=_default_workers,
                         help=f"Number of DataLoader workers (default: {_default_workers})")
-    parser.add_argument("--run-name", type=str, default=None, help="Subfolder under output-dir for this run")
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Run directory name under checkpoints/ (defaults to the selected model name)",
+    )
     parser.add_argument(
         "--max-patience", type=float, default=None,
         help=(
@@ -98,27 +96,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--threshold", type=float, default=None,
         help=(
-            "Stop training once eval recon_loss drops below this value "
+            "Stop training once smoothed training recon_loss drops below this value. "
             "Checkpoint is saved before exit."
         ),
     )
     parser.add_argument(
-        "--max-minutes", type=float, default=0,
-        help=(
-            "Stop training after this many minutes of wall-clock time "
-            "(0 = no limit, rely on --max-patience / --threshold to stop). "
-            "Also sets the cosine-annealing LR schedule duration."
-        ),
-    )
-    parser.add_argument(
         "--max-steps", type=int, default=0,
-        help="Stop after this many gradient steps (0 = no limit).",
+        help="Stop after this many gradient steps. If omitted, defaults to --total-steps.",
     )
     parser.add_argument(
         "--total-steps", type=int, default=0,
         help=(
             "Total steps for the cosine LR schedule. "
-            "Defaults to --max-steps when set, otherwise estimated from --max-minutes."
+            "If omitted, defaults to --max-steps."
         ),
     )
     parser.add_argument(
@@ -140,6 +130,14 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    if args.max_steps <= 0 and args.total_steps <= 0:
+        parser.error("either --max-steps or --total-steps must be set to a positive integer")
+
+    if args.max_steps <= 0 and args.total_steps > 0:
+        args.max_steps = args.total_steps
+    elif args.total_steps <= 0 and args.max_steps > 0:
+        args.total_steps = args.max_steps
+
     return args
 
 
@@ -154,34 +152,18 @@ def _format_elapsed(seconds):
     return f"{secs}s"
 
 
-def find_max_batch_size(
-    tokenizer, *, num_palette_colors, image_size, seq_len, device,
-    floor=1, ceiling=256, video_contains_first_frame=True,
-):
-    """Binary-search for the largest batch size that fits in GPU memory."""
-    best = floor
-    lo, hi = floor, ceiling
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        torch.cuda.empty_cache()
-        try:
-            dummy = torch.randint(0, num_palette_colors, (mid, seq_len, image_size, image_size), device=device)
-            inp = PaletteVideoTokenizer.indices_to_onehot(dummy, num_palette_colors)
-            loss, _ = tokenizer(inp, targets=dummy, return_loss=True,
-                                video_contains_first_frame=video_contains_first_frame)
-            loss.backward()
-            tokenizer.zero_grad(set_to_none=True)
-            del dummy, inp, loss
-            torch.cuda.empty_cache()
-            best = mid
-            lo = mid + 1
-        except torch.cuda.OutOfMemoryError:
-            tokenizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            hi = mid - 1
-    return best
-
-
+def _format_bytes(num_bytes: int) -> str:
+    num_bytes = max(int(num_bytes), 0)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(num_bytes)
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{int(value)} {unit}"
+    return f"{value:.1f} {unit}"
 
 
 def _index_file(file_idx, filepath, seq_len):
@@ -221,6 +203,9 @@ class MarioVideoDataset(Dataset):
         self.data_files = sorted(str(p) for p in Path(data_dir).glob('*.npz'))
         self.seq_len = seq_len
         self.samples = []
+        self.num_files = len(self.data_files)
+        self.total_frames = 0
+        self.dataset_bytes = sum(Path(path).stat().st_size for path in self.data_files)
         
         n_files = len(self.data_files)
         print(f"Indexing {n_files} data files (stride=1)...")
@@ -260,6 +245,7 @@ class MarioVideoDataset(Dataset):
 
         # Decide whether to decompress all frames into RAM or use mmap
         total_frames = sum(frame_counts)
+        self.total_frames = total_frames
         self.frames_by_file = None
         if total_frames > 0:
             available = get_available_memory(system_info)
@@ -315,8 +301,6 @@ class MarioVideoDataset(Dataset):
 def train():
     args = parse_args()
 
-    image_size = IMAGE_SIZE
-
     magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
     magvit_configs_by_name = {c.name: c for c in magvit_configs}
 
@@ -336,6 +320,11 @@ def train():
     else:
         mc = magvit_configs_by_name[args.model]
 
+    if args.run_name is None:
+        args.run_name = args.model
+
+    args.output_dir = os.path.join(CHECKPOINTS_DIR, args.run_name)
+
     seq_len = mc.sequence_length
     ctx_frames = mc.context_frames
     total_frames = seq_len + ctx_frames
@@ -354,15 +343,20 @@ def train():
             return
         del ckpt_meta
 
-    # Restore batch_size from previous run's config on resume
+    # Restore batch_size from previous run's config on resume (only if not
+    # explicitly provided on the command line).
     if args.resume_from:
         prev_config_path = os.path.join(os.path.dirname(args.resume_from), "config.json")
         if os.path.exists(prev_config_path):
             with open(prev_config_path) as f:
                 prev_config = json.load(f)
-            if "batch_size" in prev_config:
+            if "batch_size" in prev_config and args.batch_size is None:
                 args.batch_size = prev_config["batch_size"]
                 print(f"[resume] Restored batch_size={args.batch_size} from {prev_config_path}")
+
+    # Apply default batch size if not set by CLI or resume
+    if args.batch_size is None:
+        args.batch_size = 4
 
     # ── Normal training ──────────────────────────────────────────────────
 
@@ -374,8 +368,6 @@ def train():
         torch.backends.cudnn.benchmark = True
 
     # Run directory
-    if args.run_name:
-        args.output_dir = os.path.join(args.output_dir, args.run_name)
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -394,7 +386,11 @@ def train():
     )
     print(
         f"Found {len(dataset)} sequence segments of {total_frames} frames "
-        f"({ctx_frames} context + {seq_len} target, image_size={image_size})."
+        f"({ctx_frames} context + {seq_len} target, image_size={IMAGE_SIZE})."
+    )
+    print(
+        f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
+        f"{dataset.total_frames:,} frames, {_format_bytes(dataset.dataset_bytes)} on disk."
     )
 
     # ── Split eval set (deterministic via torch seed) ────────────────
@@ -443,7 +439,10 @@ def train():
     num_w = min(args.num_workers, max_workers)
 
     def make_dataloader(batch_size):
-        sampler = RandomSampler(dataset, replacement=True, num_samples=10**7) if not args.no_shuffle else None
+        if args.overfit_n > 0:
+            sampler = None
+        else:
+            sampler = RandomSampler(dataset, replacement=True, num_samples=10**7)
         return DataLoader(
             dataset,
             batch_size=batch_size,
@@ -455,11 +454,9 @@ def train():
             prefetch_factor=2 if num_w > 0 else None,
         )
 
-    dataloader = make_dataloader(args.batch_size) if gpu_cache is None else None
-
     tokenizer = PaletteVideoTokenizer(
         num_palette_colors=num_palette_colors,
-        image_size=image_size,
+        image_size=IMAGE_SIZE,
         init_dim=mc.init_dim,
         codebook_size=mc.codebook_size,
         num_codebooks=mc.num_codebooks,
@@ -472,33 +469,12 @@ def train():
     palette = palette.to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, total_frames)
 
-    # ── Auto batch-size ──
-    if args.auto_batch_size and device.type == "cuda" and not args.resume_from:
-        print("\n[auto-batch] Probing GPU for maximum batch size …")
-        ceiling = num_unique_samples
-        if args.max_batch_size > 0:
-            ceiling = min(ceiling, args.max_batch_size)
-        args.batch_size = find_max_batch_size(
-            tokenizer,
-            num_palette_colors=num_palette_colors,
-            image_size=image_size,
-            seq_len=total_frames,
-            device=device,
-            floor=1,
-            ceiling=ceiling,
-            video_contains_first_frame=video_contains_first_frame,
-        )
-        # Rebuild DataLoader with the discovered batch size
-        if gpu_cache is None:
-            dataloader = make_dataloader(args.batch_size)
-        print(f"[auto-batch] ✓ Selected batch size: {args.batch_size}\n")
-    elif args.auto_batch_size:
-        print("[auto-batch] Skipped — no CUDA device. Using --batch-size", args.batch_size)
-    else:
-      # Cap batch size to unique samples (duplicates in a batch waste compute)
-      if args.batch_size > num_unique_samples:
-          print(f"Capped batch_size {args.batch_size} -> {num_unique_samples} (unique samples)")
-          args.batch_size = num_unique_samples
+    # Cap batch size to unique samples (duplicates in a batch waste compute)
+    if args.batch_size > num_unique_samples:
+        print(f"Capped batch_size {args.batch_size} -> {num_unique_samples} (unique samples)")
+        args.batch_size = num_unique_samples
+
+    dataloader = make_dataloader(args.batch_size) if gpu_cache is None else None
 
     # ── Float Precision ─────────────────────────────────────────────────────────
     if args.tf16:
@@ -514,8 +490,6 @@ def train():
     optimizer = AdamW(tokenizer.parameters(), lr=args.lr)
 
     # ── LR schedule ──────────────────────────────────────────────────
-    max_seconds = args.max_minutes * 60 if args.max_minutes > 0 else 0
-
     if args.constant_lr:
         scheduler = LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
         print(f"[lr] Constant LR = {args.lr}")
@@ -524,14 +498,8 @@ def train():
         min_lr = args.lr * 0.25
         warmup_steps = args.warmup_steps
 
-        # Estimate total training steps for the cosine T_max
-        total_steps_for_schedule = args.total_steps or args.max_steps
-        if total_steps_for_schedule > 0:
-            estimated_total = max(total_steps_for_schedule, warmup_steps + 100)
-        elif max_seconds > 0:
-            estimated_total = max(int(max_seconds * 5), warmup_steps + 100)
-        else:
-            estimated_total = 100_000
+        # total_steps is guaranteed positive by argument validation.
+        estimated_total = max(args.total_steps, warmup_steps + 100)
         decay_steps = max(estimated_total - warmup_steps, 1)
 
         warmup_scheduler = LinearLR(
@@ -548,7 +516,7 @@ def train():
 
     # Save config for reproducibility
     config = vars(args).copy()
-    config["image_size"] = image_size
+    config["image_size"] = IMAGE_SIZE
     config["sequence_length"] = seq_len
     config["context_frames"] = ctx_frames
     config["total_frames"] = total_frames
@@ -606,14 +574,15 @@ def train():
         print("[compile] Compilation complete.")
 
     # ── Perf tracking ────────────────────────────────────────────────
-    _perf_step_count = start_step
+    _perf_step_count = 0
     _perf_sample_count = 0
+    _total_sample_count = 0
     _perf_window_start = time.time()
     _perf_window_steps = 0
     _perf_window_samples = 0
     _PERF_WINDOW = 20  # rolling window size in steps
     # Bytes per sample for throughput: one-hot input (B, K, T, H, W) float32
-    _bytes_per_sample = num_palette_colors * total_frames * image_size * image_size * 4
+    _bytes_per_sample = num_palette_colors * total_frames * IMAGE_SIZE * IMAGE_SIZE * 4
 
     def _gpu_stats():
         """Return dict of GPU stats, or empty dict if unavailable."""
@@ -656,7 +625,7 @@ def train():
         best_smoothed_recon = ckpt.get('best_smoothed_recon', float('inf'))
         best_eval_recon = ckpt.get('best_eval_recon', float('inf'))
         metrics_log = ckpt.get('metrics_log', [])
-        _perf_sample_count = ckpt.get('total_samples', 0)
+        _total_sample_count = ckpt.get('total_samples', 0)
 
     def save_reconstruction(batch, path):
         """Encode → decode a batch and save side-by-side comparison image.
@@ -757,10 +726,11 @@ def train():
         if gpu_cache is not None:
             n = gpu_cache.shape[0]
             while True:
-                idx = torch.randint(n, (bs,), device=device)
-                yield gpu_cache[idx]
+                for i in range(0, n, bs):
+                    yield gpu_cache[i:min(i + bs, n)]
         else:
-            yield from dataloader
+            while True:
+                yield from dataloader
 
     pbar_total = args.max_steps if args.max_steps > 0 else None
     pbar = tqdm(batch_iter(), desc="Training", initial=start_step, total=pbar_total)
@@ -770,10 +740,6 @@ def train():
     for batch in pbar:
         if args.max_steps > 0 and global_step >= args.max_steps:
             print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
-            break
-        elapsed = time.time() - train_start
-        if max_seconds > 0 and elapsed >= max_seconds:
-            print(f"\n[max-time] Reached {elapsed/60:.1f} min. Stopping.")
             break
 
         if gpu_cache is None:
@@ -794,10 +760,8 @@ def train():
             )
             loss.backward()
         except torch.cuda.OutOfMemoryError:
-            # Clean up GPU memory
             optimizer.zero_grad(set_to_none=True)
-            for _v in ('inp', 'targets', 'batch'):
-                locals().pop(_v, None)
+            inp = targets = batch = loss = loss_breakdown = None
             gc.collect()
             torch.cuda.empty_cache()
             if global_step == start_step:
@@ -822,6 +786,7 @@ def train():
         # ── Perf tracking ────────────────────────────────────────────
         _perf_step_count += 1
         _perf_sample_count += batch.shape[0]
+        _total_sample_count += batch.shape[0]
         _perf_window_steps += 1
         _perf_window_samples += batch.shape[0]
         now_perf = time.time()
@@ -897,7 +862,7 @@ def train():
                 "samples_per_sec": round(_samples_per_sec, 1),
                 "data_throughput_mbps": round(_samples_per_sec * _bytes_per_sample / 2**20, 1),
                 "steps_per_sec": round(_steps_per_sec, 2),
-                "total_samples": _perf_sample_count,
+                "total_samples": _total_sample_count,
                 **gs,
             }
             metrics_log.append(step_metrics)
@@ -931,7 +896,7 @@ def train():
                 'best_smoothed_recon': best_smoothed_recon,
                 'best_eval_recon': best_eval_recon,
                 'metrics_log': metrics_log,
-                'total_samples': _perf_sample_count,
+                'total_samples': _total_sample_count,
             }
             torch.save(_training_state, os.path.join(args.output_dir, "training_state_latest.pt"))
 
@@ -984,8 +949,8 @@ def train():
         "samples_per_sec": round(_perf_sample_count / max(total_elapsed, 1e-9), 1),
         "data_throughput_mbps": round(_perf_sample_count / max(total_elapsed, 1e-9) * _bytes_per_sample / 2**20, 1),
         "steps_per_sec": round(_perf_step_count / max(total_elapsed, 1e-9), 2),
-        "total_samples": _perf_sample_count,
-        "total_steps": _perf_step_count,
+        "total_samples": _total_sample_count,
+        "total_steps": global_step,
         **gs,
     }
     if not metrics_log or metrics_log[-1]["step"] != global_step:
@@ -1014,7 +979,7 @@ def train():
         'best_smoothed_recon': best_smoothed_recon,
         'best_eval_recon': best_eval_recon,
         'metrics_log': metrics_log,
-        'total_samples': _perf_sample_count,
+        'total_samples': _total_sample_count,
     }
     state_path = os.path.join(args.output_dir, "training_state_latest.pt")
     torch.save(training_state, state_path)
@@ -1059,7 +1024,7 @@ def train():
                 'best_smoothed_recon': best_smoothed_recon,
                 'best_eval_recon': best_eval_recon,
                 'metrics_log': metrics_log,
-                'total_samples': _perf_sample_count,
+                'total_samples': _total_sample_count,
             }, os.path.join(args.output_dir, "training_state_best.pt"))
             del _best_sd
             print(f"[final] New best eval_recon_loss={best_eval_recon:.6f} → saved *_best.pt")
@@ -1072,9 +1037,6 @@ def train():
 
         # Save codebook histogram
         try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
             # Full histogram (all code indices)
             ax = axes[0]

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mario_world_model.config import CONTEXT_FRAMES, IMAGE_SIZE, SEQUENCE_LENGTH
+
 
 @dataclass(frozen=True)
 class ScaleConfig:
@@ -31,8 +33,8 @@ class ModelConfig:
     scale_name: str
     attention_name: str
     num_codebooks: int = 1
-    sequence_length: int = 16
-    context_frames: int = 12
+    sequence_length: int = SEQUENCE_LENGTH
+    context_frames: int = CONTEXT_FRAMES
     model_type: str = "magvit2"  # "magvit2" or "genie2"
 
 
@@ -45,8 +47,8 @@ def build_open_genie_layers(
 ) -> str:
     """Approximate the Open-Genie MAGVIT hierarchy with MAGVIT-2 layer primitives.
 
-    With IMAGE_SIZE=256 the four compress_space stages yield a 16×16 latent grid
-    (256 / 2⁴ = 16).
+    With IMAGE_SIZE=224 compress_space stages yield a 14×14 latent grid
+    (224 / 2⁴ = 14).
     """
     stage2_dim = init_dim * 2
     stage3_dim = init_dim * 4
@@ -123,8 +125,8 @@ CODEBOOK_VARIANTS = [
 
 # (suffix, temporal_compressions)
 TEMPORAL_VARIANTS = [("_1t", 1), ("_0t", 0)]
-DEFAULT_SEQ_LEN = 16
-HALF_SEQ_LEN = 8
+DEFAULT_SEQ_LEN = SEQUENCE_LENGTH
+HALF_SEQ_LEN = SEQUENCE_LENGTH // 2
 
 MODEL_CONFIGS: list[ModelConfig] = [
     # Vanilla (residual + compress_space + compress_time)
@@ -203,7 +205,6 @@ if __name__ == "__main__":
     magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
     profile = "--profile" in sys.argv
 
-    IMAGE_SIZE = 224
     NUM_PALETTE_COLORS = 23
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))

@@ -33,13 +33,12 @@ def parse_args() -> argparse.Namespace:
 def _remote_result_roots(subdir: str | None) -> list[tuple[str, str]]:
     """Return candidate remote roots and matching local destinations."""
     candidates = []
-    for root in ("checkpoints", "results"):
-        remote_suffix = f"{root}/"
-        local_base = str(PROJECT_ROOT / "results")
-        if subdir:
-            remote_suffix += subdir + "/"
-            local_base = os.path.join(local_base, subdir)
-        candidates.append((remote_suffix, local_base))
+    remote_suffix = "checkpoints/"
+    local_base = str(PROJECT_ROOT / "results")
+    if subdir:
+        remote_suffix += subdir + "/"
+        local_base = os.path.join(local_base, subdir)
+    candidates.append((remote_suffix, local_base))
     return candidates
 
 
@@ -57,10 +56,6 @@ def _resolve_remote_source(worker, subdir: str | None) -> tuple[str, str]:
 
 def main():
     args = parse_args()
-
-    if not args.subdir and not args.workers:
-        show_workers()
-        sys.exit(0)
 
     workers = load_workers(None if args.workers and "all" in args.workers else args.workers)
 

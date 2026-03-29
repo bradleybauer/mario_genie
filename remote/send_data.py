@@ -28,7 +28,7 @@ def send_data(worker):
     ssh(worker, f"mkdir -p {worker.project_dir}/data", capture=True)
     rsync_to(
         worker,
-        str(PROJECT_ROOT / "data") + "/",
+        str(PROJECT_ROOT / "data") + "/normalized",
         f"{worker.project_dir}/data/",
         extra_args=["--progress"],
     )

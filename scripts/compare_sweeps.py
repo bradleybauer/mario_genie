@@ -256,7 +256,9 @@ def estimate_train_sample_count(run: dict) -> int | None:
     if data_dir is None:
         return None
 
-    sequence_length = int(cfg.get("sequence_length", 16) or 16)
+    from mario_world_model.config import SEQUENCE_LENGTH
+
+    sequence_length = int(cfg.get("sequence_length", SEQUENCE_LENGTH) or SEQUENCE_LENGTH)
     total_sequences = count_dataset_sequences(str(data_dir), sequence_length)
     if total_sequences is None:
         return None
@@ -770,7 +772,7 @@ def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/magvit2"],
+    parser.add_argument("--results-dir", type=str, nargs="+", default=["results/"],
                         help="One or more directories containing run folders anywhere under them")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Save comparison plot to file (e.g. sweep_comparison.png)")

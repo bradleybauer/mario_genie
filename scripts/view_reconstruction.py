@@ -23,6 +23,21 @@ from matplotlib.widgets import Slider, Button
 from matplotlib.animation import FuncAnimation
 
 
+DEFAULT_PREDICTED_FRAMES = 16
+
+
+def visible_frames(frames, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
+    """Return the frame sequence shown in the viewer.
+
+    By default keeps only the last *predicted_frames* frames, which are the
+    model's predictions (skipping however many context frames the training
+    code happened to include in the PNG).
+    """
+    if include_context or len(frames) <= predicted_frames:
+        return frames
+    return frames[-predicted_frames:]
+
+
 def load_frames(path):
     """Split a vertically-stacked grid PNG into individual frames."""
     img = Image.open(path)
@@ -67,10 +82,13 @@ def find_subfolders_with_pngs(root):
     return subs
 
 
-def show_viewer(folder_path, fps, scale):
+def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
     """Show the reconstruction viewer for a single folder (no sidebar)."""
     image_paths = collect_images(folder_path)
-    loaded = [(p, load_frames(p)) for p in image_paths]
+    loaded = [
+        (p, visible_frames(load_frames(p), include_context=include_context, predicted_frames=predicted_frames))
+        for p in image_paths
+    ]
     loaded = [(p, f) for p, f in loaded if f]
     if not loaded:
         print(f"No valid reconstruction frames in {folder_path}")
@@ -78,7 +96,7 @@ def show_viewer(folder_path, fps, scale):
     image_paths, all_frames = zip(*loaded)
     image_paths, all_frames = list(image_paths), list(all_frames)
 
-    state = {"img_idx": 0, "playing": True}
+    state = {"img_idx": 0, "playing": False}
 
     frames = all_frames[0]
     n = len(frames)
@@ -109,7 +127,7 @@ def show_viewer(folder_path, fps, scale):
     ax_next = plt.axes([0.87, 0.05, 0.08, 0.05])
     btn_next = Button(ax_next, "Next \u25b6")
     ax_pause = plt.axes([0.75, 0.05, 0.1, 0.05])
-    btn_pause = Button(ax_pause, "Pause")
+    btn_pause = Button(ax_pause, "Play")
     ax_save = plt.axes([0.14, 0.05, 0.1, 0.05])
     btn_save = Button(ax_save, "Save GIF")
 
@@ -146,10 +164,10 @@ def show_viewer(folder_path, fps, scale):
 
     def on_pause(event):
         if state["playing"]:
-            anim.pause()
+            anim.event_source.stop()
             btn_pause.label.set_text("Play")
         else:
-            anim.resume()
+            anim.event_source.start()
             btn_pause.label.set_text("Pause")
         state["playing"] = not state["playing"]
 
@@ -188,22 +206,34 @@ def show_viewer(folder_path, fps, scale):
     interval = 1000 / fps
     anim = FuncAnimation(fig, animate, interval=interval, blit=False, cache_frame_data=False)
 
+    def _stop_after_init(_event):
+        anim.event_source.stop()
+        fig.canvas.mpl_disconnect(state["_stop_cid"])
+
+    state["_stop_cid"] = fig.canvas.mpl_connect("draw_event", _stop_after_init)
+
     fig.canvas.manager.set_window_title(folder_label)
     plt.show()
 
 
 class _LazyRun:
     """Stores paths eagerly, loads/validates frames per-image on demand."""
-    __slots__ = ("paths", "_frames", "_valid")
+    __slots__ = ("paths", "include_context", "predicted_frames", "_frames")
 
-    def __init__(self, paths):
+    def __init__(self, paths, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
         self.paths = paths
+        self.include_context = include_context
+        self.predicted_frames = predicted_frames
         self._frames = [None] * len(paths)
-        self._valid = None  # indices of paths that produce valid frames
 
     def _ensure_loaded(self, idx):
         if self._frames[idx] is None:
-            self._frames[idx] = load_frames(self.paths[idx]) or []
+            frames = load_frames(self.paths[idx]) or []
+            self._frames[idx] = visible_frames(
+                frames,
+                include_context=self.include_context,
+                predicted_frames=self.predicted_frames,
+            )
 
     def frames(self, idx):
         self._ensure_loaded(idx)
@@ -218,7 +248,7 @@ class _LazyRun:
         return None
 
 
-def _discover_run(root, name):
+def _discover_run(root, name, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
     """Return a _LazyRun for a subfolder, or None if no valid PNGs."""
     folder = os.path.join(root, name)
     try:
@@ -227,10 +257,10 @@ def _discover_run(root, name):
         return None
     if not image_paths:
         return None
-    return _LazyRun(image_paths)
+    return _LazyRun(image_paths, include_context=include_context, predicted_frames=predicted_frames)
 
 
-def show_combined(root, subfolders, fps, scale):
+def show_combined(root, subfolders, fps, scale, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
     """Single-window UI with run selector on the left and viewer on the right."""
     # Discover which subfolders have PNGs (cheap: just glob, no image loading)
     available = []
@@ -248,13 +278,18 @@ def show_combined(root, subfolders, fps, scale):
 
     def _get_run(name):
         if name not in run_cache:
-            run_cache[name] = _discover_run(root, name)
+            run_cache[name] = _discover_run(
+                root,
+                name,
+                include_context=include_context,
+                predicted_frames=predicted_frames,
+            )
         return run_cache[name]
 
     state = {
         "run_idx": 0,
         "img_idx": 0,
-        "playing": True,
+        "playing": False,
         "anim": None,
     }
 
@@ -288,7 +323,7 @@ def show_combined(root, subfolders, fps, scale):
     ax_img = fig.add_axes([sidebar_frac + 0.02, 0.18, 1.0 - sidebar_frac - 0.04, 0.78])
     ax_img.set_axis_off()
 
-    im = ax_img.imshow(first_frames[0], interpolation="nearest")
+    im = ax_img.imshow(first_frame, interpolation="nearest")
     title = ax_img.set_title("", fontsize=10)
 
     # Controls along the bottom-right
@@ -303,7 +338,7 @@ def show_combined(root, subfolders, fps, scale):
     ax_next = fig.add_axes([ctrl_left + ctrl_w - 0.07, 0.05, 0.07, 0.05])
     btn_next = Button(ax_next, "Next \u25b6")
     ax_pause = fig.add_axes([ctrl_left + ctrl_w - 0.18, 0.05, 0.09, 0.05])
-    btn_pause = Button(ax_pause, "Pause")
+    btn_pause = Button(ax_pause, "Play")
     ax_save = fig.add_axes([ctrl_left, 0.00, 0.09, 0.05])
     btn_save = Button(ax_save, "Save GIF")
 
@@ -395,10 +430,10 @@ def show_combined(root, subfolders, fps, scale):
 
     def on_pause(_event):
         if state["playing"]:
-            state["anim"].pause()
+            state["anim"].event_source.stop()
             btn_pause.label.set_text("Play")
         else:
-            state["anim"].resume()
+            state["anim"].event_source.start()
             btn_pause.label.set_text("Pause")
         state["playing"] = not state["playing"]
 
@@ -451,6 +486,12 @@ def show_combined(root, subfolders, fps, scale):
     anim = FuncAnimation(fig, animate, interval=interval, blit=False, cache_frame_data=False)
     state["anim"] = anim
 
+    def _stop_after_init(_event):
+        anim.event_source.stop()
+        fig.canvas.mpl_disconnect(state["_stop_cid"])
+
+    state["_stop_cid"] = fig.canvas.mpl_connect("draw_event", _stop_after_init)
+
     plt.show()
 
 
@@ -459,6 +500,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("path", help="Path to a reconstruction PNG or a directory of PNGs")
     parser.add_argument("--fps", type=int, default=4, help="Playback frames per second (default: 4)")
     parser.add_argument("--scale", type=float, default=4.0, help="Display scale factor (default: 4)")
+    parser.add_argument(
+        "--include-context",
+        action="store_true",
+        help="Show all frames including context (by default only predicted frames are shown)",
+    )
+    parser.add_argument(
+        "--predicted-frames",
+        type=int,
+        default=DEFAULT_PREDICTED_FRAMES,
+        help=f"Number of trailing predicted frames to show (default: {DEFAULT_PREDICTED_FRAMES})",
+    )
     return parser.parse_args()
 
 
@@ -467,7 +519,13 @@ def main():
 
     # If it's a file or a directory that directly has PNGs, go straight to viewer
     if os.path.isfile(args.path) or glob.glob(os.path.join(args.path, "*.png")):
-        show_viewer(args.path, args.fps, args.scale)
+        show_viewer(
+            args.path,
+            args.fps,
+            args.scale,
+            include_context=args.include_context,
+            predicted_frames=args.predicted_frames,
+        )
         return
 
     # Otherwise look for subfolders containing PNGs
@@ -476,7 +534,14 @@ def main():
         print(f"No PNGs found in {args.path} or its immediate subfolders.")
         return
 
-    show_combined(args.path, subfolders, args.fps, args.scale)
+    show_combined(
+        args.path,
+        subfolders,
+        args.fps,
+        args.scale,
+        include_context=args.include_context,
+        predicted_frames=args.predicted_frames,
+    )
 
 
 if __name__ == "__main__":
