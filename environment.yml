@@ -85,8 +85,6 @@ dependencies:
   - mkl_random=1.3.0=py310h505adc9_0
   - mpg123=1.32.9=hc50e24c_0
   - ncurses=6.5=h7934f7d_0
-  - numpy=1.26.4=py310h64c44e4_1
-  - numpy-base=1.26.4=py310he1678cf_1
   - openssl=3.5.5=h1b28b03_0
   - opusfile=0.12=h3358134_2
   - pcre2=10.46=hf426167_0
@@ -112,7 +110,6 @@ dependencies:
   - tbb=2022.3.0=h698db13_0
   - tbb-devel=2022.3.0=h698db13_0
   - tk=8.6.15=h54e0aa7_0
-  - tzdata=2025c=he532380_0
   - wayland=1.24.0=hdac8c69_0
   - wheel=0.46.3=py310h06a4308_0
   - xkeyboard-config=2.44=h382ed1a_1
@@ -134,14 +131,21 @@ dependencies:
       - accelerate==1.12.0
       - annotated-doc==0.0.4
       - anyio==4.12.1
+      - argcomplete==3.5.1
       - beartype==0.22.9
+      - borb==2.1.25
       - certifi==2026.2.25
+      - cffi==2.0.0
+      - charset-normalizer==3.4.6
       - click==8.3.1
       - cloudpickle==3.1.2
       - contourpy==1.3.2
+      - cryptography==44.0.3
       - cuda-bindings==12.9.4
       - cuda-pathfinder==1.4.0
+      - curlify==2.2.1
       - cycler==0.12.1
+      - dunamai==1.26.0
       - einops==0.8.2
       - einx==0.3.0
       - ema-pytorch==0.7.9
@@ -152,6 +156,8 @@ dependencies:
       - frozendict==2.4.7
       - fsspec==2026.2.0
       - gateloop-transformer==0.2.5
+      - gitdb==4.0.12
+      - gitpython==3.1.46
       - grpcio==1.78.0
       - h11==0.16.0
       - hf-xet==1.3.2
@@ -166,6 +172,7 @@ dependencies:
       - kornia-rs==0.1.10
       - loguru==0.7.3
       - lpips==0.1.4
+      - lxml==6.0.2
       - magvit2-pytorch==0.5.1
       - markdown==3.10.2
       - markdown-it-py==4.0.0
@@ -175,6 +182,7 @@ dependencies:
       - mpmath==1.3.0
       - nes-py==8.2.1
       - networkx==3.4.2
+      - numpy==2.2.6
       - nvidia-cublas-cu12==12.8.4.1
       - nvidia-cuda-cupti-cu12==12.8.90
       - nvidia-cuda-nvrtc-cu12==12.8.93
@@ -193,17 +201,26 @@ dependencies:
       - opencv-python==4.13.0.92
       - optree==0.19.0
       - packaging==26.0
+      - pandas==2.3.3
       - pillow==12.1.1
+      - poetry-dynamic-versioning==1.10.0
       - protobuf==7.34.0
       - psutil==7.2.2
-      - pyglet==1.5.21
       - pyboy==2.7.0
+      - pycparser==3.0
+      - pyglet==1.5.21
       - pygments==2.19.2
       - pyparsing==3.3.2
-      - python-dateutil==2.9.0.post0
+      - pysdl2==0.9.17
+      - pysdl2-dll==2.32.0
+      - python-barcode==0.16.1
+      - python-dateutil==2.7.0
       - pytorch-custom-utils==0.0.21
       - pytorch-warmup==0.2.0
+      - pytz==2026.1.post1
       - pyyaml==6.0.3
+      - qrcode==8.2
+      - requests==2.33.0
       - rich==14.3.3
       - rotary-embedding-torch==0.8.9
       - safetensors==0.7.0
@@ -211,10 +228,15 @@ dependencies:
       - shellingham==1.5.4
       - shimmy==2.0.0
       - six==1.17.0
+      - smmap==5.0.3
+      - stable-retro==0.9.9
       - sympy==1.14.0
       - taylor-series-linear-attention==0.1.12
       - tensorboard==2.20.0
       - tensorboard-data-server==0.7.2
+      - toml==0.10.2
+      - tomli==2.4.1
+      - tomlkit==0.14.0
       - torch==2.10.0
       - torchinfo==1.8.0
       - torchvision==0.25.0
@@ -222,8 +244,13 @@ dependencies:
       - triton==3.6.0
       - typer==0.24.1
       - typing-extensions==4.15.0
+      - tzdata==2025.3
+      - urllib3==2.6.3
+      - vastai==0.5.0
       - vector-quantize-pytorch==1.27.21
+      - vulture==2.16
       - wadler-lindig==0.1.7
       - werkzeug==3.1.6
       - x-transformers==2.16.1
+      - xdg==6.0.0
 prefix: /home/bradley/miniconda3/envs/mario

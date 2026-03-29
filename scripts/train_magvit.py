@@ -28,7 +28,10 @@ from torchvision.utils import save_image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, LambdaLR
 
-from tqdm import tqdm
+from rich.progress import (
+    Progress, BarColumn, MofNCompleteColumn, SpinnerColumn,
+    TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+)
 
 from mario_world_model.config import IMAGE_SIZE
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
@@ -216,12 +219,15 @@ class MarioVideoDataset(Dataset):
                 pool.submit(_index_file, idx, f, seq_len): idx
                 for idx, f in enumerate(self.data_files)
             }
-            with tqdm(total=n_files, desc="Indexing files", unit="file") as pbar:
+            with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                          BarColumn(), MofNCompleteColumn(),
+                          TimeElapsedColumn(), TimeRemainingColumn()) as progress:
+                task = progress.add_task("Indexing files", total=n_files)
                 for future in concurrent.futures.as_completed(futures):
                     file_idx, total_t, samples = future.result()
                     frame_counts[file_idx] = total_t
                     self.samples.extend(samples)
-                    pbar.update(1)
+                    progress.advance(task)
 
         # Remove files with no usable frames and remap indices
         valid = [i for i in range(n_files) if frame_counts[i] > 0]
@@ -264,11 +270,14 @@ class MarioVideoDataset(Dataset):
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
                     futures = [pool.submit(_load_file, i) for i in range(n_files)]
-                    with tqdm(total=n_files, desc="Loading into RAM", unit="file") as pbar:
+                    with Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                                  BarColumn(), MofNCompleteColumn(),
+                                  TimeElapsedColumn(), TimeRemainingColumn()) as progress:
+                        task = progress.add_task("Loading into RAM", total=n_files)
                         for future in concurrent.futures.as_completed(futures):
                             idx, frames = future.result()
                             self.frames_by_file[idx] = frames
-                            pbar.update(1)
+                            progress.advance(task)
                 actual = sum(f.nbytes for f in self.frames_by_file)
                 print(f"Loaded {actual / 2**30:.0f} GB into RAM (COW-shared with workers)")
             else:
@@ -670,8 +679,16 @@ def train():
         total_pixels = 0
         correct_pixels = 0
         last_eval_batch = None
+        eval_progress = Progress(
+            SpinnerColumn(), TextColumn("{task.description}"),
+            BarColumn(), MofNCompleteColumn(),
+            TimeElapsedColumn(), TimeRemainingColumn(),
+            transient=True,
+        )
+        eval_progress.start()
+        eval_task = eval_progress.add_task(f"Eval@{step_label}", total=len(eval_loader))
         with torch.no_grad():
-            for eval_batch in tqdm(eval_loader, desc=f"Eval@{step_label}", leave=False):
+            for eval_batch in eval_loader:
                 eval_batch = eval_batch.to(device, non_blocking=True)
                 last_eval_batch = eval_batch
                 targets = eval_batch.long()
@@ -695,6 +712,8 @@ def train():
                 total_pixels += eval_tgt.numel()
                 correct_pixels += (recon_idx == eval_tgt).sum().item()
                 del recon_video, recon_idx, targets
+                eval_progress.advance(eval_task)
+        eval_progress.stop()
 
         eval_recon_loss = sum(eval_losses) / len(eval_losses)
         pixel_accuracy = correct_pixels / max(total_pixels, 1)
@@ -733,11 +752,21 @@ def train():
                 yield from dataloader
 
     pbar_total = args.max_steps if args.max_steps > 0 else None
-    pbar = tqdm(batch_iter(), desc="Training", initial=start_step, total=pbar_total)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("{task.fields[status]}"),
+    )
+    progress.start()
+    train_task = progress.add_task("Training", total=pbar_total, completed=start_step, status="")
 
     global_step = start_step
     consecutive_ooms = 0
-    for batch in pbar:
+    for batch in batch_iter():
         if args.max_steps > 0 and global_step >= args.max_steps:
             print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
             break
@@ -772,6 +801,7 @@ def train():
             if consecutive_ooms >= 20:
                 print(f"\n[OOM] {consecutive_ooms} consecutive OOMs — model cannot fit. Aborting.")
                 sys.exit(1)
+            progress.advance(train_task)
             global_step += 1
             continue
         consecutive_ooms = 0
@@ -830,7 +860,8 @@ def train():
             postfix['mem'] = f"{gs['gpu_mem_pct']:.0f}%"
         if 'gpu_temp_c' in gs:
             postfix['temp'] = f"{gs['gpu_temp_c']}C"
-        pbar.set_postfix(postfix)
+        progress.update(train_task, advance=1,
+                       status=" ".join(f"{k}={v}" for k, v in postfix.items()))
 
         if args.threshold is not None and smoothed_recon < args.threshold:
             print(f"\n[threshold] smoothed_recon={smoothed_recon:.6f} < "
@@ -924,6 +955,8 @@ def train():
 
         global_step += 1
 
+    progress.stop()
+
     # Always record the final state so sweep readers see the terminal smoothed_recon
     total_elapsed = time.time() - train_start
 
@@ -995,7 +1028,7 @@ def train():
         dataset._mmap_cache.clear()
     if eval_dataset is not None and hasattr(eval_dataset, '_mmap_cache'):
         eval_dataset._mmap_cache.clear()
-    del dataset, batch, pbar
+    del dataset, batch
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
