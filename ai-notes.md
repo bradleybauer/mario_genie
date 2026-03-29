@@ -71,6 +71,24 @@ I investigated whether `scripts/play_autoencoder.py` could be sped up by carryin
 - Use full-window autoencoder reconstruction for live input visualization.
 - Revisit decoder-state caching later in the **autoregressive world-model inference** path, where the model operates on already-discrete latent tokens and exact streaming is much more straightforward.
 
+## Context Frames & Temporal Padding in PaletteVideoTokenizer
+
+The `PaletteVideoTokenizer` disables temporal padding on `conv_in` and replaces it with real context frames from the data.
+
+- `conv_in` is a 7×7×7 `CausalConv3d` (stride=1, dilation=1) → original `time_pad = 6`.
+- In `__init__`, temporal padding is zeroed out: `self.conv_in.time_pad = 0`. The original value is saved as `self.conv_in_time_pad = 6`.
+- `conv_out` is a 3×3×3 `CausalConv3d` → `time_pad = 2`, uses `replicate` padding (not zeros). This padding is **not** disabled.
+
+With 8 context frames and 16 target frames (24 total input):
+
+1. **conv_in** has no temporal padding, so it consumes 6 frames from the input (producing 18 output frames from 24 input).
+2. The encoder/quantizer/decoder process these 18 frames.
+3. **conv_out** adds 2 replicate-padded frames on the temporal left, then its kernel-3 conv produces 18 output frames.
+
+At loss time: `skip_logits = context_frames - conv_in_time_pad = 8 - 6 = 2`. The first 2 output frames (which saw replicate padding from `conv_out`) are discarded. The remaining 16 output frames align exactly with the 16 target frames. The first loss frame (output index 2) sees zero padding — all 3 of its temporal receptive field positions are real decoder features.
+
+The accounting: 6 context frames consumed by unpadded `conv_in` + 2 context frames discarded as `conv_out` replicate-padding region = all 8 context frames excluded from loss.
+
 ## Theoretical Minimum Reconstruction Loss
 
 The palette tokenizer uses **cross-entropy** (`F.cross_entropy` with default mean reduction) over all pixels. For a single wrong pixel with optimal logits (probability ~0.5 on the correct class), the minimum recon loss is:
