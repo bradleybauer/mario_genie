@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default="sweep",
                         help="Remote multiplexer session to attach or create (default: sweep)")
     parser.add_argument("--multiplexer", choices=("auto", "tmux", "zellij", "none"),
-                        default="auto",
+                        default="zellij",
                         help="Remote multiplexer to use after connecting (default: auto)")
     parser.add_argument("--no-tmux", action="store_true",
                         help="Open a plain interactive SSH session without attaching to tmux or zellij")
