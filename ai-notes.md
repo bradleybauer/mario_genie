@@ -78,3 +78,83 @@ The palette tokenizer uses **cross-entropy** (`F.cross_entropy` with default mea
 $$\text{recon\_loss} = \frac{\ln 2}{B \times T \times H \times W}$$
 
 Example: batch=6, seq_len=16, image_size=224 → $N = 4{,}816{,}896$ pixels → minimum loss ≈ $1.44 \times 10^{-7}$.
+
+
+## LTX-Video 2.3 Style DiT as Genie Replacement
+
+### Motivation
+Explored whether a 100× downscaled LTX-Video 2.3 architecture (DiT-based latent video diffusion) could replace the current three-module Genie-2 pipeline for joint audio-video world-model generation, targeting 20–100M total parameters.
+
+### Current Genie-2 Architecture (for reference)
+The existing pipeline in `scripts/train_genie2.py` has three separate modules:
+1. **FrameVAE** (~1.6M params) — 2D conv encoder/decoder, compresses 224×224 palette-indexed frames to continuous 4×14×14 latents. Four 2× downsamples (224→112→56→28→14), VAE with KL penalty.
+2. **DynamicsTransformer** — Causal transformer (6 layers, dim=256, 4 heads, MLP ratio 4). Patchifies each frame's latent grid (4×14×14 → 196 spatial tokens), interleaves with action embeddings, processes with causal masking. Outputs a context vector by pooling the last frame's spatial tokens.
+3. **LatentDenoiser** — Small U-Net on 14×14 latents (down 14→7, up 7→14, base channels=64). Conditioned on DynamicsTransformer context + sinusoidal timestep embedding via additive broadcast. Predicts noise ε for DDPM (200 steps, cosine beta schedule).
+
+Training is two-phase: (1) train autoencoder on reconstruction, (2) freeze AE, train dynamics+denoiser on next-frame latent prediction.
+
+### Why LTX/DiT Is a Better Fit
+- **Unified model**: DiT replaces both DynamicsTransformer and LatentDenoiser with a single transformer that does denoising via self-attention over spatiotemporal latent patches. Architecturally simpler.
+- **Flow matching over DDPM**: LTX uses rectified flow matching (linear interpolation $x_t = (1-t)x_0 + t\epsilon$, velocity prediction). Trains faster, samples in 5–20 steps instead of 200 DDPM steps.
+- **RoPE** for spatiotemporal position encoding instead of learned embeddings (better generalization).
+- **Action conditioning via AdaLN** (adaptive layer norm) replaces LTX's text-conditioning cross-attention path — much cheaper and appropriate for our discrete action space.
+
+### Scaling to 20–100M Parameters
+LTX-Video full is ~2B. Scaling knobs for 100× reduction:
+
+| Knob             | LTX Full | Target (20–100M) |
+|------------------|----------|-------------------|
+| Hidden dim       | 2048+    | 256–512           |
+| Layers           | 28+      | 6–12              |
+| Heads            | 16+      | 4–8               |
+| Latent spatial   | variable | 14×14 or 16×16    |
+| Latent temporal  | variable | 4–16 frames       |
+
+Example config: dim=384, 8 layers, 6 heads on 4×14×14 latents (196 spatial patches × ~8 frames) ≈ **30–40M params** unified model.
+
+### Causal Temporal Masking
+For autoregressive rollout, mask attention so frame $t$ only attends to frames $\leq t$. LTX already does this for video continuation, so the architecture natively supports it.
+
+### Attention Feasibility
+With 196 spatial tokens × 16 frames = 3,136 tokens, full causal attention is feasible at this model size. Windowed attention optional but not strictly necessary.
+
+### Key Modifications to LTX for This Project
+1. **Keep existing tokenizer** — reuse the MAGVIT-2 (discrete, 16×16) or FrameVAE (continuous, 14×14) to produce latent patches. No need to train a new 3D VAE.
+2. **Action conditioning via AdaLN** — replace text cross-attention with adaptive layer norm conditioned on action embeddings.
+3. **Flow matching replaces DDPM** — linear interpolant, velocity prediction, 5–20 sampling steps.
+4. **Causal temporal masking** built into the attention for autoregressive rollout.
+
+---
+
+## Joint Audio-Video Generation
+
+### Audio Data Source
+We have **AVI files with perfectly synced video+audio**, bypassing the earlier limitation of only having APU register values in RAM dumps. The SMB1 RAM map (`src/mario_world_model/smb1_memory_map.py`) does contain audio registers (`area_music` 0x00FB, `event_music` 0x00FC, `sfx_reg1-3` 0x00FD-0x00FF) but these are high-level triggers, not waveform data. Perfect audio reconstruction from registers alone was not feasible — the AVI files solve this.
+
+### Audio Tokenization Strategy
+NES audio is low-complexity (4 synthesis channels: 2 pulse, 1 triangle, 1 noise + optional DPCM). At 60fps, one frame ≈ 16.7ms of audio. At 16kHz sample rate (sufficient for NES frequency range), that's ~267 samples per frame.
+
+**Approach**: Train a small 1D convolutional audio VAE on per-frame audio chunks:
+- Extract audio: `ffmpeg -i input.avi -ar 16000 -ac 1 output.wav`
+- Align frame indices to audio windows (each frame = 1/60s = ~267 samples at 16kHz)
+- A 1D conv encoder compressing by 8–16× yields **~16–32 audio latent tokens per frame** (small compared to 196 video tokens)
+- The audio VAE should be very small (sub-1M params) given NES audio simplicity
+
+### Joint Sequence Layout in the DiT
+Concatenate audio latent patches with video latent patches in the transformer sequence:
+```
+[action_t, video_patches_t (196 tokens), audio_patches_t (~16-32 tokens), action_{t+1}, ...]
+```
+
+The DiT jointly denoises both modalities using a shared diffusion timestep, with modality-specific input/output projection layers. This is how recent joint audio-video diffusion models work.
+
+### Parameter Budget
+- Audio VAE: sub-1M params
+- Video tokenizer (existing): ~1.6M params (FrameVAE) or existing MAGVIT
+- Unified DiT: 30–50M params (handles both dynamics prediction and denoising)
+- **Total: well within 20–100M target**
+
+### What Wouldn't Work Well
+- Full bidirectional spatiotemporal attention over very long sequences at 20M params (but causal/windowed attention is fine).
+- Trying to generate high-fidelity audio waveforms purely from APU register prediction (bypassed by having actual audio in AVIs).
+- Training a full 3D video VAE from scratch at this scale (unnecessary — reuse existing tokenizers).
