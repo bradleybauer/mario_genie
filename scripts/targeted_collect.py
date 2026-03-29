@@ -57,6 +57,7 @@ RAM_WORLD = 0x075F       # world number (0-indexed)
 RAM_STAGE = 0x075C       # stage number (0-indexed)
 RAM_X_PAGE = 0x006D      # player horizontal page in level
 RAM_X_SCREEN = 0x0086    # player X position on screen (0-255)
+RAM_GAME_MODE = 0x0770   # game mode (0=Demo, 1=Playing, 2=World End)
 
 # Optional extra dimensions you might want to balance over in the future.
 # Each entry is (ram_index, label, optional_bin_width_or_None).
@@ -126,8 +127,32 @@ def compute_coverage(bin_width: int) -> Counter:
     counts: Counter = Counter()
     recordings = load_recordings(data_dir=RAW_DATA_DIR, verbose=False)
     total_frames = 0
+    skip_after_transition = 10  # frames to skip after a world/stage change
     for rec in recordings:
+        saw_non_playing = False
+        prev_world = prev_stage = None
+        skip_remaining = 0
         for i in range(len(rec.frames)):
+            if int(rec.ram[i][RAM_GAME_MODE]) != 1:
+                saw_non_playing = True
+                prev_world = prev_stage = None
+                skip_remaining = 0
+                continue
+            world = int(rec.ram[i][RAM_WORLD])
+            stage = int(rec.ram[i][RAM_STAGE])
+            if prev_world is None:
+                # First playing frame of a segment
+                prev_world, prev_stage = world, stage
+                if saw_non_playing:
+                    # Returning from non-playing (death/world-end) — x is stale
+                    skip_remaining = skip_after_transition
+            elif (prev_world, prev_stage) != (world, stage):
+                # Mid-gameplay level transition — x is stale
+                prev_world, prev_stage = world, stage
+                skip_remaining = skip_after_transition
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
             key = extract_bin_key(rec.ram[i], bin_width)
             counts[key] += 1
             total_frames += 1
@@ -142,36 +167,75 @@ def compute_coverage(bin_width: int) -> Counter:
 # Step 2: gather all available save states and tag them
 # ---------------------------------------------------------------------------
 
-def gather_save_states(bin_width: int) -> list[SaveStateInfo]:
+def gather_save_states(bin_width: int,
+                       min_survival: int = 120) -> list[SaveStateInfo]:
     """Find every .mss file in the raw data directory and read its
-    associated RAM snapshot to determine (world, stage, x_bin)."""
+    associated RAM snapshot to determine (world, stage, x_bin).
+
+    *min_survival*: minimum number of game_mode==1 frames that must follow
+    the save state in the original recording.  States where the player
+    dies (or the level ends) sooner than this are skipped — they are
+    bad starting positions.
+    """
     import re
     from mario_world_model.npy_db import load_recordings
 
     recordings = load_recordings(data_dir=RAW_DATA_DIR, verbose=False)
     states: list[SaveStateInfo] = []
 
+    def _tag_state(rec, start_idx: int, bw: int) -> tuple | None:
+        """Determine the best bin key for a save state by looking at the
+        frames following it.  Returns the most-common bin key among the
+        first *min_survival* playing frames, or None if the player dies
+        or leaves game_mode==1 too quickly."""
+        end = min(start_idx + min_survival, len(rec.frames))
+        if (end - start_idx) < min_survival:
+            return None
+        start_x = compute_x_position(rec.ram[start_idx])
+        key_counts: dict[tuple, int] = {}
+        for j in range(start_idx, end):
+            if int(rec.ram[j][RAM_GAME_MODE]) != 1:
+                return None
+            x = compute_x_position(rec.ram[j])
+            if start_x > 1024 and x < 128:
+                return None
+            key = extract_bin_key(rec.ram[j], bw)
+            key_counts[key] = key_counts.get(key, 0) + 1
+        # Return the bin the player occupied most
+        return max(key_counts, key=key_counts.get)
+
     for rec in recordings:
+        if len(rec.frames) == 0:
+            continue
+
         # Initial save state
         if rec.mss_path and rec.mss_path.exists():
-            # Use the first frame's RAM to tag this state
-            key = extract_bin_key(rec.ram[0], bin_width)
-            states.append(SaveStateInfo(
-                path=rec.mss_path,
-                recording_name=rec.name,
-                frame_number=int(rec.frames[0]),
-                world=key[0],
-                stage=key[1],
-                x_bin=key[2],
-            ))
+            key = _tag_state(rec, 0, bin_width)
+            if key is not None and key[2] <= 4000:
+                states.append(SaveStateInfo(
+                    path=rec.mss_path,
+                    recording_name=rec.name,
+                    frame_number=int(rec.frames[0]),
+                    world=key[0],
+                    stage=key[1],
+                    x_bin=key[2],
+                ))
 
         # Periodic save states
         for frame_num, state_path in rec.save_states:
-            # Find the closest frame index in the recording
-            idx = np.searchsorted(rec.frames, frame_num)
-            if idx >= len(rec.frames):
-                idx = len(rec.frames) - 1
-            key = extract_bin_key(rec.ram[idx], bin_width)
+            # Look a few frames ahead to avoid tagging with transient
+            # mid-transition RAM (world/stage updated but x not yet reset).
+            idx = min(np.searchsorted(rec.frames, frame_num) + 5,
+                      len(rec.frames) - 1)
+            # Skip non-playing frames (demo, world end, transitions)
+            if int(rec.ram[idx][RAM_GAME_MODE]) != 1:
+                continue
+            key = _tag_state(rec, idx, bin_width)
+            if key is None:
+                continue
+            # Skip states with bogus x positions (transition artifacts)
+            if key[2] > 4000:
+                continue
             states.append(SaveStateInfo(
                 path=state_path,
                 recording_name=rec.name,
@@ -192,39 +256,48 @@ def pick_best_state(
     coverage: Counter,
     states: list[SaveStateInfo],
 ) -> SaveStateInfo:
-    """Score each save state by inverse frequency of its bin.
+    """Pick a save state by sampling a bin proportional to inverse frequency,
+    then picking a random state within that bin.
 
-    States in bins with zero coverage get the highest priority.
-    Among equally-weighted states, pick one at random to add variety.
+    This ensures each under-represented *bin* gets proportional attention
+    regardless of how many save states happen to land in it.
     """
+    from collections import defaultdict
+
     labels = dim_labels()
 
     def state_key(s: SaveStateInfo) -> tuple:
         key = [s.world, s.stage, s.x_bin]
-        # If EXTRA_BALANCE_DIMS were used they would already be in the
-        # SaveStateInfo fields — for now just the core 3.
         return tuple(key)
 
-    # Compute inverse-frequency weight for each state
-    weights = np.empty(len(states), dtype=np.float64)
+    # Group states by bin
+    bin_to_states: dict[tuple, list[int]] = defaultdict(list)
     for i, s in enumerate(states):
-        count = coverage[state_key(s)]
-        if count == 0:
-            weights[i] = float("inf")
-        else:
-            weights[i] = 1.0 / count
+        bin_to_states[state_key(s)].append(i)
 
-    # Separate infinite (unseen) from finite
-    inf_mask = np.isinf(weights)
-    if inf_mask.any():
-        # Pick randomly among completely unseen bins
-        candidates = np.where(inf_mask)[0]
-    else:
-        # Pick from the top-10% least-covered states
-        threshold = np.percentile(weights, 90)
-        candidates = np.where(weights >= threshold)[0]
+    # Weight each unique bin by inverse frequency (skip bins with 0 coverage —
+    # those only appear in transition frames and aren't real gameplay locations)
+    alpha = 2.0  # exponent to control how strongly we prefer under-covered bins
+    unique_bins = [b for b in bin_to_states if coverage[b] > 0]
+    bin_weights = np.array([
+        1.0 / coverage[b]**alpha for b in unique_bins
+    ], dtype=np.float64)
 
-    chosen_idx = int(np.random.choice(candidates))
+    # Print top-20 most likely bins before selecting
+    top_indices = np.argsort(-bin_weights)[:60]
+    probs = bin_weights / bin_weights.sum()
+    print(f"\n  Top {len(top_indices)} likely bins:")
+    for rank, bi in enumerate(top_indices, 1):
+        b = unique_bins[bi]
+        dim_str = ", ".join(f"{l}={v}" for l, v in zip(labels, b))
+        print(f"    {rank:2d}. {dim_str}  (count={coverage[b]}, prob={probs[bi]:.4f})")
+
+    # Sample a bin proportionally to weight
+    chosen_bin_idx = int(np.random.choice(len(unique_bins), p=probs))
+    chosen_bin = unique_bins[chosen_bin_idx]
+
+    # Pick a random state from that bin
+    chosen_idx = int(np.random.choice(bin_to_states[chosen_bin]))
     chosen = states[chosen_idx]
 
     s_key = state_key(chosen)
@@ -236,6 +309,7 @@ def pick_best_state(
     for lbl, val in zip(labels, s_key):
         print(f"    {lbl:12s}:  {val}")
     print(f"    Bin count:   {current_count} frames in dataset")
+    print(f"    Bin prob:    {probs[chosen_bin_idx]:.4f}")
 
     return chosen
 
