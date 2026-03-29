@@ -206,11 +206,14 @@ def main():
         act_remap[old] = new
 
     constant_mask = ram_min == ram_max
-    kept_cols = np.where(~constant_mask)[0]
+    # Exclude Stack ($0100–$01FF) and OAM ($0200–$02FF) — noise / redundant with image
+    stack_oam_mask = np.zeros(ram_min.shape[0], dtype=bool)
+    stack_oam_mask[0x100:0x300] = True
+    kept_cols = np.where(~constant_mask & ~stack_oam_mask)[0]
 
     print(f"\nPalette: {len(used_pal_sorted)} / {len(palette)} colors used")
     print(f"Actions: {len(used_act_sorted)} unique values")
-    print(f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses")
+    print(f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses (Stack+OAM excluded)")
 
     # ── Write JSON mapping files ─────────────────────────────────────
     OUT_DIR.mkdir(parents=True, exist_ok=True)
