@@ -22,6 +22,9 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUT_DIR = PROJECT_ROOT / "data" / "normalized"
 PALETTE_FILE = RAW_DIR / "smb1_palette.pal"
 
+# Suffixes associated with each recording base path
+RAW_SUFFIXES = [".frames.npy", ".input.npy", ".ram.npy", ".avi", ".mss", ".wram.npy"]
+
 CROP_H = 224
 CROP_W = 224
 NES_W = 256
@@ -57,6 +60,15 @@ def decode_avi(avi_path: Path, expected_frames: int) -> np.ndarray:
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg error on {avi_path.name}: {proc.stderr.decode()}")
     raw = np.frombuffer(proc.stdout, dtype=np.uint8)
+    frame_bytes = NES_H * NES_W * 3
+    actual_frames = len(raw) // frame_bytes
+    if actual_frames < expected_frames:
+        raise ValueError(
+            f"AVI has {actual_frames} frames but expected {expected_frames} in {avi_path.name}"
+        )
+    if actual_frames != expected_frames:
+        print(f"    Note: AVI has {actual_frames} frames, trimming to {expected_frames}")
+    raw = raw[: expected_frames * frame_bytes]
     return raw.reshape(expected_frames, NES_H, NES_W, 3)
 
 
@@ -126,8 +138,36 @@ def main():
 
     print(f"Found {len(bases)} recording(s)\n")
 
-    # ── Load all recordings into memory ──────────────────────────────
-    loaded = []
+    # ── Remove empty recordings (0 frames) ───────────────────────────
+    valid_bases = []
+    for base in bases:
+        frame_numbers = np.load(str(base) + ".frames.npy")
+        if len(frame_numbers) == 0:
+            print(f"  Deleting empty recording: {base.name}")
+            for suffix in RAW_SUFFIXES:
+                p = Path(str(base) + suffix)
+                if p.exists():
+                    p.unlink()
+            # Also delete periodic save-state directory if present
+            states_dir = Path(str(base) + "_states")
+            if states_dir.is_dir():
+                import shutil
+                shutil.rmtree(states_dir)
+        else:
+            valid_bases.append(base)
+    bases = valid_bases
+
+    if not bases:
+        print("No valid recordings remaining.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Pass 1: collect unique palette/action/RAM stats (no frames kept) ──
+    print("Pass 1: scanning metadata and frames for mappings ...")
+    used_pal = set()
+    used_act = set()
+    ram_min = None
+    ram_max = None
+
     for base in bases:
         frame_numbers = np.load(str(base) + ".frames.npy")
         actions = np.load(str(base) + ".input.npy")
@@ -137,41 +177,40 @@ def main():
         n = len(frame_numbers)
         avi = Path(str(base) + ".avi")
 
-        print(f"  Loading {base.name} ({n} frames) ...")
+        print(f"  Scanning {base.name} ({n} frames) ...")
         rgb = decode_avi(avi, n)
         cropped = center_crop(rgb)
         pal_idx = rgb_to_palette_indices(cropped, lut, palette)
 
-        loaded.append((base.name, pal_idx, actions, ram))
-
-    # ── Compute reduced mappings across the full dataset ─────────────
-
-    # Palette: which indices actually appear after crop?
-    used_pal = set()
-    for _, pal_idx, _, _ in loaded:
         used_pal.update(np.unique(pal_idx).tolist())
+        used_act.update(np.unique(actions).tolist())
+
+        if ram_min is None:
+            ram_min = ram.min(axis=0)
+            ram_max = ram.max(axis=0)
+        else:
+            ram_min = np.minimum(ram_min, ram.min(axis=0))
+            ram_max = np.maximum(ram_max, ram.max(axis=0))
+
+        del rgb, cropped, pal_idx  # free memory
+
+    # Build remapping tables
     used_pal_sorted = sorted(used_pal)
     pal_remap = np.zeros(len(palette), dtype=np.uint8)
     for new, old in enumerate(used_pal_sorted):
         pal_remap[old] = new
 
-    # Actions: which button combinations actually appear?
-    used_act = set()
-    for _, _, actions, _ in loaded:
-        used_act.update(np.unique(actions).tolist())
     used_act_sorted = sorted(used_act)
     act_remap = np.zeros(256, dtype=np.uint8)
     for new, old in enumerate(used_act_sorted):
         act_remap[old] = new
 
-    # RAM: which columns are NOT constant across every frame of every recording?
-    all_ram = np.concatenate([ram for _, _, _, ram in loaded])
-    constant_mask = all_ram.min(axis=0) == all_ram.max(axis=0)
+    constant_mask = ram_min == ram_max
     kept_cols = np.where(~constant_mask)[0]
 
     print(f"\nPalette: {len(used_pal_sorted)} / {len(palette)} colors used")
     print(f"Actions: {len(used_act_sorted)} unique values")
-    print(f"RAM:     {len(kept_cols)} / {all_ram.shape[1]} non-constant addresses")
+    print(f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses")
 
     # ── Write JSON mapping files ─────────────────────────────────────
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -200,13 +239,28 @@ def main():
             json.dump(obj, f, indent=2)
         print(f"  Wrote {path}")
 
-    # ── Convert and save each recording ──────────────────────────────
-    for rec_name, pal_idx, actions, ram in loaded:
+    # ── Pass 2: re-decode, remap, and save each recording ────────────
+    print("\nPass 2: converting and saving ...")
+    for base in bases:
+        frame_numbers = np.load(str(base) + ".frames.npy")
+        actions = np.load(str(base) + ".input.npy")
+        ram = np.load(str(base) + ".ram.npy")
+
+        n = len(frame_numbers)
+        avi = Path(str(base) + ".avi")
+
+        print(f"  Processing {base.name} ({n} frames) ...")
+        rgb = decode_avi(avi, n)
+        cropped = center_crop(rgb)
+        pal_idx = rgb_to_palette_indices(cropped, lut, palette)
+        del rgb, cropped
+
         frames_out = pal_remap[pal_idx]
+        del pal_idx
         actions_out = act_remap[actions]
         ram_out = ram[:, kept_cols]
 
-        out_path = OUT_DIR / (rec_name + ".npz")
+        out_path = OUT_DIR / (base.name + ".npz")
         np.savez_compressed(
             str(out_path),
             frames=frames_out,
@@ -215,6 +269,7 @@ def main():
         )
         print(f"  Saved {out_path.name}  "
               f"frames={frames_out.shape} actions={actions_out.shape} ram={ram_out.shape}")
+        del frames_out, actions_out, ram_out
 
     print(f"\nDone. Output in {OUT_DIR}")
 
