@@ -38,10 +38,16 @@ def setup_worker(worker):
         capture=True,
     )
     ssh(worker, (
-        "apt-get install -y build-essential htop vim && "
+        "apt-get update && "
+        "apt-get install -y build-essential ca-certificates curl htop pkg-config libssl-dev vim && "
+        "command -v cargo >/dev/null 2>&1 || curl https://sh.rustup.rs -sSf | sh -s -- -y && "
+        ". $HOME/.cargo/env && "
+        "command -v cargo-binstall >/dev/null 2>&1 || cargo install cargo-binstall && "
+        "command -v zellij >/dev/null 2>&1 || BINSTALL_DISABLE_TELEMETRY=true cargo binstall --no-confirm zellij && "
         ". /opt/miniforge3/etc/profile.d/conda.sh && "
         f"cd {worker.project_dir} && "
         "(conda env create -f environment.yml 2>/dev/null || conda env update -f environment.yml) && "
+        "grep -qxF '. $HOME/.cargo/env' ~/.bashrc || echo '. $HOME/.cargo/env' >> ~/.bashrc && "
         "grep -qxF '. /opt/miniforge3/etc/profile.d/conda.sh' ~/.bashrc || echo '. /opt/miniforge3/etc/profile.d/conda.sh' >> ~/.bashrc && "
         "grep -qxF 'conda activate mario' ~/.bashrc || echo 'conda activate mario' >> ~/.bashrc && "
         "grep -qxF 'alias py=python' ~/.bashrc || echo 'alias py=python' >> ~/.bashrc && "
