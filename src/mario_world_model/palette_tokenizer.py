@@ -89,11 +89,17 @@ class PaletteVideoTokenizer(VideoTokenizer):
     # ── helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def indices_to_onehot(indices: Tensor, num_colors: int) -> Tensor:
+    def indices_to_onehot(
+        indices: Tensor,
+        num_colors: int,
+        dtype: torch.dtype | None = None,
+    ) -> Tensor:
         """``(B, T, H, W)`` long  →  ``(B, K, T, H, W)`` float one-hot."""
+        if dtype is None:
+            dtype = torch.float32
         return (
             F.one_hot(indices.long(), num_colors)
-            .float()
+            .to(dtype=dtype)
             .permute(0, 4, 1, 2, 3)
         )
 

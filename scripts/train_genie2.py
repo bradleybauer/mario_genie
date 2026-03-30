@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
@@ -48,6 +49,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from mario_world_model.system_info import get_available_memory, get_effective_cpu_count
+
 # ---------------------------------------------------------------------------
 # Hyperparameters (small model)
 # ---------------------------------------------------------------------------
@@ -63,6 +66,7 @@ TRANSFORMER_MLP_RATIO = 4
 DIFFUSION_STEPS = 200      # DDPM T
 BETA_START = 1e-4
 BETA_END = 0.02
+NUM_ACTIONS = 42
 
 CROP_224_SIZE = 224
 
@@ -70,6 +74,64 @@ CROP_224_SIZE = 224
 # ═══════════════════════════════════════════════════════════════════════════
 # Dataset
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _index_file(file_idx: int, filepath: str, seq_len: int) -> tuple[int, int, list[tuple[int, int]]]:
+    """Index a normalized .npz file.
+
+    Supports both the current `(N, H, W)` frame layout and the legacy
+    `(N, 1, H, W)` layout.
+    """
+    try:
+        with np.load(filepath, mmap_mode="r") as npz:
+            frames = npz["frames"]
+            if frames.ndim == 3:
+                total_t = frames.shape[0]
+            elif frames.ndim == 4 and frames.shape[1] == 1:
+                total_t = frames.shape[0]
+            else:
+                print(
+                    f"Skipping {filepath}: expected (N, H, W) or (N, 1, H, W), "
+                    f"got {tuple(frames.shape)}"
+                )
+                return file_idx, 0, []
+
+        if total_t < seq_len:
+            return file_idx, 0, []
+        samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
+        return file_idx, total_t, samples
+    except Exception as e:
+        print(f"Skipping {filepath} due to error: {e}")
+        return file_idx, 0, []
+
+
+def find_session_files(data_dir: str) -> list[str]:
+    return sorted(str(p) for p in Path(data_dir).glob("*.npz"))
+
+
+def load_palette_info(data_dir: str) -> tuple[int, np.ndarray]:
+    palette_path = os.path.join(data_dir, "palette.json")
+    if not os.path.isfile(palette_path):
+        raise FileNotFoundError(f"No palette.json found in {data_dir}")
+    with open(palette_path) as f:
+        palette_info = json.load(f)
+    return palette_info["num_colors"], np.array(palette_info["colors_rgb"], dtype=np.uint8)
+
+
+def load_num_actions(data_dir: str) -> int:
+    actions_path = os.path.join(data_dir, "actions.json")
+    if not os.path.isfile(actions_path):
+        return NUM_ACTIONS
+    with open(actions_path) as f:
+        actions_info = json.load(f)
+    return int(actions_info.get("num_actions", NUM_ACTIONS))
+
+
+def _normalize_frames_chunk(frames: np.ndarray) -> np.ndarray:
+    if frames.ndim == 3:
+        return frames
+    if frames.ndim == 4 and frames.shape[1] == 1:
+        return frames[:, 0]
+    raise ValueError(f"Unexpected frame chunk shape {tuple(frames.shape)}")
 
 class Genie2Dataset(Dataset):
     """Loads sequences of (frames, actions) for Genie 2 training.
@@ -79,40 +141,127 @@ class Genie2Dataset(Dataset):
     actions are uint8 indices into COMPLEX_MOVEMENT.
     """
 
-    def __init__(self, data_dir: str, seq_len: int = 16, crop_size: int = CROP_224_SIZE):
+    def __init__(
+        self,
+        data_dir: str,
+        seq_len: int = 16,
+        crop_size: int = CROP_224_SIZE,
+        subset_n: int = 0,
+        seed: int = 42,
+        num_workers: int | None = None,
+    ):
         super().__init__()
+        if num_workers is None:
+            num_workers = get_effective_cpu_count()
         self.seq_len = seq_len
         self.crop_size = crop_size
         self.data_files = find_session_files(data_dir)
+        self.num_files = len(self.data_files)
+        self.dataset_bytes = sum(Path(path).stat().st_size for path in self.data_files)
         assert self.data_files, f"No session files found in {data_dir}"
 
-        # Index valid windows
-        self.samples: list[tuple[int, int]] = []  # (file_idx, t_start)
-        for fi, fp in enumerate(self.data_files):
-            try:
-                meta = fp.replace(".npz", ".meta.json")
-                if os.path.exists(meta):
-                    with open(meta) as f:
-                        total_t = json.load(f)["num_frames"]
-                else:
-                    with np.load(fp, mmap_mode="r") as z:
-                        total_t = z["frames"].shape[0]
-                if total_t >= seq_len:
-                    for t in range(total_t - seq_len + 1):
-                        self.samples.append((fi, t))
-            except Exception as e:
-                print(f"Skipping {fp}: {e}")
+        self.samples: list[tuple[int, int]] = []
+        frame_counts = [0] * self.num_files
+
+        print(f"Indexing {self.num_files} data files (stride=1)...")
+        index_workers = max(int(num_workers), 1)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
+            futures = {
+                pool.submit(_index_file, idx, path, seq_len): idx
+                for idx, path in enumerate(self.data_files)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                file_idx, total_t, samples = future.result()
+                frame_counts[file_idx] = total_t
+                self.samples.extend(samples)
+
+        valid = [i for i in range(self.num_files) if frame_counts[i] > 0]
+        if len(valid) < self.num_files:
+            old_to_new = {old: new for new, old in enumerate(valid)}
+            skipped = self.num_files - len(valid)
+            print(f"Dropped {skipped} file(s) with no usable frames")
+            self.data_files = [self.data_files[i] for i in valid]
+            frame_counts = [frame_counts[i] for i in valid]
+            self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
+            self.num_files = len(self.data_files)
+
         self.samples.sort()
+
+        if subset_n > 0 and subset_n < len(self.samples):
+            rng = np.random.RandomState(seed)
+            indices = rng.choice(len(self.samples), size=subset_n, replace=False)
+            self.samples = [self.samples[i] for i in indices]
+            print(f"Subset: kept {subset_n} samples")
+
+        self.total_frames = sum(frame_counts)
+        self.frames_by_file: list[np.ndarray] | None = None
+        self.actions_by_file: list[np.ndarray] | None = None
+
+        if self.total_frames > 0:
+            available = get_available_memory()
+            with np.load(self.data_files[0], mmap_mode="r") as npz:
+                probe_frames = _normalize_frames_chunk(npz["frames"][:1])
+                probe_actions = np.asarray(npz["actions"][:1])
+            bytes_per_frame = probe_frames[0].nbytes
+            bytes_per_action = probe_actions[0].nbytes
+            total_bytes = self.total_frames * (bytes_per_frame + bytes_per_action)
+            headroom = 2 * 2**30
+
+            if available > 0 and total_bytes < available - headroom:
+                print(
+                    f"Loading frames/actions into RAM ({total_bytes / 2**30:.1f} GB, "
+                    f"{available / 2**30:.1f} GB available)..."
+                )
+                self.frames_by_file = [None] * self.num_files
+                self.actions_by_file = [None] * self.num_files
+
+                def _load_file(idx: int) -> tuple[int, np.ndarray, np.ndarray]:
+                    with np.load(self.data_files[idx]) as npz:
+                        frames = _normalize_frames_chunk(npz["frames"])
+                        actions = np.asarray(npz["actions"])
+                    return idx, frames, actions
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
+                    futures = [pool.submit(_load_file, i) for i in range(self.num_files)]
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, frames, actions = future.result()
+                        self.frames_by_file[idx] = frames
+                        self.actions_by_file[idx] = actions
+            else:
+                print(
+                    f"Dataset too large for RAM ({total_bytes / 2**30:.1f} GB, "
+                    f"{available / 2**30:.1f} GB available). Using mmap."
+                )
+
         print(f"[Genie2Dataset] {len(self.samples)} windows from {len(self.data_files)} files")
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _get_frames_mmap(self, file_idx: int) -> np.ndarray:
+        if not hasattr(self, "_mmap_frames_cache"):
+            self._mmap_frames_cache = {}
+        if file_idx not in self._mmap_frames_cache:
+            npz = np.load(self.data_files[file_idx], mmap_mode="r")
+            self._mmap_frames_cache[file_idx] = _normalize_frames_chunk(npz["frames"])
+        return self._mmap_frames_cache[file_idx]
+
+    def _get_actions_mmap(self, file_idx: int) -> np.ndarray:
+        if not hasattr(self, "_mmap_actions_cache"):
+            self._mmap_actions_cache = {}
+        if file_idx not in self._mmap_actions_cache:
+            npz = np.load(self.data_files[file_idx], mmap_mode="r")
+            self._mmap_actions_cache[file_idx] = np.asarray(npz["actions"])
+        return self._mmap_actions_cache[file_idx]
+
     def __getitem__(self, idx: int):
         fi, t0 = self.samples[idx]
-        with np.load(self.data_files[fi], mmap_mode="r") as z:
-            frames = z["frames"][t0 : t0 + self.seq_len, 0]   # (T, H, W) uint8
-            actions = z["actions"][t0 : t0 + self.seq_len]     # (T,) uint8
+        if self.frames_by_file is not None and self.actions_by_file is not None:
+            frames = self.frames_by_file[fi][t0 : t0 + self.seq_len]
+            actions = self.actions_by_file[fi][t0 : t0 + self.seq_len]
+        else:
+            frames = self._get_frames_mmap(fi)[t0 : t0 + self.seq_len]
+            actions = self._get_actions_mmap(fi)[t0 : t0 + self.seq_len]
 
         # Centre-crop 256 → 224 if needed
         h, w = frames.shape[-2:]
@@ -120,7 +269,7 @@ class Genie2Dataset(Dataset):
             border = (h - self.crop_size) // 2
             frames = frames[..., border : h - border, border : w - border]
 
-        return torch.from_numpy(frames.copy()).long(), torch.from_numpy(actions.copy()).long()
+        return torch.from_numpy(frames.copy()).long(), torch.from_numpy(np.asarray(actions).reshape(-1).copy()).long()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -479,9 +628,15 @@ def train_autoencoder(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    dataset = Genie2Dataset(args.data_dir, seq_len=1, crop_size=CROP_224_SIZE)
+    dataset = Genie2Dataset(
+        args.data_dir,
+        seq_len=1,
+        crop_size=CROP_224_SIZE,
+        subset_n=args.overfit_n,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
     if args.overfit_n > 0:
-        dataset.samples = dataset.samples[: args.overfit_n]
         print(f"[overfit] Using {len(dataset)} samples")
     n_eval = min(500, max(1, len(dataset) // 10))
     train_ds, eval_ds = random_split(dataset, [len(dataset) - n_eval, n_eval])
@@ -490,9 +645,7 @@ def train_autoencoder(args):
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=0)
 
-    palette_path = os.path.join(args.data_dir, "palette.json")
-    with open(palette_path) as f:
-        num_colors = len(json.load(f))
+    num_colors, palette = load_palette_info(args.data_dir)
     print(f"Palette: {num_colors} colours")
 
     model = FrameVAE(num_palette_colors=num_colors, latent_channels=LATENT_CHANNELS).to(device)
@@ -512,12 +665,15 @@ def train_autoencoder(args):
         model.train()
         total_recon = total_kl = 0.0
         n_batches = 0
+        train_preview_frames = None
         pbar = tqdm(train_loader, desc=f"AE epoch {epoch}/{args.epochs}")
         step = 0
         for frames_batch, _ in pbar:
             if args.max_steps > 0 and step >= args.max_steps:
                 break
             frames = frames_batch[:, 0].to(device)  # (B, H, W), seq_len=1 so squeeze
+            if train_preview_frames is None:
+                train_preview_frames = frames[: min(8, frames.shape[0])].detach().clone()
             logits, mu, logvar = model(frames)
 
             recon_loss = F.cross_entropy(logits, frames)
@@ -540,10 +696,13 @@ def train_autoencoder(args):
         # Eval
         model.eval()
         eval_recon = eval_correct = eval_total = 0
+        preview_frames = None
         with torch.no_grad():
             for frames_batch, _ in eval_loader:
                 frames = frames_batch[:, 0].to(device)
                 logits, mu, logvar = model(frames)
+                if preview_frames is None:
+                    preview_frames = frames[: min(8, frames.shape[0])].clone()
                 eval_recon += F.cross_entropy(logits, frames, reduction="sum").item()
                 eval_correct += (logits.argmax(1) == frames).sum().item()
                 eval_total += frames.numel()
@@ -551,6 +710,10 @@ def train_autoencoder(args):
         eval_acc = eval_correct / eval_total
         print(f"  eval recon={eval_recon:.6f}  pixel_acc={eval_acc:.4f}  "
               f"train_recon={total_recon / n_batches:.4f}  train_kl={total_kl / n_batches:.2f}")
+
+        preview_source_frames = train_preview_frames if args.overfit_n > 0 else preview_frames
+        if preview_source_frames is not None:
+            save_ae_eval_image(model, preview_source_frames, palette, args.output_dir, epoch)
 
         if eval_recon < best_eval:
             best_eval = eval_recon
@@ -569,9 +732,15 @@ def train_dynamics(args):
 
     seq_len = 8  # context frames for dynamics training
 
-    dataset = Genie2Dataset(args.data_dir, seq_len=seq_len + 1, crop_size=CROP_224_SIZE)
+    dataset = Genie2Dataset(
+        args.data_dir,
+        seq_len=seq_len + 1,
+        crop_size=CROP_224_SIZE,
+        subset_n=args.overfit_n,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
     if args.overfit_n > 0:
-        dataset.samples = dataset.samples[: args.overfit_n]
         print(f"[overfit] Using {len(dataset)} samples")
     n_eval = min(500, max(1, len(dataset) // 10))
     train_ds, eval_ds = random_split(dataset, [len(dataset) - n_eval, n_eval])
@@ -580,9 +749,8 @@ def train_dynamics(args):
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=0)
 
-    palette_path = os.path.join(args.data_dir, "palette.json")
-    with open(palette_path) as f:
-        num_colors = len(json.load(f))
+    num_colors, palette = load_palette_info(args.data_dir)
+    num_actions = load_num_actions(args.data_dir)
 
     # Load frozen autoencoder
     ae = FrameVAE(num_palette_colors=num_colors, latent_channels=LATENT_CHANNELS).to(device)
@@ -599,7 +767,7 @@ def train_dynamics(args):
         dim=TRANSFORMER_DIM,
         num_heads=TRANSFORMER_HEADS,
         num_layers=TRANSFORMER_LAYERS,
-        num_actions=NUM_ACTIONS,
+        num_actions=num_actions,
         max_frames=seq_len + 1,
     ).to(device)
     denoiser = LatentDenoiser(
@@ -645,6 +813,7 @@ def train_dynamics(args):
         denoiser.train()
         total_loss = 0.0
         n_batches = 0
+        train_preview_batch = None
         pbar = tqdm(train_loader, desc=f"Dyn epoch {epoch}/{args.epochs}")
 
         step = 0
@@ -653,6 +822,11 @@ def train_dynamics(args):
                 break
             frames_batch = frames_batch.to(device)    # (B, T+1, H, W)
             actions_batch = actions_batch.to(device)   # (B, T+1)
+            if train_preview_batch is None:
+                train_preview_batch = (
+                    frames_batch[: min(4, frames_batch.shape[0])].detach().clone(),
+                    actions_batch[: min(4, actions_batch.shape[0])].detach().clone(),
+                )
 
             # Encode all frames
             latents = encode_frames(frames_batch)      # (B, T+1, C, Hl, Wl)
@@ -688,10 +862,16 @@ def train_dynamics(args):
         denoiser.eval()
         eval_loss = 0.0
         eval_n = 0
+        preview_batch = None
         with torch.no_grad():
             for frames_batch, actions_batch in eval_loader:
                 frames_batch = frames_batch.to(device)
                 actions_batch = actions_batch.to(device)
+                if preview_batch is None:
+                    preview_batch = (
+                        frames_batch[: min(4, frames_batch.shape[0])].clone(),
+                        actions_batch[: min(4, actions_batch.shape[0])].clone(),
+                    )
                 latents = encode_frames(frames_batch)
                 ctx_latents = latents[:, :-1]
                 ctx_actions = actions_batch[:, :-1]
@@ -704,6 +884,22 @@ def train_dynamics(args):
                 eval_n += noise.numel()
         eval_loss /= max(eval_n, 1)
         print(f"  eval_loss={eval_loss:.6f}  train_loss={total_loss / n_batches:.6f}")
+
+        preview_source_batch = train_preview_batch if args.overfit_n > 0 else preview_batch
+        if preview_source_batch is not None:
+            preview_frames, preview_actions = preview_source_batch
+            save_dynamics_eval_image(
+                ae,
+                dynamics,
+                denoiser,
+                schedule,
+                preview_frames,
+                preview_actions,
+                palette,
+                args.output_dir,
+                epoch,
+                num_colors,
+            )
 
         state = {
             "dynamics": dynamics.state_dict(),
@@ -727,16 +923,100 @@ def palette_to_rgb(indices: torch.Tensor, palette: np.ndarray) -> np.ndarray:
     return palette[indices.cpu().numpy()].astype(np.uint8)
 
 
+def _save_eval_grid(rows: list[np.ndarray], output_dir: str, stem: str, epoch: int):
+    from PIL import Image
+
+    eval_dir = os.path.join(output_dir, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    if not rows:
+        return
+
+    h_sep = np.full((2, rows[0].shape[1], 3), 255, dtype=np.uint8)
+    parts = []
+    for i, row in enumerate(rows):
+        if i > 0:
+            parts.append(h_sep)
+        parts.append(row)
+    grid = np.concatenate(parts, axis=0)
+
+    epoch_path = os.path.join(eval_dir, f"{stem}_epoch_{epoch:03d}.png")
+    latest_path = os.path.join(eval_dir, f"{stem}_latest.png")
+    Image.fromarray(grid).save(epoch_path)
+    Image.fromarray(grid).save(latest_path)
+    print(f"  saved {epoch_path}")
+
+
+@torch.no_grad()
+def save_ae_eval_image(
+    model: FrameVAE,
+    frames: torch.Tensor,
+    palette: np.ndarray,
+    output_dir: str,
+    epoch: int,
+):
+    logits, _, _ = model(frames)
+    pred_indices = logits.argmax(1)
+
+    rows = []
+    for i in range(frames.shape[0]):
+        gt_rgb = palette_to_rgb(frames[i], palette)
+        pred_rgb = palette_to_rgb(pred_indices[i], palette)
+        sep = np.full((gt_rgb.shape[0], 2, 3), 255, dtype=np.uint8)
+        rows.append(np.concatenate([gt_rgb, sep, pred_rgb], axis=1))
+
+    _save_eval_grid(rows, output_dir, "ae_eval", epoch)
+
+
+@torch.no_grad()
+def save_dynamics_eval_image(
+    ae: FrameVAE,
+    dynamics: DynamicsTransformer,
+    denoiser: LatentDenoiser,
+    schedule: DiffusionSchedule,
+    frames_batch: torch.Tensor,
+    actions_batch: torch.Tensor,
+    palette: np.ndarray,
+    output_dir: str,
+    epoch: int,
+    num_colors: int,
+):
+    ctx_frames = frames_batch[:, :-1]
+    gt_next = frames_batch[:, -1]
+    last_ctx = frames_batch[:, -2]
+
+    bsz, steps, height, width = ctx_frames.shape
+    flat = ctx_frames.reshape(bsz * steps, height, width)
+    x_oh = F.one_hot(flat, num_colors).float().permute(0, 3, 1, 2)
+    h = ae.encoder(x_oh)
+    mu = ae.enc_mu(h)
+    ctx_latents = mu.reshape(bsz, steps, *mu.shape[1:])
+    ctx_actions = actions_batch[:, :-1]
+
+    context = dynamics(ctx_latents, ctx_actions)
+    latent_shape = (bsz, LATENT_CHANNELS, LATENT_SIZE, LATENT_SIZE)
+    pred_latent = schedule.ddpm_sample(denoiser, context, latent_shape, frames_batch.device)
+    pred_logits = ae.decode(pred_latent)
+    pred_indices = pred_logits.argmax(1)
+
+    rows = []
+    for i in range(frames_batch.shape[0]):
+        ctx_rgb = palette_to_rgb(last_ctx[i], palette)
+        gt_rgb = palette_to_rgb(gt_next[i], palette)
+        pred_rgb = palette_to_rgb(pred_indices[i], palette)
+        sep = np.full((ctx_rgb.shape[0], 2, 3), 255, dtype=np.uint8)
+        rows.append(np.concatenate([ctx_rgb, sep, gt_rgb, sep, pred_rgb], axis=1))
+
+    _save_eval_grid(rows, output_dir, "dynamics_eval", epoch)
+
+
 def visualize(args):
     from PIL import Image
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load palette
-    palette_path = os.path.join(args.data_dir, "palette.json")
-    with open(palette_path) as f:
-        palette = np.array(json.load(f), dtype=np.uint8)  # (K, 3)
-    num_colors = len(palette)
+    num_colors, palette = load_palette_info(args.data_dir)
+    num_actions = load_num_actions(args.data_dir)
 
     # Load AE
     ae = FrameVAE(num_palette_colors=num_colors, latent_channels=LATENT_CHANNELS).to(device)
@@ -749,9 +1029,16 @@ def visualize(args):
     has_dynamics = args.dyn_checkpoint is not None or os.path.exists(
         os.path.join(args.output_dir, "dynamics_best.pt"))
     seq_len = 9 if has_dynamics else 1
-    dataset = Genie2Dataset(args.data_dir, seq_len=seq_len, crop_size=CROP_224_SIZE)
+    dataset = Genie2Dataset(
+        args.data_dir,
+        seq_len=seq_len,
+        crop_size=CROP_224_SIZE,
+        subset_n=args.overfit_n,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
     if args.overfit_n > 0:
-        dataset.samples = dataset.samples[: args.overfit_n]
+        print(f"[overfit] Using {len(dataset)} samples")
 
     n_samples = min(args.vis_n, len(dataset))
     loader = DataLoader(dataset, batch_size=n_samples, shuffle=False, num_workers=0)
@@ -797,7 +1084,7 @@ def visualize(args):
     dynamics = DynamicsTransformer(
         latent_channels=LATENT_CHANNELS, latent_size=LATENT_SIZE,
         dim=TRANSFORMER_DIM, num_heads=TRANSFORMER_HEADS,
-        num_layers=TRANSFORMER_LAYERS, num_actions=NUM_ACTIONS,
+        num_layers=TRANSFORMER_LAYERS, num_actions=num_actions,
         max_frames=seq_len,
     ).to(device)
     denoiser = LatentDenoiser(
@@ -867,14 +1154,14 @@ def visualize(args):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genie 2 – small latent diffusion world model")
     parser.add_argument("--phase", choices=["autoencoder", "dynamics", "visualize"], required=True)
-    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--output-dir", type=str, default="checkpoints/genie2")
     parser.add_argument("--ae-checkpoint", type=str, default=None,
                         help="Path to trained AE checkpoint (required for dynamics phase)")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=min(get_effective_cpu_count(), 32))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overfit-n", type=int, default=0,
                         help="Train on N random samples (overfit sanity check)")

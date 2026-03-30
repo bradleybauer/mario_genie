@@ -103,6 +103,23 @@ Example: batch=6, seq_len=16, image_size=224 → $N = 4{,}816{,}896$ pixels → 
 ### Motivation
 Explored whether a 100× downscaled LTX-Video 2.3 architecture (DiT-based latent video diffusion) could replace the current three-module Genie-2 pipeline for joint audio-video world-model generation, targeting 20–100M total parameters.
 
+### LTX-2.3 Architecture Findings
+- LTX-2.3 is not a game/world-model system like Matrix-Game 3. It is a general-purpose **joint audio-video diffusion transformer** with open weights.
+- The public LTX-2 paper describes an **asymmetric dual-stream transformer**: a larger video stream plus a smaller audio stream, coupled by bidirectional cross-modal attention. The model card lists the current open checkpoint family as `ltx-2.3-22b-*`.
+- It uses **separate modality-specific autoencoders**, not one shared audiovisual autoencoder:
+	- **Video VAE**: a spatiotemporal latent VAE for video.
+	- **Audio VAE**: a separate audio VAE over mel spectrograms.
+	- **Vocoder**: HiFi-GAN-like waveform decoder for the audio side.
+- The public codebase implements the **video VAE** as a 3D-conv spatiotemporal VAE with explicit temporal and spatial compression. Standard latent shape/compression in the repo:
+	- input video: `[B, 3, F, H, W]`
+	- latent video: `[B, 128, F', H/32, W/32]`
+	- temporal compression: `F' = 1 + (F - 1) / 8`
+	- example: `33 x 512 x 512 -> 5 x 16 x 16`
+- The video VAE code path uses an initial **spatial patchify step** with `patch_size = 4`, then additional encoder blocks compress time and space further.
+- The decoder mirrors this with temporal/spatial upsampling plus an unpatchify-style final expansion back to pixels.
+- The audio VAE is much smaller and operates on mel spectrograms, with a reported 4x temporal downsample in the public README.
+- Practical implication: the LTX design is a good architectural reference for a **unified latent diffusion backbone**, but its autoencoder stack is much more general-purpose and multimodal than what we need for NES-only experiments.
+
 ### Current Genie-2 Architecture (for reference)
 The existing pipeline in `scripts/train_genie2.py` has three separate modules:
 1. **FrameVAE** (~1.6M params) — 2D conv encoder/decoder, compresses 224×224 palette-indexed frames to continuous 4×14×14 latents. Four 2× downsamples (224→112→56→28→14), VAE with KL penalty.
@@ -116,6 +133,44 @@ Training is two-phase: (1) train autoencoder on reconstruction, (2) freeze AE, t
 - **Flow matching over DDPM**: LTX uses rectified flow matching (linear interpolation $x_t = (1-t)x_0 + t\epsilon$, velocity prediction). Trains faster, samples in 5–20 steps instead of 200 DDPM steps.
 - **RoPE** for spatiotemporal position encoding instead of learned embeddings (better generalization).
 - **Action conditioning via AdaLN** (adaptive layer norm) replaces LTX's text-conditioning cross-attention path — much cheaper and appropriate for our discrete action space.
+
+### What "Patchifying" Means
+Patchifying means bundling a small local pixel block into one coarser cell before the rest of the model processes it.
+
+For a single image with patch size 4, a `4 x 4` neighborhood is rearranged into channels:
+
+$$[C, H, W] \rightarrow [16C, H/4, W/4]$$
+
+For video, LTX's video VAE does this spatially on each frame before later compression stages:
+
+$$[C, F, H, W] \rightarrow [16C, F, H/4, W/4]$$
+
+This is similar to a **space-to-depth** transform or a non-overlapping patch embedding. It is not quantization and it is not a learned codebook by itself. It is just an early restructuring/compression step.
+
+Why this matters:
+- it reduces sequence length / spatial resolution early,
+- preserves local neighborhoods as a single coarse unit,
+- and makes later attention or convolutions cheaper.
+
+In LTX's case, patchifying is only the first compression stage. The encoder then applies additional temporal/spatial compression to reach the final `8x` time and `32x` space latent grid.
+
+### Patchifying Ideas Worth Testing Here
+Patchifying is potentially relevant for this project because it gives a clean way to impose local structure **before** the main dynamics model.
+
+Useful interpretations for Mario:
+- **Tokenizer-side patchify**: explicitly patchify frames before a continuous VAE/DiT encoder, similar to LTX. This would be the direct architectural imitation.
+- **Metatile-aligned patchify**: use `16 x 16` patch units so one coarse token corresponds to one NES metatile region. This is already close to the existing tokenizer bias and may be the more domain-correct option.
+- **Latent patchify instead of pixel patchify**: keep the current tokenizer, but patchify the continuous latent grid before the transformer. This is cheaper to test and avoids retraining the image front-end immediately.
+
+Low-risk experiment order:
+1. **Latent-grid patchify** on the current FrameVAE latents (`14 x 14`) before the transformer/denoiser replacement.
+2. **Pixel-space patchify** in a small continuous autoencoder baseline, to see whether early patch structure improves optimization or harms fine sprite edges.
+3. **Metatile-aligned patchify** with `16 x 16` spatial units on `256 x 256` inputs or the nearest compatible resized representation.
+
+Main tradeoff to watch:
+- Patchifying improves efficiency and may encourage local compositional structure.
+- But if patches are too coarse, it may hurt tiny sprite details, palette edges, and HUD text.
+- For Mario specifically, patch boundaries that align with **metatiles** are much more likely to help than arbitrary patch boundaries.
 
 ### Scaling to 20–100M Parameters
 LTX-Video full is ~2B. Scaling knobs for 100× reduction:
