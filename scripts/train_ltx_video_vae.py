@@ -448,6 +448,7 @@ def main() -> None:
                         preview[0],
                         preview[1],
                         palette,
+                        max_frames=args.clip_frames,
                     )
 
                 # Random training sample preview
@@ -461,6 +462,7 @@ def main() -> None:
                         train_frames.detach().cpu(),
                         train_outputs.logits.detach().cpu(),
                         palette,
+                        max_frames=args.clip_frames,
                     )
 
                 if eval_metrics["loss"] < best_eval:
