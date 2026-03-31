@@ -14,3 +14,9 @@ Skimmed the magvit2 paper, notes: Increase warmup period, push the temporal down
 
 
 Instead of all combinations of architecture variables maybe just define an order to test them as additions to some base model
+
+half res / 2d init
+audio
+bit size / reconstruction expectations
+gan: what kind of signal really would a gan provide to the decoder?
+pixel shuffle helps avoid checkerboard

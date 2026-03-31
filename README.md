@@ -265,7 +265,34 @@ Train more models
 
 I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook.
 
-Tentatively claiming the context images idea worked quite nicely. Non-context images consistently have better reconstructions that context images (context image are delightfully glitched). Currently using 4 additional context images per sample. I am pretty sure 4 does not totally prevent temporal zero padding but adding more images may cost more than it's worth in flops.
+Context images idea worked quite nicely. Non-context images consistently have better reconstructions that context images (context image are delightfully glitched). Currently using 8 additional context images per sample.
+
+<br>
+<br>
+
+# Audio
+
+**Context:**
+![](pictures/audio.png)
+
+**Approach:**
+
+Run a dataset-wide spectrum analysis over the raw Mesen AVI recordings, then pick mel front-end parameters that preserve most of the energy while staying aligned with the NES frame rate.
+
+**Result:**
+
+Current mel defaults for SMB1 audio:
+
+- Sample rate: `24000` Hz mono
+- Window / `n_fft`: `400` samples
+- Hop length: `100` samples
+- Mel bins / `n_mels`: `64`
+- `fmin`: `40` Hz
+- `fmax`: `8000` Hz
+- Log floor: `80` dB
+- STFT window: Hann
+
+These values came from scanning the full dataset audio distribution. At `24` kHz, about `98.5%` of spectral energy is retained relative to the original audio. Only about `2.5%` of energy falls below `40` Hz, and only about `2.4%` sits above `8` kHz. A `400`-sample window is also convenient because it is almost exactly one NES video frame at `~60.1` FPS, while a `100`-sample hop gives about four mel steps per frame.
 
 <!-- Template -->
 

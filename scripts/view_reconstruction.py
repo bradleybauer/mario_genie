@@ -498,7 +498,7 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="View reconstruction PNG(s) as video")
     parser.add_argument("path", help="Path to a reconstruction PNG or a directory of PNGs")
-    parser.add_argument("--fps", type=int, default=4, help="Playback frames per second (default: 4)")
+    parser.add_argument("--fps", type=int, default=16, help="Playback frames per second (default: 4)")
     parser.add_argument("--scale", type=float, default=4.0, help="Display scale factor (default: 4)")
     parser.add_argument(
         "--include-context",

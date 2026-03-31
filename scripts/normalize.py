@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Normalize raw Mesen2 recordings into compact training data.
+"""Convert raw Mesen2 recordings into compact training data.
 
 Reads data/raw/ and produces data/normalized/:
   - Per-recording .npz files with palette-indexed frames, reduced actions,
-    and reduced RAM columns.
+        reduced RAM columns, frame-aligned audio, and audio metadata.
   - Shared JSON mapping files (palette.json, actions.json, ram_addresses.json).
 
 Usage:
@@ -11,6 +11,7 @@ Usage:
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,10 @@ CROP_H = 224
 CROP_W = 224
 NES_W = 256
 NES_H = 240
+
+# Audio normalization parameters (derived from dataset-wide spectrum analysis)
+AUDIO_SAMPLE_RATE = 24000  # Retains 98.5% of dataset spectral energy
+AUDIO_DTYPE = np.int16
 
 
 def load_palette(path: Path) -> np.ndarray:
@@ -106,6 +111,74 @@ def rgb_to_palette_indices(
     return indices
 
 
+def decode_audio(avi_path: Path, sample_rate: int = AUDIO_SAMPLE_RATE) -> np.ndarray:
+    """Decode full audio track from AVI → (S,) int16 mono at *sample_rate* via ffmpeg."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg is required to extract audio from AVI files")
+    cmd = [
+        "ffmpeg", "-i", str(avi_path),
+        "-vn", "-ac", "1",
+        "-ar", str(sample_rate),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-v", "error", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg audio error on {avi_path.name}: {proc.stderr.decode()}"
+        )
+    return np.frombuffer(proc.stdout, dtype=np.int16)
+
+
+def frame_aligned_audio(
+    audio: np.ndarray,
+    n_frames: int,
+    fps: float,
+    sample_rate: int = AUDIO_SAMPLE_RATE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slice mono audio into (N, samples_per_frame) aligned to video frames.
+
+    Uses cumulative rounding so drift never exceeds one sample over the
+    full recording, even though fps is not an exact divisor of sample_rate.
+    Each frame's chunk is truncated or zero-padded to a fixed window width
+    (the ceiling of samples_per_frame) so the output array is rectangular.
+    Returns both the padded audio chunks and the valid sample count for each
+    frame before zero padding.
+    """
+    samples_per_frame = sample_rate / fps
+    window_size = int(np.ceil(samples_per_frame))
+    boundaries = np.round(np.arange(n_frames + 1) * samples_per_frame).astype(np.int64)
+
+    out = np.zeros((n_frames, window_size), dtype=audio.dtype)
+    lengths = np.zeros((n_frames,), dtype=np.uint16)
+    for i in range(n_frames):
+        start = int(boundaries[i])
+        end = min(int(boundaries[i + 1]), len(audio))
+        length = min(end - start, window_size)
+        if length > 0:
+            out[i, :length] = audio[start : start + length]
+            lengths[i] = length
+    return out, lengths
+
+
+def probe_fps(avi_path: Path) -> float:
+    """Read the video frame rate from an AVI file via ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(avi_path),
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"ffprobe failed on {avi_path.name}")
+    num, den = result.stdout.strip().split("/")
+    return int(num) / int(den)
+
+
 def scan_raw_recordings() -> list[Path]:
     """Find recording base paths in RAW_DIR (keyed by .ram.npy presence)."""
     return [
@@ -151,7 +224,7 @@ def main():
             # Also delete periodic save-state directory if present
             states_dir = Path(str(base) + "_states")
             if states_dir.is_dir():
-                import shutil
+
                 shutil.rmtree(states_dir)
         else:
             valid_bases.append(base)
@@ -263,16 +336,27 @@ def main():
         actions_out = act_remap[actions]
         ram_out = ram[:, kept_cols]
 
+        # Extract frame-aligned mono audio at the target sample rate
+        fps = probe_fps(avi)
+        raw_audio = decode_audio(avi)
+        audio_out, audio_lengths = frame_aligned_audio(raw_audio, n, fps)
+        del raw_audio
+
         out_path = OUT_DIR / (base.name + ".npz")
         np.savez_compressed(
             str(out_path),
             frames=frames_out,
             actions=actions_out,
             ram=ram_out,
+            audio=audio_out,
+            audio_lengths=audio_lengths,
+            audio_sample_rate=np.int32(AUDIO_SAMPLE_RATE),
+            video_fps=np.float32(fps),
         )
         print(f"  Saved {out_path.name}  "
-              f"frames={frames_out.shape} actions={actions_out.shape} ram={ram_out.shape}")
-        del frames_out, actions_out, ram_out
+              f"frames={frames_out.shape} actions={actions_out.shape} "
+              f"ram={ram_out.shape} audio={audio_out.shape}")
+        del frames_out, actions_out, ram_out, audio_out, audio_lengths
 
     print(f"\nDone. Output in {OUT_DIR}")
 
