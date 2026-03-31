@@ -109,6 +109,7 @@ class NormalizedSequenceDataset(Dataset):
         data_dir: str | Path,
         clip_frames: int,
         *,
+        include_frames: bool = True,
         include_audio: bool = False,
         include_actions: bool = False,
         stride: int = 1,
@@ -129,6 +130,7 @@ class NormalizedSequenceDataset(Dataset):
 
         self.data_dir = Path(data_dir)
         self.clip_frames = clip_frames
+        self.include_frames = include_frames
         self.include_audio = include_audio
         self.include_actions = include_actions
         self.stride = stride
@@ -311,7 +313,7 @@ class NormalizedSequenceDataset(Dataset):
             with np.load(self.data_files[0], mmap_mode="r") as probe_npz:
                 probe_frames = probe_npz["frames"]
                 bytes_per_frame = int(math.prod(probe_frames.shape[1:]) * probe_frames.dtype.itemsize)
-                total_bytes = self.total_frames * bytes_per_frame
+                total_bytes = self.total_frames * bytes_per_frame if self.include_frames else 0
 
                 if self.include_actions:
                     probe_actions = probe_npz["actions"]
@@ -334,7 +336,8 @@ class NormalizedSequenceDataset(Dataset):
                     f"{available / 2**30:.1f} GB available)..."
                 )
 
-                self.frames_by_file = [None] * self.num_files
+                if self.include_frames:
+                    self.frames_by_file = [None] * self.num_files
                 if self.include_actions:
                     self.actions_by_file = [None] * self.num_files
                 if self.include_audio:
@@ -343,7 +346,7 @@ class NormalizedSequenceDataset(Dataset):
 
                 def _load_file(file_idx: int):
                     with np.load(self.data_files[file_idx]) as npz:
-                        frames = np.asarray(npz["frames"])
+                        frames = np.asarray(npz["frames"]) if self.include_frames else None
                         actions = np.asarray(npz["actions"]) if self.include_actions else None
                         audio = np.asarray(npz["audio"]) if self.include_audio else None
                         lengths = None
@@ -353,7 +356,8 @@ class NormalizedSequenceDataset(Dataset):
                             if "audio_lengths" in npz.files:
                                 lengths = np.asarray(npz["audio_lengths"], dtype=np.int32)
                             else:
-                                lengths = np.full((frames.shape[0],), audio.shape[1], dtype=np.int32)
+                                num_frames = audio.shape[0]
+                                lengths = np.full((num_frames,), audio.shape[1], dtype=np.int32)
                             if "audio_sample_rate" in npz.files:
                                 sample_rate = int(np.asarray(npz["audio_sample_rate"]).item())
                             if "video_fps" in npz.files:
@@ -380,7 +384,8 @@ class NormalizedSequenceDataset(Dataset):
                             load_task = progress.add_task("Loading files into RAM", total=self.num_files, rate=0.0)
                             for future in concurrent.futures.as_completed(futures):
                                 file_idx, frames, actions, audio, lengths, sample_rate, video_fps = future.result()
-                                self.frames_by_file[file_idx] = frames
+                                if self.include_frames and self.frames_by_file is not None:
+                                    self.frames_by_file[file_idx] = frames
                                 if self.include_actions and self.actions_by_file is not None:
                                     self.actions_by_file[file_idx] = actions
                                 if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
@@ -397,7 +402,8 @@ class NormalizedSequenceDataset(Dataset):
                     else:
                         for future in concurrent.futures.as_completed(futures):
                             file_idx, frames, actions, audio, lengths, sample_rate, video_fps = future.result()
-                            self.frames_by_file[file_idx] = frames
+                            if self.include_frames and self.frames_by_file is not None:
+                                self.frames_by_file[file_idx] = frames
                             if self.include_actions and self.actions_by_file is not None:
                                 self.actions_by_file[file_idx] = actions
                             if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
@@ -419,7 +425,9 @@ class NormalizedSequenceDataset(Dataset):
                                 )
                                 last_load_report = now
 
-                loaded_bytes = int(sum(frames.nbytes for frames in self.frames_by_file if frames is not None))
+                loaded_bytes = 0
+                if self.frames_by_file is not None:
+                    loaded_bytes += int(sum(frames.nbytes for frames in self.frames_by_file if frames is not None))
                 if self.include_actions and self.actions_by_file is not None:
                     loaded_bytes += int(sum(actions.nbytes for actions in self.actions_by_file if actions is not None))
                 if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
@@ -451,23 +459,26 @@ class NormalizedSequenceDataset(Dataset):
         file_idx, start_idx = self.samples[idx]
         end_idx = start_idx + self.clip_frames
 
-        if self.frames_by_file is not None:
-            frames = self.frames_by_file[file_idx][start_idx:end_idx]
-            npz = None
-        else:
-            npz = self._get_npz(file_idx)
-            frames = np.asarray(npz["frames"][start_idx:end_idx])
-
+        npz = None
         sample: dict[str, Any] = {
-            "frames": torch.from_numpy(np.asarray(frames).copy()),
             "file_idx": file_idx,
             "start_idx": start_idx,
         }
+
+        if self.include_frames:
+            if self.frames_by_file is not None:
+                frames = self.frames_by_file[file_idx][start_idx:end_idx]
+            else:
+                npz = self._get_npz(file_idx)
+                frames = np.asarray(npz["frames"][start_idx:end_idx])
+            sample["frames"] = torch.from_numpy(np.asarray(frames).copy())
 
         if self.include_actions:
             if self.actions_by_file is not None:
                 actions = self.actions_by_file[file_idx][start_idx:end_idx]
             else:
+                if npz is None:
+                    npz = self._get_npz(file_idx)
                 actions = np.asarray(npz["actions"][start_idx:end_idx])
             sample["actions"] = torch.from_numpy(np.asarray(actions).copy())
 
@@ -478,6 +489,8 @@ class NormalizedSequenceDataset(Dataset):
                 sample_rate = self.audio_sample_rate_by_file[file_idx]
                 video_fps = self.video_fps_by_file[file_idx]
             else:
+                if npz is None:
+                    npz = self._get_npz(file_idx)
                 audio = np.asarray(npz["audio"][start_idx:end_idx])
                 if "audio_lengths" in npz.files:
                     lengths = np.asarray(npz["audio_lengths"][start_idx:end_idx], dtype=np.int32)

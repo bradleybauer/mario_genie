@@ -170,6 +170,7 @@ def evaluate(
     recon_losses: list[float] = []
     kl_losses: list[float] = []
     preview: tuple[torch.Tensor, torch.Tensor] | None = None
+    preview_energy = -1.0
     with torch.no_grad():
         for batch in loader:
             audio = batch["audio"].to(device, non_blocking=True).float() / 32768.0
@@ -204,7 +205,9 @@ def evaluate(
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
-            if preview is None:
+            energy = float(mel[0].mean())
+            if energy > preview_energy:
+                preview_energy = energy
                 preview = (mel.detach().cpu(), outputs.reconstruction.detach().cpu())
     model.train()
 
@@ -287,6 +290,7 @@ def main() -> None:
     dataset = NormalizedSequenceDataset(
         data_dir=args.data_dir,
         clip_frames=args.clip_frames,
+        include_frames=False,
         include_audio=True,
         num_workers=args.num_workers,
         system_info=system_info,
@@ -543,23 +547,33 @@ def main() -> None:
                 if preview is not None:
                     save_mel_preview(output_dir / f"preview_step_{step:06d}.png", preview[0], preview[1])
 
-                # Random training sample preview
+                # Random training sample preview — pick the loudest of a few batches
                 with torch.no_grad():
-                    train_batch = next(train_iter)
-                    train_audio = train_batch["audio"].to(device, non_blocking=True).float() / 32768.0
-                    train_audio_lengths = train_batch["audio_lengths"]
-                    if bool(torch.all(train_audio_lengths == train_audio.shape[-1])):
-                        train_waveform = train_audio.reshape(train_audio.shape[0], -1)
-                    else:
-                        train_waveform = frame_audio_to_waveform(train_audio, train_audio_lengths)
-                    train_mel = mel_extractor(train_waveform)
-                    train_outputs = model(train_mel)
-                    save_mel_preview(
-                        output_dir / f"train_preview_step_{step:06d}.png",
-                        train_mel.detach().cpu(),
-                        train_outputs.reconstruction.detach().cpu(),
-                        title_prefix="[Train] ",
-                    )
+                    best_train_mel = None
+                    best_train_recon = None
+                    best_train_energy = -1.0
+                    for _ in range(5):
+                        train_batch = next(train_iter)
+                        train_audio = train_batch["audio"].to(device, non_blocking=True).float() / 32768.0
+                        train_audio_lengths = train_batch["audio_lengths"]
+                        if bool(torch.all(train_audio_lengths == train_audio.shape[-1])):
+                            train_waveform = train_audio.reshape(train_audio.shape[0], -1)
+                        else:
+                            train_waveform = frame_audio_to_waveform(train_audio, train_audio_lengths)
+                        train_mel = mel_extractor(train_waveform)
+                        energy = float(train_mel[0].mean())
+                        if energy > best_train_energy:
+                            best_train_energy = energy
+                            train_outputs = model(train_mel)
+                            best_train_mel = train_mel.detach().cpu()
+                            best_train_recon = train_outputs.reconstruction.detach().cpu()
+                    if best_train_mel is not None:
+                        save_mel_preview(
+                            output_dir / f"train_preview_step_{step:06d}.png",
+                            best_train_mel,
+                            best_train_recon,
+                            title_prefix="[Train] ",
+                        )
 
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]

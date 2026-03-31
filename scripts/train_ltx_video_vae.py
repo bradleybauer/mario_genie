@@ -450,6 +450,19 @@ def main() -> None:
                         palette,
                     )
 
+                # Random training sample preview
+                with torch.no_grad():
+                    train_batch = next(train_iter)
+                    train_frames = train_batch["frames"].to(device, non_blocking=True).long()
+                    train_inputs = frames_to_one_hot(train_frames, num_colors)
+                    train_outputs = model(train_inputs)
+                    save_video_preview(
+                        output_dir / f"train_preview_step_{step:06d}.png",
+                        train_frames.detach().cpu(),
+                        train_outputs.logits.detach().cpu(),
+                        palette,
+                    )
+
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]
                     save_training_state(
