@@ -181,24 +181,6 @@ MODEL_CONFIGS: list[ModelConfig] = [
 MODEL_CONFIGS_BY_NAME: dict[str, ModelConfig] = {m.name: m for m in MODEL_CONFIGS}
 
 
-# ── Genie 2 VAE config ────────────────────────────────────────────
-
-GENIE2_CONFIG = ModelConfig(
-    name="genie2_vae",
-    init_dim=32,
-    codebook_size=0,     # continuous latents, no codebook
-    layers="",           # not used — FrameVAE has its own architecture
-    scale_name="genie2",
-    attention_name="plain",
-    num_codebooks=0,
-    sequence_length=1,   # frame-independent
-    model_type="genie2",
-)
-
-MODEL_CONFIGS.append(GENIE2_CONFIG)
-MODEL_CONFIGS_BY_NAME[GENIE2_CONFIG.name] = GENIE2_CONFIG
-
-
 if __name__ == "__main__":
     import sys, os, math
 

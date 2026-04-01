@@ -4,7 +4,8 @@
 Reads data/raw/ and produces data/normalized/:
   - Per-recording .npz files with palette-indexed frames, reduced actions,
         reduced RAM columns, frame-aligned audio, and audio metadata.
-  - Shared JSON mapping files (palette.json, actions.json, ram_addresses.json).
+  - Shared JSON mapping files (palette.json, palette_distribution.json,
+      actions.json, ram_addresses.json).
 
 Usage:
     python scripts/normalize.py
@@ -237,6 +238,7 @@ def main():
     # ── Pass 1: collect unique palette/action/RAM stats (no frames kept) ──
     print("Pass 1: scanning metadata and frames for mappings ...")
     used_pal = set()
+    palette_counts_full = np.zeros(len(palette), dtype=np.int64)
     used_act = set()
     ram_min = None
     ram_max = None
@@ -255,6 +257,10 @@ def main():
         cropped = center_crop(rgb)
         pal_idx = rgb_to_palette_indices(cropped, lut, palette)
 
+        palette_counts_full += np.bincount(
+            pal_idx.ravel(),
+            minlength=len(palette),
+        )[:len(palette)]
         used_pal.update(np.unique(pal_idx).tolist())
         used_act.update(np.unique(actions).tolist())
 
@@ -272,6 +278,13 @@ def main():
     pal_remap = np.zeros(len(palette), dtype=np.uint8)
     for new, old in enumerate(used_pal_sorted):
         pal_remap[old] = new
+
+    reduced_palette_counts = palette_counts_full[used_pal_sorted]
+    total_palette_pixels = int(reduced_palette_counts.sum())
+    if total_palette_pixels > 0:
+        reduced_palette_probs = reduced_palette_counts.astype(np.float64) / total_palette_pixels
+    else:
+        reduced_palette_probs = np.zeros_like(reduced_palette_counts, dtype=np.float64)
 
     used_act_sorted = sorted(used_act)
     act_remap = np.zeros(256, dtype=np.uint8)
@@ -296,6 +309,12 @@ def main():
         "reduced_to_original_index": used_pal_sorted,
         "colors_rgb": [palette[i].tolist() for i in used_pal_sorted],
     }
+    palette_distribution_info = {
+        "num_colors": len(used_pal_sorted),
+        "total_pixels": total_palette_pixels,
+        "counts": [int(v) for v in reduced_palette_counts.tolist()],
+        "probabilities": [float(v) for v in reduced_palette_probs.tolist()],
+    }
     action_info = {
         "num_actions": len(used_act_sorted),
         "reduced_to_original_value": used_act_sorted,
@@ -307,6 +326,7 @@ def main():
 
     for name, obj in [
         ("palette.json", palette_info),
+        ("palette_distribution.json", palette_distribution_info),
         ("actions.json", action_info),
         ("ram_addresses.json", ram_info),
     ]:

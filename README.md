@@ -253,10 +253,6 @@ I would like to test num_codebooks=2 and codebook_size=256 which will result in 
 
 Additionally I want to test a version of the video autoencoder with more context frames, a version without temporal downsampling, and a version trained on a cleaner dataset.
 
-A previous result from a single-image VAE, named "FrameVAE", that claude whipped up was quite surprising. It fit a small subset of data perfectly and within a few minutes of training.
-
-Given that result I'm also interested in what the most significant difference is between FrameVAE and my VideoTokenizer. Is it the discrete bottleneck or the temporal convs/downsampling that explain the difference in training efficiency best? I think it's the bottleneck size... VideoTokenizer has 1/16th the number of bits in the bottleneck per frame as FrameVAE, wow.
-
 **Approach:**
 
 Train more models

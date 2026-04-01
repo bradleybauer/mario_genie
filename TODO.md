@@ -18,6 +18,4 @@ Instead of all combinations of architecture variables maybe just define an order
 half res / 2d init
 audio
 bit size / reconstruction expectations
-focal loss?
 gan: what kind of signal really would a gan provide to the decoder?
-pixel shuffle helps avoid checkerboard

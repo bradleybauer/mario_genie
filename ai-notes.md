@@ -97,7 +97,6 @@ Useful interpretations for Mario:
 - **Latent patchify instead of pixel patchify**: keep the current tokenizer, but patchify the continuous latent grid before the transformer. This is cheaper to test and avoids retraining the image front-end immediately.
 
 Low-risk experiment order:
-1. **Latent-grid patchify** on the current FrameVAE latents (`14 x 14`) before the transformer/denoiser replacement.
 2. **Pixel-space patchify** in a small continuous autoencoder baseline, to see whether early patch structure improves optimization or harms fine sprite edges.
 3. **Metatile-aligned patchify** with `16 x 16` spatial units on `256 x 256` inputs or the nearest compatible resized representation.
 
@@ -126,7 +125,7 @@ For autoregressive rollout, mask attention so frame $t$ only attends to frames $
 With 196 spatial tokens × 16 frames = 3,136 tokens, full causal attention is feasible at this model size. Windowed attention optional but not strictly necessary.
 
 ### Key Modifications to LTX for This Project
-1. **Keep existing tokenizer** — reuse the MAGVIT-2 (discrete, 16×16) or FrameVAE (continuous, 14×14) to produce latent patches. No need to train a new 3D VAE.
+1. **Keep existing tokenizer** — reuse the MAGVIT-2 (discrete, 16×16) to produce latent patches. No need to train a new 3D VAE.
 2. **Action conditioning via AdaLN** — replace text cross-attention with adaptive layer norm conditioned on action embeddings.
 3. **Flow matching replaces DDPM** — linear interpolant, velocity prediction, 5–20 sampling steps.
 4. **Causal temporal masking** built into the attention for autoregressive rollout.
@@ -189,12 +188,6 @@ Concatenate audio latent patches with video latent patches in the transformer se
 ```
 
 The DiT jointly denoises both modalities using a shared diffusion timestep, with modality-specific input/output projection layers. This is how recent joint audio-video diffusion models work.
-
-### Parameter Budget
-- Audio VAE: sub-1M params
-- Video tokenizer (existing): ~1.6M params (FrameVAE) or existing MAGVIT
-- Unified DiT: 30–50M params (handles both dynamics prediction and denoising)
-- **Total: well within 20–100M target**
 
 ### What Wouldn't Work Well
 - Full bidirectional spatiotemporal attention over very long sequences at 20M params (but causal/windowed attention is fine).

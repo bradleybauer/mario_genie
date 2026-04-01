@@ -14,12 +14,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from magvit2_pytorch import VideoTokenizer
 from magvit2_pytorch import magvit2_pytorch as magvit_impl
 from magvit2_pytorch.magvit2_pytorch import LossBreakdown
+
+from mario_world_model.losses import focal_cross_entropy
 
 
 _ORIGINAL_RESIDUAL_UNIT = magvit_impl.ResidualUnit
@@ -94,14 +95,24 @@ class PaletteVideoTokenizer(VideoTokenizer):
         num_colors: int,
         dtype: torch.dtype | None = None,
     ) -> Tensor:
-        """``(B, T, H, W)`` long  →  ``(B, K, T, H, W)`` float one-hot."""
+        """``(B, T, H, W)`` long  →  ``(B, K, T, H, W)`` one-hot in ``dtype``.
+
+        Uses ``scatter_`` directly into the output tensor to avoid the large
+        temporary int64 tensor created by ``F.one_hot``.
+        """
         if dtype is None:
             dtype = torch.float32
-        return (
-            F.one_hot(indices.long(), num_colors)
-            .to(dtype=dtype)
-            .permute(0, 4, 1, 2, 3)
+        if indices.ndim != 4:
+            raise ValueError(f"Expected indices with shape (B, T, H, W), got {tuple(indices.shape)}")
+
+        indices = indices.long()
+        one_hot = torch.zeros(
+            (indices.shape[0], num_colors, indices.shape[1], indices.shape[2], indices.shape[3]),
+            dtype=dtype,
+            device=indices.device,
         )
+        one_hot.scatter_(1, indices.unsqueeze(1), 1)
+        return one_hot
 
     # ── forward ─────────────────────────────────────────────────────
 
@@ -120,7 +131,9 @@ class PaletteVideoTokenizer(VideoTokenizer):
         multiscale_adversarial_loss_weight: float | None = None,
         *,
         targets: Tensor | None = None,
-        context_frames: int = 0,
+        context_frames: int = 6,
+        focal_gamma: float = 1.0,
+        class_weight: Tensor | None = None,
     ):
         """Forward pass with optional cross-entropy loss.
 
@@ -158,21 +171,10 @@ class PaletteVideoTokenizer(VideoTokenizer):
             video_contains_first_frame=video_contains_first_frame,
         )
 
-        # if context_frames > 0:
-        #   B, D, latent_T, H, W = x.shape
-        #   downsampling_factor = video_or_images.shape[2] / latent_T
-        #   latent_context_frames = int(context_frames / downsampling_factor)
-        #   mask = torch.ones((B, latent_T, H, W), dtype=torch.bool, device=x.device)
-        #   mask[:, :latent_context_frames, :, :] = False
-        #   mask = mask.reshape(B, -1)
-        # else:
-        #   mask = None
-        mask = None
-
         # Quantize
         (quantized, codes, aux_losses), quantizer_loss_breakdown = (
-            # self.quantizers(x, inv_temperature = 5.0, return_loss_breakdown=True, mask=mask)
-            self.quantizers(x, return_loss_breakdown=True, mask=mask)
+            # self.quantizers(x, inv_temperature = 5.0, return_loss_breakdown=True)
+            self.quantizers(x, return_loss_breakdown=True)
         )
 
         # Decode → (B, K, T, H, W) logits
@@ -188,7 +190,12 @@ class PaletteVideoTokenizer(VideoTokenizer):
             skip_logits = context_frames - self.conv_in_time_pad
             logits = logits[:, :, skip_logits:]
             targets = targets[:, context_frames:]
-        ce_loss = F.cross_entropy(logits, targets)
+        ce_loss = focal_cross_entropy(
+            logits,
+            targets,
+            gamma=focal_gamma,
+            class_weight=class_weight,
+        )
         total_loss = ce_loss + self.quantizer_aux_loss_weight * aux_losses
 
         loss_breakdown = LossBreakdown(

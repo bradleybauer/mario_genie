@@ -7,9 +7,9 @@ import math
 import os
 import random
 import time
+from contextlib import nullcontext
 from datetime import datetime
 import torch
-import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, RandomSampler
 import sys
@@ -34,8 +34,11 @@ from rich.progress import (
 )
 
 from mario_world_model.config import IMAGE_SIZE
+from mario_world_model.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
+from mario_world_model.lfq import swap_tokenizer_lfq
+from mario_world_model.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
 
@@ -53,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
-        "--lr", type=float, default=7e-4)
+        "--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000,
                         help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
     parser.add_argument("--val-interval", type=int, default=200)
@@ -74,12 +77,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tf16", action="store_true",
                         help="Enable TF16")
+    parser.add_argument(
+        "--onehot-dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float16", "bfloat16"],
+        help="Dtype for one-hot input tensors (reduces memory vs float32 when using float16/bfloat16).",
+    )
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        help="Enable CUDA autocast for model forward/decode paths.",
+    )
+    parser.add_argument(
+        "--autocast-dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float16", "bfloat16"],
+        help="Compute dtype for --autocast.",
+    )
     parser.add_argument("--compile", action="store_true",
                         help="Enable graph compilation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval-samples", type=int, default=5000,
                         help="Number of held-out samples for end-of-training evaluation (0 to disable)")
-    _default_workers = min(get_effective_cpu_count(), 64)
+    _default_workers = min(get_effective_cpu_count(), 16)
     parser.add_argument("--num-workers", type=int, default=_default_workers,
                         help=f"Number of DataLoader workers (default: {_default_workers})")
     parser.add_argument(
@@ -131,7 +153,88 @@ def parse_args() -> argparse.Namespace:
         "--resume-from", type=str, default=None,
         help="Path to a training_state*.pt file to resume training from.",
     )
+    parser.add_argument("--focal-gamma", type=float, default=1.0,
+                        help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
+    parser.add_argument(
+        "--use-class-weights",
+        action="store_true",
+        help="Enable class-weighted reconstruction loss using distribution JSON from --data-dir.",
+    )
+    parser.add_argument(
+        "--class-weights-file",
+        type=str,
+        default="palette_distribution.json",
+        help="Distribution JSON filename in --data-dir containing class counts/probabilities.",
+    )
+    parser.add_argument(
+        "--class-weight-soften",
+        type=float,
+        default=0.5,
+        help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
+    )
+    parser.add_argument(
+        "--lfq-entropy-mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "factorized"],
+        help=(
+            "Entropy estimator for LFQ. 'factorized' avoids materializing the "
+            "full (tokens x codebook_size) softmax tensor and is much cheaper "
+            "for large codebooks."
+        ),
+    )
+    parser.add_argument(
+        "--use-gan",
+        action="store_true",
+        help="Enable adversarial training with a compact 3D discriminator.",
+    )
+    parser.add_argument(
+        "--gan-weight",
+        type=float,
+        default=0.1,
+        help="Generator adversarial loss weight.",
+    )
+    parser.add_argument(
+        "--gan-lr",
+        type=float,
+        default=2e-4,
+        help="Discriminator learning rate.",
+    )
+    parser.add_argument(
+        "--gan-start-step",
+        type=int,
+        default=0,
+        help="Global step to start GAN updates.",
+    )
+    parser.add_argument(
+        "--gan-target-size",
+        type=str,
+        default="~5m",
+        choices=["~10m", "~5m"],
+        help="Discriminator size preset.",
+    )
+    parser.add_argument(
+        "--use-lecam",
+        action="store_true",
+        help="Enable LeCAM regularization for discriminator stabilization.",
+    )
+    parser.add_argument(
+        "--lecam-weight",
+        type=float,
+        default=0.1,
+        help="LeCAM regularization weight added to discriminator loss.",
+    )
+    parser.add_argument(
+        "--lecam-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay for LeCAM running real/fake logits.",
+    )
     args = parser.parse_args()
+
+    # Listing configs should work as a lightweight introspection command.
+    if args.list_models:
+        return args
 
     if args.max_steps <= 0 and args.total_steps <= 0:
         parser.error("either --max-steps or --total-steps must be set to a positive integer")
@@ -167,6 +270,44 @@ def _format_bytes(num_bytes: int) -> str:
     if unit == "B":
         return f"{int(value)} {unit}"
     return f"{value:.1f} {unit}"
+
+
+def load_class_weights(
+    data_dir: str,
+    *,
+    num_classes: int,
+    filename: str,
+    soften: float,
+    device: torch.device,
+) -> torch.Tensor:
+    dist_path = Path(data_dir) / filename
+    if not dist_path.is_file():
+        raise FileNotFoundError(
+            f"Class weight distribution file not found: {dist_path}. "
+            "Run scripts/normalize.py first or disable --use-class-weights."
+        )
+
+    with dist_path.open() as handle:
+        dist = json.load(handle)
+
+    counts_data = dist.get("counts")
+    probs_data = dist.get("probabilities")
+    if counts_data is not None:
+        counts = torch.tensor(counts_data, dtype=torch.float32)
+    elif probs_data is not None:
+        counts = torch.tensor(probs_data, dtype=torch.float32)
+    else:
+        raise ValueError(
+            f"{dist_path} must contain either 'counts' or 'probabilities'"
+        )
+
+    if counts.ndim != 1 or counts.numel() != num_classes:
+        raise ValueError(
+            f"{dist_path} has {counts.numel()} classes but model expects {num_classes}"
+        )
+
+    weights = softened_inverse_frequency_weights(counts, soften=soften)
+    return weights.to(device)
 
 
 def _index_file(file_idx, filepath, seq_len):
@@ -310,6 +451,59 @@ class MarioVideoDataset(Dataset):
 def train():
     args = parse_args()
 
+    if args.use_lecam and not args.use_gan:
+        raise SystemExit("--use-lecam requires --use-gan")
+
+    if not (0.0 < args.lecam_decay < 1.0):
+        raise SystemExit("--lecam-decay must be in (0, 1)")
+
+    def hinge_discriminator_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
+        return (torch.relu(1.0 - real_logits) + torch.relu(1.0 + fake_logits)).mean()
+
+    def hinge_generator_loss(fake_logits: torch.Tensor) -> torch.Tensor:
+        return -fake_logits.mean()
+
+    def set_requires_grad(module: torch.nn.Module, enabled: bool) -> None:
+        for parameter in module.parameters():
+            parameter.requires_grad_(enabled)
+
+    class LeCAMEMA:
+        def __init__(self, decay: float) -> None:
+            self.decay = decay
+            self.logits_real_ema: torch.Tensor | None = None
+            self.logits_fake_ema: torch.Tensor | None = None
+
+        def update(self, real_logit_mean: torch.Tensor, fake_logit_mean: torch.Tensor) -> None:
+            real_value = real_logit_mean.detach()
+            fake_value = fake_logit_mean.detach()
+            if self.logits_real_ema is None or self.logits_fake_ema is None:
+                self.logits_real_ema = real_value
+                self.logits_fake_ema = fake_value
+                return
+
+            self.logits_real_ema = self.decay * self.logits_real_ema + (1.0 - self.decay) * real_value
+            self.logits_fake_ema = self.decay * self.logits_fake_ema + (1.0 - self.decay) * fake_value
+
+        def regularizer(self, real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
+            if self.logits_real_ema is None or self.logits_fake_ema is None:
+                return real_logits.new_zeros(())
+
+            reg_real = torch.relu(real_logits - self.logits_fake_ema).pow(2).mean()
+            reg_fake = torch.relu(self.logits_real_ema - fake_logits).pow(2).mean()
+            return reg_real + reg_fake
+
+        def state_dict(self) -> dict[str, torch.Tensor | float | None]:
+            return {
+                "decay": self.decay,
+                "logits_real_ema": self.logits_real_ema,
+                "logits_fake_ema": self.logits_fake_ema,
+            }
+
+        def load_state_dict(self, state: dict[str, torch.Tensor | float | None]) -> None:
+            self.decay = float(state.get("decay", self.decay))
+            self.logits_real_ema = state.get("logits_real_ema")
+            self.logits_fake_ema = state.get("logits_fake_ema")
+
     magvit_configs = [c for c in MODEL_CONFIGS if c.model_type == "magvit2"]
     magvit_configs_by_name = {c.name: c for c in magvit_configs}
 
@@ -424,6 +618,21 @@ def train():
     palette = torch.tensor(palette_info["colors_rgb"], dtype=torch.float32) / 255.0  # (K, 3)
     num_palette_colors = palette.shape[0]
     print(f"[palette] Loaded {num_palette_colors} colours from {palette_path}")
+    class_weight = None
+    if args.use_class_weights:
+        class_weight = load_class_weights(
+            args.data_dir,
+            num_classes=num_palette_colors,
+            filename=args.class_weights_file,
+            soften=args.class_weight_soften,
+            device=device,
+        )
+        print(
+            "[class-weights] Enabled from "
+            f"{Path(args.data_dir) / args.class_weights_file} "
+            f"(soften={args.class_weight_soften:.2f}, "
+            f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
+        )
 
     num_unique_samples = len(dataset)
     gpu_cache = None
@@ -475,6 +684,31 @@ def train():
     # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
     tokenizer.discr = None
     tokenizer.multiscale_discrs = None
+    if args.lfq_entropy_mode != "legacy":
+        swap_tokenizer_lfq(tokenizer, entropy_mode=args.lfq_entropy_mode)
+        print(f"[lfq] Using {args.lfq_entropy_mode} entropy estimator")
+
+    discriminator = None
+    discriminator_optimizer = None
+    lecam_ema = None
+    discriminator_num_parameters = 0
+    if args.use_gan:
+        discriminator = build_palette_discriminator(
+            num_palette_colors,
+            target_size=args.gan_target_size,
+        ).to(device)
+        discriminator_num_parameters = count_trainable_parameters(discriminator)
+        discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
+        if args.use_lecam:
+            lecam_ema = LeCAMEMA(decay=args.lecam_decay)
+        print(
+            f"[gan] Enabled discriminator {args.gan_target_size} "
+            f"({discriminator_num_parameters:,} params), "
+            f"gan_weight={args.gan_weight}, gan_lr={args.gan_lr:.2e}, "
+            f"gan_start_step={args.gan_start_step}, "
+            f"lecam={'on' if args.use_lecam else 'off'}"
+        )
+
     palette = palette.to(device)
     video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, total_frames)
 
@@ -492,6 +726,39 @@ def train():
     elif torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
         print("[tf32] TF32 matmul precision enabled")
+
+    onehot_dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    onehot_dtype = onehot_dtype_map[args.onehot_dtype]
+    onehot_element_size = torch.tensor([], dtype=onehot_dtype).element_size()
+
+    autocast_dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    autocast_enabled = bool(args.autocast and device.type == "cuda")
+    autocast_dtype = autocast_dtype_map[args.autocast_dtype]
+    if args.autocast and device.type != "cuda":
+        print("[autocast] Requested but CUDA is unavailable; disabling autocast.")
+    if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        print("[autocast] bfloat16 unsupported on this GPU; falling back to float16.")
+        autocast_dtype = torch.float16
+    if autocast_enabled:
+        label = "bf16" if autocast_dtype == torch.bfloat16 else "fp16"
+        print(f"[autocast] Enabled ({label})")
+
+    grad_scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=autocast_enabled and autocast_dtype == torch.float16,
+    )
+
+    def autocast_context():
+        if not autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
 
     # ── Count parameters ──
     num_parameters = sum(p.numel() for p in tokenizer.parameters())
@@ -533,6 +800,7 @@ def train():
     config["git_hash"] = os.popen("git rev-parse --short HEAD 2>/dev/null").read().strip() or None
     config["timestamp"] = datetime.now().isoformat()
     config["num_parameters"] = num_parameters
+    config["discriminator_parameters"] = discriminator_num_parameters
     config["system_info"] = system_info
     config_path = os.path.join(args.output_dir, "config.json")
     with open(config_path, "w") as f:
@@ -552,6 +820,17 @@ def train():
         unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
         unwrapped.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
+            if "discriminator" in ckpt and "discriminator_optimizer" in ckpt:
+                discriminator.load_state_dict(ckpt["discriminator"])
+                discriminator_optimizer.load_state_dict(ckpt["discriminator_optimizer"])
+            else:
+                print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
+            if args.use_lecam and lecam_ema is not None:
+                if "lecam_ema" in ckpt:
+                    lecam_ema.load_state_dict(ckpt["lecam_ema"])
+                else:
+                    print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
         if not args.constant_lr:
             try:
                 scheduler.load_state_dict(ckpt['scheduler'])
@@ -590,8 +869,8 @@ def train():
     _perf_window_steps = 0
     _perf_window_samples = 0
     _PERF_WINDOW = 20  # rolling window size in steps
-    # Bytes per sample for throughput: one-hot input (B, K, T, H, W) float32
-    _bytes_per_sample = num_palette_colors * total_frames * IMAGE_SIZE * IMAGE_SIZE * 4
+    # Bytes per sample for throughput: one-hot input (B, K, T, H, W) in selected dtype
+    _bytes_per_sample = num_palette_colors * total_frames * IMAGE_SIZE * IMAGE_SIZE * onehot_element_size
 
     def _gpu_stats():
         """Return dict of GPU stats, or empty dict if unavailable."""
@@ -644,13 +923,16 @@ def train():
         tokenizer.eval()
         with torch.no_grad():
             inp = PaletteVideoTokenizer.indices_to_onehot(
-                batch.long().to(device), num_palette_colors,
+                batch.long().to(device),
+                num_palette_colors,
+                dtype=onehot_dtype,
             )
-            codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-            recon_video = tokenizer.decode_from_code_indices(
-                codes,
-                video_contains_first_frame=video_contains_first_frame,
-            )
+            with autocast_context():
+                codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                recon_video = tokenizer.decode_from_code_indices(
+                    codes,
+                    video_contains_first_frame=video_contains_first_frame,
+                )
             # recon has fewer temporal frames (conv_in eats conv_in_time_pad)
             unwrapped_model = getattr(tokenizer, '_orig_mod', tokenizer)
             time_pad = getattr(unwrapped_model, 'conv_in_time_pad', 0)
@@ -692,12 +974,18 @@ def train():
                 eval_batch = eval_batch.to(device, non_blocking=True)
                 last_eval_batch = eval_batch
                 targets = eval_batch.long()
-                inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
-                codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
-                code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
-                recon_video = tokenizer.decode_from_code_indices(
-                    codes, video_contains_first_frame=video_contains_first_frame,
+                inp = PaletteVideoTokenizer.indices_to_onehot(
+                    targets,
+                    num_palette_colors,
+                    dtype=onehot_dtype,
                 )
+                with autocast_context():
+                    codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
+                code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
+                with autocast_context():
+                    recon_video = tokenizer.decode_from_code_indices(
+                        codes, video_contains_first_frame=video_contains_first_frame,
+                    )
                 del codes, inp
                 # Mask context frames from eval metrics.
                 # conv_in eats conv_in_time_pad frames (no temporal F.pad),
@@ -705,9 +993,16 @@ def train():
                 unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
                 time_pad = getattr(unwrapped, 'conv_in_time_pad', 0)
                 skip_recon = max(ctx_frames - time_pad, 0) if ctx_frames > 0 else 0
-                eval_recon = recon_video[:, :, skip_recon:]
+                eval_recon = recon_video[:, :, skip_recon:].float()
                 eval_tgt = targets[:, ctx_frames:]
-                eval_losses.append(F.cross_entropy(eval_recon, eval_tgt).item())
+                eval_losses.append(
+                    focal_cross_entropy(
+                        eval_recon,
+                        eval_tgt,
+                        gamma=args.focal_gamma,
+                        class_weight=class_weight,
+                    ).item()
+                )
                 recon_idx = eval_recon.argmax(dim=1)
                 total_pixels += eval_tgt.numel()
                 correct_pixels += (recon_idx == eval_tgt).sum().item()
@@ -766,6 +1061,13 @@ def train():
 
     global_step = start_step
     consecutive_ooms = 0
+    gan_discr_loss_value = 0.0
+    gan_gen_loss_value = 0.0
+    gan_real_logit_value = 0.0
+    gan_fake_logit_value = 0.0
+    gan_lecam_reg_value = 0.0
+    gan_lecam_ema_real_value = 0.0
+    gan_lecam_ema_fake_value = 0.0
     for batch in batch_iter():
         if args.max_steps > 0 and global_step >= args.max_steps:
             print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
@@ -774,20 +1076,85 @@ def train():
         if gpu_cache is None:
             batch = batch.to(device, non_blocking=True)
 
+        gan_active = args.use_gan and global_step >= args.gan_start_step
+        gan_discr_loss_value = 0.0
+        gan_gen_loss_value = 0.0
+        gan_real_logit_value = 0.0
+        gan_fake_logit_value = 0.0
+        gan_lecam_reg_value = 0.0
+        gan_lecam_ema_real_value = 0.0
+        gan_lecam_ema_fake_value = 0.0
+
         optimizer.zero_grad()
         try:
             targets = batch.long()
             inp = PaletteVideoTokenizer.indices_to_onehot(
                 targets, num_palette_colors,
+                dtype=onehot_dtype,
             )
-            loss, loss_breakdown = tokenizer(
-                inp,
-                targets=targets,
-                return_loss=True,
-                video_contains_first_frame=video_contains_first_frame,
-                context_frames=ctx_frames,
-            )
-            loss.backward()
+
+            if gan_active and discriminator is not None and discriminator_optimizer is not None:
+                set_requires_grad(discriminator, True)
+                discriminator_optimizer.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    with autocast_context():
+                        fake_logits_for_discriminator = tokenizer(
+                            inp,
+                            return_loss=False,
+                            video_contains_first_frame=video_contains_first_frame,
+                        )
+                real_video = inp.float()
+                fake_video = fake_logits_for_discriminator.float().softmax(dim=1)
+                real_scores = discriminator(real_video)
+                fake_scores = discriminator(fake_video)
+                discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
+                if args.use_lecam and lecam_ema is not None:
+                    lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
+                    gan_lecam_reg_value = lecam_reg.item()
+                    discr_loss = discr_loss + args.lecam_weight * lecam_reg
+                discr_loss.backward()
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                discriminator_optimizer.step()
+
+                if args.use_lecam and lecam_ema is not None:
+                    lecam_ema.update(real_scores.mean(), fake_scores.mean())
+                    if lecam_ema.logits_real_ema is not None:
+                        gan_lecam_ema_real_value = float(lecam_ema.logits_real_ema.item())
+                    if lecam_ema.logits_fake_ema is not None:
+                        gan_lecam_ema_fake_value = float(lecam_ema.logits_fake_ema.item())
+
+                gan_discr_loss_value = discr_loss.item()
+                gan_real_logit_value = real_scores.mean().item()
+                gan_fake_logit_value = fake_scores.mean().item()
+
+            with autocast_context():
+                loss, loss_breakdown = tokenizer(
+                    inp,
+                    targets=targets,
+                    return_loss=True,
+                    video_contains_first_frame=video_contains_first_frame,
+                    context_frames=ctx_frames,
+                    focal_gamma=args.focal_gamma,
+                    class_weight=class_weight,
+                )
+
+            if gan_active and discriminator is not None:
+                set_requires_grad(discriminator, False)
+                with autocast_context():
+                    fake_logits_for_generator = tokenizer(
+                        inp,
+                        return_loss=False,
+                        video_contains_first_frame=video_contains_first_frame,
+                    )
+                generator_fake_video = fake_logits_for_generator.float().softmax(dim=1)
+                gen_adv_loss = hinge_generator_loss(discriminator(generator_fake_video))
+                gan_gen_loss_value = gen_adv_loss.item()
+                loss = loss + args.gan_weight * gen_adv_loss
+
+            if grad_scaler.is_enabled():
+                grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
         except torch.cuda.OutOfMemoryError:
             optimizer.zero_grad(set_to_none=True)
             inp = targets = batch = loss = loss_breakdown = None
@@ -805,8 +1172,14 @@ def train():
             global_step += 1
             continue
         consecutive_ooms = 0
+        if grad_scaler.is_enabled():
+            grad_scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(tokenizer.parameters(), max_norm=1.0)
-        optimizer.step()
+        if grad_scaler.is_enabled():
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
         scheduler.step()
 
         current_lr = optimizer.param_groups[0]['lr']
@@ -853,6 +1226,11 @@ def train():
             'samp/s': f"{_samples_per_sec:.0f}",
             'MB/s': f"{_samples_per_sec * _bytes_per_sample / 2**20:.0f}",
         }
+        if gan_active:
+            postfix['g_adv'] = f"{gan_gen_loss_value:.4f}"
+            postfix['d'] = f"{gan_discr_loss_value:.4f}"
+            if args.use_lecam:
+                postfix['lecam'] = f"{gan_lecam_reg_value:.4f}"
         gs = _gpu_stats()
         if 'gpu_util_pct' in gs:
             postfix['gpu'] = f"{gs['gpu_util_pct']}%"
@@ -894,6 +1272,14 @@ def train():
                 "data_throughput_mbps": round(_samples_per_sec * _bytes_per_sample / 2**20, 1),
                 "steps_per_sec": round(_steps_per_sec, 2),
                 "total_samples": _total_sample_count,
+                "gan_enabled": bool(gan_active),
+                "gan_generator_loss": float(gan_gen_loss_value),
+                "gan_discriminator_loss": float(gan_discr_loss_value),
+                "gan_real_logit": float(gan_real_logit_value),
+                "gan_fake_logit": float(gan_fake_logit_value),
+                "gan_lecam_reg": float(gan_lecam_reg_value),
+                "gan_lecam_ema_real": float(gan_lecam_ema_real_value),
+                "gan_lecam_ema_fake": float(gan_lecam_ema_fake_value),
                 **gs,
             }
             metrics_log.append(step_metrics)
@@ -929,6 +1315,11 @@ def train():
                 'metrics_log': metrics_log,
                 'total_samples': _total_sample_count,
             }
+            if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
+                _training_state['discriminator'] = discriminator.state_dict()
+                _training_state['discriminator_optimizer'] = discriminator_optimizer.state_dict()
+                if args.use_lecam and lecam_ema is not None:
+                    _training_state['lecam_ema'] = lecam_ema.state_dict()
             torch.save(_training_state, os.path.join(args.output_dir, "training_state_latest.pt"))
 
             if eval_dataset is not None:
@@ -984,6 +1375,14 @@ def train():
         "steps_per_sec": round(_perf_step_count / max(total_elapsed, 1e-9), 2),
         "total_samples": _total_sample_count,
         "total_steps": global_step,
+        "gan_enabled": bool(args.use_gan and global_step >= args.gan_start_step),
+        "gan_generator_loss": float(gan_gen_loss_value),
+        "gan_discriminator_loss": float(gan_discr_loss_value),
+        "gan_real_logit": float(gan_real_logit_value),
+        "gan_fake_logit": float(gan_fake_logit_value),
+        "gan_lecam_reg": float(gan_lecam_reg_value),
+        "gan_lecam_ema_real": float(gan_lecam_ema_real_value),
+        "gan_lecam_ema_fake": float(gan_lecam_ema_fake_value),
         **gs,
     }
     if not metrics_log or metrics_log[-1]["step"] != global_step:
@@ -1014,15 +1413,27 @@ def train():
         'metrics_log': metrics_log,
         'total_samples': _total_sample_count,
     }
+    if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
+        training_state['discriminator'] = discriminator.state_dict()
+        training_state['discriminator_optimizer'] = discriminator_optimizer.state_dict()
+        if args.use_lecam and lecam_ema is not None:
+            training_state['lecam_ema'] = lecam_ema.state_dict()
     state_path = os.path.join(args.output_dir, "training_state_latest.pt")
     torch.save(training_state, state_path)
     print(f"Training state saved to {state_path}")
     _optimizer_sd = training_state['optimizer']
     _scheduler_sd = training_state['scheduler']
+    _discriminator_sd = training_state.get('discriminator')
+    _discriminator_optimizer_sd = training_state.get('discriminator_optimizer')
+    _lecam_ema_sd = training_state.get('lecam_ema')
     del training_state, model_sd
 
     # Free training-only objects before eval to reduce RSS
     del optimizer, scheduler, dataloader
+    if args.use_gan and discriminator_optimizer is not None:
+        del discriminator_optimizer
+    if args.use_gan and discriminator is not None:
+        del discriminator
     # Drop training dataset and its mmap handles to release resident pages
     if hasattr(dataset, '_mmap_cache'):
         dataset._mmap_cache.clear()
@@ -1058,6 +1469,15 @@ def train():
                 'best_eval_recon': best_eval_recon,
                 'metrics_log': metrics_log,
                 'total_samples': _total_sample_count,
+                **(
+                    {
+                        'discriminator': _discriminator_sd,
+                        'discriminator_optimizer': _discriminator_optimizer_sd,
+                        'lecam_ema': _lecam_ema_sd,
+                    }
+                    if _discriminator_sd is not None and _discriminator_optimizer_sd is not None
+                    else {}
+                ),
             }, os.path.join(args.output_dir, "training_state_best.pt"))
             del _best_sd
             print(f"[final] New best eval_recon_loss={best_eval_recon:.6f} → saved *_best.pt")

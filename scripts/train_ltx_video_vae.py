@@ -12,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from rich.console import Console
 from rich.progress import (
@@ -33,6 +32,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from mario_world_model.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from mario_world_model.ltx_video_vae import LTXVideoVAE
 from mario_world_model.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from mario_world_model.system_info import collect_system_info, print_system_info
@@ -75,8 +75,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--focal-gamma", type=float, default=1.0,
+                        help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
+    parser.add_argument(
+        "--use-class-weights",
+        action="store_true",
+        help="Enable class-weighted reconstruction loss using distribution JSON from --data-dir.",
+    )
+    parser.add_argument(
+        "--class-weights-file",
+        type=str,
+        default="palette_distribution.json",
+        help="Distribution JSON filename in --data-dir containing class counts/probabilities.",
+    )
+    parser.add_argument(
+        "--class-weight-soften",
+        type=float,
+        default=0.5,
+        help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
+    )
     parser.add_argument("--resume-from", type=str, default=None)
     return parser.parse_args()
+
+
+def load_class_weights(
+    data_dir: str,
+    *,
+    num_classes: int,
+    filename: str,
+    soften: float,
+    device: torch.device,
+) -> torch.Tensor:
+    dist_path = Path(data_dir) / filename
+    if not dist_path.is_file():
+        raise FileNotFoundError(
+            f"Class weight distribution file not found: {dist_path}. "
+            "Run scripts/normalize.py first or disable --use-class-weights."
+        )
+
+    with dist_path.open() as handle:
+        dist = json.load(handle)
+
+    counts_data = dist.get("counts")
+    probs_data = dist.get("probabilities")
+    if counts_data is not None:
+        counts = torch.tensor(counts_data, dtype=torch.float32)
+    elif probs_data is not None:
+        counts = torch.tensor(probs_data, dtype=torch.float32)
+    else:
+        raise ValueError(
+            f"{dist_path} must contain either 'counts' or 'probabilities'"
+        )
+
+    if counts.ndim != 1 or counts.numel() != num_classes:
+        raise ValueError(
+            f"{dist_path} has {counts.numel()} classes but model expects {num_classes}"
+        )
+
+    weights = softened_inverse_frequency_weights(counts, soften=soften)
+    return weights.to(device)
 
 
 def seed_everything(seed: int) -> None:
@@ -97,7 +154,17 @@ def make_output_dir(args: argparse.Namespace) -> Path:
 
 
 def frames_to_one_hot(frames: torch.Tensor, num_colors: int) -> torch.Tensor:
-    return F.one_hot(frames.long(), num_classes=num_colors).permute(0, 4, 1, 2, 3).float()
+    if frames.ndim != 4:
+        raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
+
+    frames = frames.long()
+    one_hot = torch.zeros(
+        (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3]),
+        dtype=torch.float32,
+        device=frames.device,
+    )
+    one_hot.scatter_(1, frames.unsqueeze(1), 1)
+    return one_hot
 
 
 def save_video_preview(path: Path, frames: torch.Tensor, logits: torch.Tensor, palette: torch.Tensor, max_frames: int = 8) -> None:
@@ -119,6 +186,8 @@ def evaluate(
     device: torch.device,
     num_colors: int,
     kl_weight: float,
+    focal_gamma: float = 0.0,
+    class_weight: torch.Tensor | None = None,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
     model.eval()
     recon_losses: list[float] = []
@@ -129,7 +198,12 @@ def evaluate(
             frames = batch["frames"].to(device, non_blocking=True).long()
             inputs = frames_to_one_hot(frames, num_colors)
             outputs = model(inputs)
-            recon_loss = F.cross_entropy(outputs.logits, frames)
+            recon_loss = focal_cross_entropy(
+                outputs.logits,
+                frames,
+                gamma=focal_gamma,
+                class_weight=class_weight,
+            )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
@@ -274,6 +348,21 @@ def main() -> None:
     palette = load_palette_tensor(args.data_dir)
     num_colors = palette.shape[0]
     console.print(f"[palette] Loaded {num_colors} colours from {palette_path}")
+    class_weight = None
+    if args.use_class_weights:
+        class_weight = load_class_weights(
+            args.data_dir,
+            num_classes=num_colors,
+            filename=args.class_weights_file,
+            soften=args.class_weight_soften,
+            device=device,
+        )
+        console.print(
+            "[class-weights] Enabled from "
+            f"{Path(args.data_dir) / args.class_weights_file} "
+            f"(soften={args.class_weight_soften:.2f}, "
+            f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
+        )
     model = LTXVideoVAE(
         num_colors=num_colors,
         patch_size=args.patch_size,
@@ -362,7 +451,12 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             outputs = model(inputs)
-            recon_loss = F.cross_entropy(outputs.logits, frames)
+            recon_loss = focal_cross_entropy(
+                outputs.logits,
+                frames,
+                gamma=args.focal_gamma,
+                class_weight=class_weight,
+            )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
             loss.backward()
@@ -431,6 +525,8 @@ def main() -> None:
                     device=device,
                     num_colors=num_colors,
                     kl_weight=args.kl_weight,
+                    focal_gamma=args.focal_gamma,
+                    class_weight=class_weight,
                 )
                 eval_metrics["step"] = step
                 metrics.append(eval_metrics)
