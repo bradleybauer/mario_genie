@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -63,19 +65,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
+    parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=4,
+        help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
+    )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--kl-weight", type=float, default=1e-4)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for eval only (defaults to --batch-size).",
+    )
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
-    parser.add_argument("--base-channels", type=int, default=64)
-    parser.add_argument("--latent-channels", type=int, default=64)
+    parser.add_argument("--base-channels", type=int, default=48)
+    parser.add_argument("--latent-channels", type=int, default=32)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tf16", action="store_true", help="Enable TF16 matmul precision")
+    parser.add_argument(
+        "--onehot-dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float32", "float16", "bfloat16"],
+        help="Dtype for one-hot input tensors (reduces memory vs float32 when using float16/bfloat16).",
+    )
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        help="Enable CUDA autocast for model forward paths.",
+    )
+    parser.add_argument(
+        "--autocast-dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float16", "bfloat16"],
+        help="Compute dtype for --autocast.",
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--focal-gamma", type=float, default=1.0,
                         help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
@@ -144,7 +178,14 @@ def parse_args() -> argparse.Namespace:
         help="EMA decay for LeCAM running real/fake logits.",
     )
     parser.add_argument("--resume-from", type=str, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.context_frames < 0:
+        parser.error("--context-frames must be >= 0")
+    if args.clip_frames <= 0:
+        parser.error("--clip-frames must be > 0")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be > 0")
+    return args
 
 
 def load_class_weights(
@@ -206,18 +247,37 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return getattr(model, "_orig_mod", model)
 
 
-def frames_to_one_hot(frames: torch.Tensor, num_colors: int) -> torch.Tensor:
+def frames_to_one_hot(
+    frames: torch.Tensor,
+    num_colors: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     if frames.ndim != 4:
         raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
 
     frames = frames.long()
     one_hot = torch.zeros(
         (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3]),
-        dtype=torch.float32,
+        dtype=dtype,
         device=frames.device,
     )
     one_hot.scatter_(1, frames.unsqueeze(1), 1)
     return one_hot
+
+
+def split_context_targets(
+    logits: torch.Tensor,
+    frames: torch.Tensor,
+    context_frames: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if context_frames <= 0:
+        return logits, frames
+    if context_frames >= frames.shape[1]:
+        raise ValueError(
+            f"context_frames ({context_frames}) must be smaller than total clip length ({frames.shape[1]})"
+        )
+    return logits[:, :, context_frames:], frames[:, context_frames:]
 
 
 def save_video_preview(path: Path, frames: torch.Tensor, logits: torch.Tensor, palette: torch.Tensor, max_frames: int = 8) -> None:
@@ -239,6 +299,10 @@ def evaluate(
     device: torch.device,
     num_colors: int,
     kl_weight: float,
+    context_frames: int = 0,
+    onehot_dtype: torch.dtype = torch.float32,
+    autocast_enabled: bool = False,
+    autocast_dtype: torch.dtype = torch.bfloat16,
     focal_gamma: float = 0.0,
     class_weight: torch.Tensor | None = None,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
@@ -246,14 +310,22 @@ def evaluate(
     recon_losses: list[float] = []
     kl_losses: list[float] = []
     preview: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def autocast_context():
+        if not autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
+
     with torch.no_grad():
         for batch in loader:
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors)
-            outputs = model(inputs)
+            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype)
+            with autocast_context():
+                outputs = model(inputs)
+            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
             recon_loss = focal_cross_entropy(
-                outputs.logits,
-                frames,
+                recon_logits,
+                recon_targets,
                 gamma=focal_gamma,
                 class_weight=class_weight,
             )
@@ -261,8 +333,12 @@ def evaluate(
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
             if preview is None:
-                preview = (frames.detach().cpu(), outputs.logits.detach().cpu())
+                # Keep only a single sample preview to cap host and device transient memory.
+                preview = (frames[:1].detach().cpu(), outputs.logits[:1].detach().cpu())
+            del recon_logits, recon_targets, recon_loss, kl_loss, outputs, inputs, frames
     model.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if not recon_losses:
         return {"recon_loss": 0.0, "kl_loss": 0.0, "loss": 0.0}, preview
@@ -338,10 +414,47 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"Using device: {device}")
     if torch.cuda.is_available():
+        if args.tf16:
+            torch.set_float32_matmul_precision("medium")
+            console.print("[tf16] TF16 matmul precision enabled")
+        else:
+            torch.set_float32_matmul_precision("high")
+            console.print("[tf32] TF32 matmul precision enabled")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        console.print("[tf32] TF32 matmul precision enabled")
+
+    onehot_dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    onehot_dtype = onehot_dtype_map[args.onehot_dtype]
+
+    autocast_dtype_map = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    autocast_enabled = bool(args.autocast and device.type == "cuda")
+    autocast_dtype = autocast_dtype_map[args.autocast_dtype]
+    if args.autocast and device.type != "cuda":
+        console.print("[autocast] Requested but CUDA is unavailable; disabling autocast.")
+    if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        console.print("[autocast] bfloat16 unsupported on this GPU; falling back to float16.")
+        autocast_dtype = torch.float16
+    if autocast_enabled:
+        label = "bf16" if autocast_dtype == torch.bfloat16 else "fp16"
+        console.print(f"[autocast] Enabled ({label})")
+
+    grad_scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=autocast_enabled and autocast_dtype == torch.float16,
+    )
+
+    def autocast_context():
+        if not autocast_enabled:
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
 
     system_info = collect_system_info()
     print_system_info(system_info)
@@ -349,10 +462,12 @@ def main() -> None:
     output_dir = make_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    total_clip_frames = args.clip_frames + args.context_frames
+
     console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
     dataset = NormalizedSequenceDataset(
         data_dir=args.data_dir,
-        clip_frames=args.clip_frames,
+        clip_frames=total_clip_frames,
         num_workers=args.num_workers,
         system_info=system_info,
     )
@@ -360,7 +475,8 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError("No training samples were found.")
     console.print(
-        f"Found {len(dataset)} sequence segments of {args.clip_frames} frames."
+        f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
+        f"({args.context_frames} context + {args.clip_frames} target)."
     )
     console.print(
         f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
@@ -399,12 +515,13 @@ def main() -> None:
 
     eval_loader = None
     if eval_dataset is not None:
+        eval_batch_size = args.eval_batch_size or args.batch_size
         eval_loader = DataLoader(
             eval_dataset,
-            batch_size=args.batch_size,
+            batch_size=eval_batch_size,
             shuffle=False,
             num_workers=0,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=False,
         )
 
     palette_path = Path(args.data_dir) / "palette.json"
@@ -539,7 +656,7 @@ def main() -> None:
         for step in range(start_step, args.max_steps):
             batch = next(train_iter)
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors)
+            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype)
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
@@ -548,13 +665,20 @@ def main() -> None:
             gan_lecam_reg_value = 0.0
             if bytes_per_sample is None:
                 _, time_steps, height, width = frames.shape
-                bytes_per_sample = num_colors * time_steps * height * width * 4
+                bytes_per_sample = (
+                    num_colors
+                    * time_steps
+                    * height
+                    * width
+                    * torch.tensor([], dtype=onehot_dtype).element_size()
+                )
 
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad():
-                    fake_logits_for_discriminator = model(inputs).logits
+                    with autocast_context():
+                        fake_logits_for_discriminator = model(inputs).logits
                 real_video = inputs.float()
                 fake_video = fake_logits_for_discriminator.float().softmax(dim=1)
                 real_scores = discriminator(real_video)
@@ -574,12 +698,15 @@ def main() -> None:
                 gan_discr_loss_value = discr_loss.item()
                 gan_real_logit_value = real_scores.mean().item()
                 gan_fake_logit_value = fake_scores.mean().item()
+                del fake_logits_for_discriminator, fake_video, real_video, real_scores, fake_scores
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(inputs)
+            with autocast_context():
+                outputs = model(inputs)
+            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, args.context_frames)
             recon_loss = focal_cross_entropy(
-                outputs.logits,
-                frames,
+                recon_logits,
+                recon_targets,
                 gamma=args.focal_gamma,
                 class_weight=class_weight,
             )
@@ -591,10 +718,21 @@ def main() -> None:
                 gen_adv_loss = hinge_generator_loss(discriminator(generator_fake_video))
                 gan_gen_loss_value = gen_adv_loss.item()
                 loss = loss + args.gan_weight * gen_adv_loss
-            loss.backward()
+                del generator_fake_video, gen_adv_loss
+            if grad_scaler.is_enabled():
+                grad_scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            if grad_scaler.is_enabled():
+                grad_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if grad_scaler.is_enabled():
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                optimizer.step()
             scheduler.step()
+            del outputs, recon_logits, recon_targets
 
             perf_window_steps += 1
             perf_window_samples += frames.shape[0]
@@ -661,15 +799,31 @@ def main() -> None:
                 )
             )
             if should_eval:
-                eval_metrics, preview = evaluate(
-                    model,
-                    eval_loader,
-                    device=device,
-                    num_colors=num_colors,
-                    kl_weight=args.kl_weight,
-                    focal_gamma=args.focal_gamma,
-                    class_weight=class_weight,
-                )
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                try:
+                    eval_metrics, preview = evaluate(
+                        model,
+                        eval_loader,
+                        device=device,
+                        num_colors=num_colors,
+                        kl_weight=args.kl_weight,
+                        context_frames=args.context_frames,
+                        onehot_dtype=onehot_dtype,
+                        autocast_enabled=autocast_enabled,
+                        autocast_dtype=autocast_dtype,
+                        focal_gamma=args.focal_gamma,
+                        class_weight=class_weight,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    log_console.print("[eval][OOM] Eval pass OOM; skipping this eval window.")
+                    if torch.cuda.is_available():
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    continue
+
                 eval_metrics["step"] = step
                 metrics.append(eval_metrics)
                 with (output_dir / "metrics.json").open("w") as handle:
@@ -686,22 +840,35 @@ def main() -> None:
                         preview[0],
                         preview[1],
                         palette,
-                        max_frames=args.clip_frames,
+                        max_frames=total_clip_frames,
                     )
 
                 # Random training sample preview
                 with torch.no_grad():
-                    train_batch = next(train_iter)
-                    train_frames = train_batch["frames"].to(device, non_blocking=True).long()
-                    train_inputs = frames_to_one_hot(train_frames, num_colors)
-                    train_outputs = model(train_inputs)
-                    save_video_preview(
-                        output_dir / f"train_preview_step_{step:06d}.png",
-                        train_frames.detach().cpu(),
-                        train_outputs.logits.detach().cpu(),
-                        palette,
-                        max_frames=args.clip_frames,
-                    )
+                    try:
+                        train_batch = next(train_iter)
+                        train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
+                        train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                        with autocast_context():
+                            train_outputs = model(train_inputs)
+                        save_video_preview(
+                            output_dir / f"train_preview_step_{step:06d}.png",
+                            train_frames.detach().cpu(),
+                            train_outputs.logits.detach().cpu(),
+                            palette,
+                            max_frames=total_clip_frames,
+                        )
+                        del train_outputs, train_inputs, train_frames, train_batch
+                    except torch.cuda.OutOfMemoryError:
+                        log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
+                        if torch.cuda.is_available():
+                            gc.collect()
+                            torch.cuda.empty_cache()
+
+                del preview
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]

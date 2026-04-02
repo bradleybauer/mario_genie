@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
+    parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=0,
+        help="Number of leading clip frames used as context; reconstruction losses ignore this prefix.",
+    )
     parser.add_argument("--overfit-n", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
@@ -145,6 +151,11 @@ def parse_args() -> argparse.Namespace:
     if len(args.resblock_kernel_sizes) != len(args.resblock_dilation_sizes):
         parser.error("--resblock-kernel-sizes must match parsed --resblock-dilation-sizes group count")
 
+    if args.context_frames < 0:
+        parser.error("--context-frames must be non-negative")
+    if args.context_frames >= args.clip_frames:
+        parser.error("--context-frames must be smaller than --clip-frames")
+
     return args
 
 
@@ -183,19 +194,61 @@ def build_mel_mask(
     max_time_steps: int,
     n_fft: int,
     hop_length: int,
+    context_lengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if context_lengths is not None and context_lengths.shape != waveform_lengths.shape:
+        raise ValueError(
+            "context_lengths must have same shape as waveform_lengths: "
+            f"got {tuple(context_lengths.shape)} vs {tuple(waveform_lengths.shape)}"
+        )
+
     mask = torch.zeros((waveform_lengths.shape[0], 1, max_time_steps, 1), dtype=torch.float32, device=waveform_lengths.device)
-    for batch_idx, length in enumerate(waveform_lengths.tolist()):
+    context_iter = context_lengths.tolist() if context_lengths is not None else [0] * waveform_lengths.shape[0]
+    for batch_idx, (length, context_length) in enumerate(zip(waveform_lengths.tolist(), context_iter, strict=True)):
         valid_steps, _ = mel_time_frequency_shape(int(length), n_fft=n_fft, hop_length=hop_length, center=False)
-        mask[batch_idx, :, : min(valid_steps, max_time_steps)] = 1.0
+        context_steps = 0
+        if context_length > 0:
+            context_steps, _ = mel_time_frequency_shape(int(context_length), n_fft=n_fft, hop_length=hop_length, center=False)
+
+        start_step = min(context_steps, max_time_steps)
+        end_step = min(valid_steps, max_time_steps)
+        if end_step > start_step:
+            mask[batch_idx, :, start_step:end_step] = 1.0
+
     return mask
 
 
-def build_waveform_mask(lengths: torch.Tensor, *, max_samples: int) -> torch.Tensor:
+def build_waveform_mask(
+    lengths: torch.Tensor,
+    *,
+    max_samples: int,
+    context_lengths: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if context_lengths is not None and context_lengths.shape != lengths.shape:
+        raise ValueError(
+            "context_lengths must have same shape as lengths: "
+            f"got {tuple(context_lengths.shape)} vs {tuple(lengths.shape)}"
+        )
+
     mask = torch.zeros((lengths.shape[0], 1, max_samples), dtype=torch.float32, device=lengths.device)
-    for batch_idx, length in enumerate(lengths.tolist()):
-        mask[batch_idx, :, : min(int(length), max_samples)] = 1.0
+    context_iter = context_lengths.tolist() if context_lengths is not None else [0] * lengths.shape[0]
+    for batch_idx, (length, context_length) in enumerate(zip(lengths.tolist(), context_iter, strict=True)):
+        start_sample = min(max(int(context_length), 0), max_samples)
+        end_sample = min(max(int(length), 0), max_samples)
+        if end_sample > start_sample:
+            mask[batch_idx, :, start_sample:end_sample] = 1.0
+
     return mask
+
+
+def context_waveform_lengths(audio_lengths: torch.Tensor, *, context_frames: int) -> torch.Tensor:
+    if audio_lengths.ndim != 2:
+        raise ValueError(f"Expected audio_lengths with shape (B, T), got {tuple(audio_lengths.shape)}")
+    if context_frames <= 0:
+        return torch.zeros(audio_lengths.shape[0], dtype=torch.int64, device=audio_lengths.device)
+
+    capped_context = min(context_frames, audio_lengths.shape[1])
+    return audio_lengths[:, :capped_context].to(dtype=torch.int64).sum(dim=1)
 
 
 class MultiResolutionSTFTLoss(nn.Module):
@@ -386,6 +439,7 @@ def evaluate(
     mel_l1_weight: float,
     stft_sc_weight: float,
     stft_mag_weight: float,
+    context_frames: int = 0,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None]:
     model.eval()
     base_model = unwrap_model(model)
@@ -406,6 +460,10 @@ def evaluate(
 
             waveform = frame_audio_to_waveform(audio, audio_lengths)
             waveform_lengths = audio_lengths.sum(dim=1).to(device)
+            context_lengths = context_waveform_lengths(
+                audio_lengths,
+                context_frames=context_frames,
+            ).to(device)
             mel = mel_extractor(waveform)
 
             mel_mask = build_mel_mask(
@@ -413,19 +471,30 @@ def evaluate(
                 max_time_steps=mel.shape[2],
                 n_fft=n_fft,
                 hop_length=hop_length,
+                context_lengths=context_lengths if context_frames > 0 else None,
             )
 
             target_length = base_model.expected_output_length(mel.shape[2])
             waveform_target = waveform[:, :target_length].unsqueeze(1)
             valid_lengths = waveform_lengths.clamp_max(target_length)
-            waveform_mask = build_waveform_mask(valid_lengths, max_samples=target_length)
+            masked_context_lengths = context_lengths.clamp_max(valid_lengths) if context_frames > 0 else None
+            waveform_mask = build_waveform_mask(
+                valid_lengths,
+                max_samples=target_length,
+                context_lengths=masked_context_lengths,
+            )
 
             prediction = model(mel, output_length=target_length)
             pred_mel = mel_extractor(prediction.squeeze(1))
 
             wave_l1 = masked_l1_loss(prediction, waveform_target, waveform_mask)
             mel_l1 = masked_l1_loss(pred_mel, mel, mel_mask.expand_as(mel))
-            stft_sc, stft_mag = stft_loss(prediction, waveform_target)
+            if context_frames > 0:
+                stft_prediction = prediction * waveform_mask
+                stft_target = waveform_target * waveform_mask
+                stft_sc, stft_mag = stft_loss(stft_prediction, stft_target)
+            else:
+                stft_sc, stft_mag = stft_loss(prediction, waveform_target)
 
             total_loss = (
                 waveform_l1_weight * wave_l1
@@ -502,10 +571,21 @@ def main() -> None:
     console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No audio training samples were found.")
-    console.print(
-        f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-        f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
-    )
+    target_frames = args.clip_frames - args.context_frames
+    if args.context_frames > 0:
+        console.print(
+            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+            f"({args.context_frames} context + {target_frames} target, "
+            f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
+        )
+        console.print(
+            f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
+        )
+    else:
+        console.print(
+            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+            f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
+        )
     console.print(
         f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
         f"{_format_bytes(dataset.dataset_bytes)} on disk."
@@ -694,6 +774,10 @@ def main() -> None:
 
             waveform = frame_audio_to_waveform(audio, audio_lengths)
             waveform_lengths = audio_lengths.sum(dim=1).to(device)
+            context_lengths = context_waveform_lengths(
+                audio_lengths,
+                context_frames=args.context_frames,
+            ).to(device)
 
             mel = mel_extractor(waveform)
             mel_mask = build_mel_mask(
@@ -701,12 +785,18 @@ def main() -> None:
                 max_time_steps=mel.shape[2],
                 n_fft=args.n_fft,
                 hop_length=args.hop_length,
+                context_lengths=context_lengths if args.context_frames > 0 else None,
             )
 
             target_length = unwrap_model(model).expected_output_length(mel.shape[2])
             waveform_target = waveform[:, :target_length].unsqueeze(1)
             valid_lengths = waveform_lengths.clamp_max(target_length)
-            waveform_mask = build_waveform_mask(valid_lengths, max_samples=target_length)
+            masked_context_lengths = context_lengths.clamp_max(valid_lengths) if args.context_frames > 0 else None
+            waveform_mask = build_waveform_mask(
+                valid_lengths,
+                max_samples=target_length,
+                context_lengths=masked_context_lengths,
+            )
 
             optimizer.zero_grad(set_to_none=True)
             prediction = model(mel, output_length=target_length)
@@ -720,7 +810,12 @@ def main() -> None:
 
             wave_l1 = masked_l1_loss(prediction, waveform_target, waveform_mask)
             mel_l1 = masked_l1_loss(pred_mel, mel, mel_mask.expand_as(mel))
-            stft_sc, stft_mag = stft_loss(prediction, waveform_target)
+            if args.context_frames > 0:
+                stft_prediction = prediction * waveform_mask
+                stft_target = waveform_target * waveform_mask
+                stft_sc, stft_mag = stft_loss(stft_prediction, stft_target)
+            else:
+                stft_sc, stft_mag = stft_loss(prediction, waveform_target)
 
             loss = (
                 args.waveform_l1_weight * wave_l1
@@ -802,6 +897,7 @@ def main() -> None:
                     mel_l1_weight=args.mel_l1_weight,
                     stft_sc_weight=args.stft_sc_weight,
                     stft_mag_weight=args.stft_mag_weight,
+                    context_frames=args.context_frames,
                 )
                 eval_metrics["step"] = step
                 metrics.append(eval_metrics)

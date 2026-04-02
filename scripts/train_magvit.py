@@ -310,27 +310,31 @@ def load_class_weights(
     return weights.to(device)
 
 
-def _index_file(file_idx, filepath, seq_len):
+def _index_file(file_idx, filepath, seq_len, *, load_frames=False):
     """Index a normalized .npz file.
 
-    Returns (file_idx, frame_count, samples) where samples is a list of
-    (file_idx, t_start) tuples.
+    Returns (file_idx, frame_count, samples, frame_shape, frames_opt) where
+    samples is a list of (file_idx, t_start) tuples and frames_opt is loaded
+    frame data when load_frames=True.
     """
     try:
-        npz = np.load(filepath, mmap_mode='r')
-        frames = npz['frames']
-        if frames.ndim != 3:
-            print(f"Skipping {filepath}: expected (N, H, W), got ndim={frames.ndim}")
-            return file_idx, 0, []
-        total_t = frames.shape[0]
+        mmap_mode = None if load_frames else 'r'
+        with np.load(filepath, mmap_mode=mmap_mode) as npz:
+            frames = np.asarray(npz['frames']) if load_frames else npz['frames']
+            if frames.ndim != 3:
+                print(f"Skipping {filepath}: expected (N, H, W), got ndim={frames.ndim}")
+                return file_idx, 0, [], None, None
+            total_t = frames.shape[0]
+            frame_shape = tuple(int(dim) for dim in frames.shape[1:])
 
-        if total_t < seq_len:
-            return file_idx, 0, []
-        samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
-        return file_idx, total_t, samples
+            if total_t < seq_len:
+                return file_idx, 0, [], frame_shape, None
+            samples = [(file_idx, t) for t in range(total_t - seq_len + 1)]
+            loaded_frames = frames if load_frames else None
+            return file_idx, total_t, samples, frame_shape, loaded_frames
     except Exception as e:
         print(f"Skipping {filepath} due to error: {e}")
-        return file_idx, 0, []
+        return file_idx, 0, [], None, None
 
 class MarioVideoDataset(Dataset):
     def __init__(
@@ -350,14 +354,24 @@ class MarioVideoDataset(Dataset):
         self.num_files = len(self.data_files)
         self.total_frames = 0
         self.dataset_bytes = sum(Path(path).stat().st_size for path in self.data_files)
+
+        available_memory = get_available_memory(system_info)
+        headroom = 2 * 2**30  # keep 2 GB free
+        # Conservative gate: only pre-load while indexing when disk size is well below RAM budget.
+        preload_during_index = (
+            available_memory > 0
+            and self.dataset_bytes < max(available_memory - headroom, 0) * 0.5
+        )
         
         n_files = len(self.data_files)
         print(f"Indexing {n_files} data files (stride=1)...")
         frame_counts = [0] * n_files
+        frame_shapes = [None] * n_files
+        self.frames_by_file = [None] * n_files if preload_during_index else None
         index_workers = max(num_workers, 1)
         with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as pool:
             futures = {
-                pool.submit(_index_file, idx, f, seq_len): idx
+                pool.submit(_index_file, idx, f, seq_len, load_frames=preload_during_index): idx
                 for idx, f in enumerate(self.data_files)
             }
             with Progress(SpinnerColumn(), TextColumn("{task.description}"),
@@ -365,8 +379,11 @@ class MarioVideoDataset(Dataset):
                           TimeElapsedColumn(), TimeRemainingColumn()) as progress:
                 task = progress.add_task("Indexing files", total=n_files)
                 for future in concurrent.futures.as_completed(futures):
-                    file_idx, total_t, samples = future.result()
+                    file_idx, total_t, samples, frame_shape, loaded_frames = future.result()
                     frame_counts[file_idx] = total_t
+                    frame_shapes[file_idx] = frame_shape
+                    if preload_during_index and self.frames_by_file is not None and loaded_frames is not None:
+                        self.frames_by_file[file_idx] = loaded_frames
                     self.samples.extend(samples)
                     progress.advance(task)
 
@@ -378,7 +395,10 @@ class MarioVideoDataset(Dataset):
             old_to_new = {old: new for new, old in enumerate(valid)}
             self.data_files = [self.data_files[i] for i in valid]
             frame_counts = [frame_counts[i] for i in valid]
+            frame_shapes = [frame_shapes[i] for i in valid]
             self.samples = [(old_to_new[fi], t) for fi, t in self.samples]
+            if self.frames_by_file is not None:
+                self.frames_by_file = [self.frames_by_file[i] for i in valid]
             n_files = len(self.data_files)
 
         self.samples.sort()  # deterministic order regardless of thread completion
@@ -393,15 +413,27 @@ class MarioVideoDataset(Dataset):
         # Decide whether to decompress all frames into RAM or use mmap
         total_frames = sum(frame_counts)
         self.total_frames = total_frames
-        self.frames_by_file = None
         if total_frames > 0:
-            available = get_available_memory(system_info)
-            probe = np.load(self.data_files[0], mmap_mode='r')['frames']
-            bytes_per_frame = math.prod(probe.shape[1:])  # C*H*W, uint8
+            available = available_memory
+            shape_sample = next((shape for shape in frame_shapes if shape is not None), None)
+            if shape_sample is None:
+                raise RuntimeError("Could not determine frame shape during indexing.")
+            bytes_per_frame = math.prod(shape_sample)  # H*W, uint8
             total_bytes = total_frames * bytes_per_frame
-            headroom = 2 * 2**30  # keep 2 GB free
+            ram_budget = available - headroom
 
-            if available > 0 and total_bytes < available - headroom:
+            if self.frames_by_file is not None:
+                if available > 0 and total_bytes < ram_budget:
+                    actual = sum(f.nbytes for f in self.frames_by_file if f is not None)
+                    print(f"Loaded {actual / 2**30:.0f} GB into RAM during indexing (single pass)")
+                else:
+                    print(
+                        f"[index] RAM preload exceeded safe budget ({total_bytes / 2**30:.0f} GB, "
+                        f"{available / 2**30:.0f} GB available). Falling back to mmap."
+                    )
+                    self.frames_by_file = None
+
+            if self.frames_by_file is None and available > 0 and total_bytes < ram_budget:
                 print(f"Loading all frames into RAM ({total_bytes / 2**30:.0f} GB, "
                       f"{available / 2**30:.0f} GB available)...")
                 self.frames_by_file = [None] * n_files
@@ -421,7 +453,7 @@ class MarioVideoDataset(Dataset):
                             progress.advance(task)
                 actual = sum(f.nbytes for f in self.frames_by_file)
                 print(f"Loaded {actual / 2**30:.0f} GB into RAM (COW-shared with workers)")
-            else:
+            elif self.frames_by_file is None:
                 print(f"Dataset too large for RAM ({total_bytes / 2**30:.0f} GB, "
                       f"{available / 2**30:.0f} GB available). Using mmap.")
 
