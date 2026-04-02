@@ -11,6 +11,8 @@
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
 - [Tokenizer Variables To Explore](#tokenizer-variables-to-explore)
+- [Training Recipe](#training-recipe)
+- [LTX Video And Audio VAE](#ltx-video-and-audio-vae)
 
 <br>
 
@@ -289,6 +291,107 @@ Current mel defaults for SMB1 audio:
 - STFT window: Hann
 
 These values came from scanning the full dataset audio distribution. At `24` kHz, about `98.5%` of spectral energy is retained relative to the original audio. Only about `2.5%` of energy falls below `40` Hz, and only about `2.4%` sits above `8` kHz. A `400`-sample window is also convenient because it is almost exactly one NES video frame at `~60.1` FPS, while a `100`-sample hop gives about four mel steps per frame.
+
+
+<br>
+<br>
+
+# Memory Optimizations
+
+**Context:**
+
+Training the palette-based video tokenizer is memory-heavy. The one-hot input tensor `(B, K, T, H, W)` is created via `F.one_hot`, which always returns int64 — 8 bytes per element — even though only 0s and 1s are needed. The model forward pass also runs in float32 by default.
+
+**Approach:**
+
+Two changes: (1) replaced `F.one_hot` with a `scatter_`-based `indices_to_onehot` that writes directly into a tensor of the desired dtype (float32, float16, or bfloat16 via `--onehot-dtype`), avoiding the large int64 intermediate entirely. (2) Added `--autocast` with bfloat16 to run the model forward/backward in half precision.
+
+**Result:**
+
+Cuts memory enough to increase batch size or use larger models on the same GPU. No measurable impact on training quality.
+
+<br>
+<br>
+
+# Training Updates
+
+**Context:**
+
+The baseline cross-entropy loss treats all palette colors equally, but the NES color distribution is extremely skewed — sky blue and black dominate, while rare colors like coin-gold or power-up red appear in a tiny fraction of pixels. The model learns the dominant colors quickly and ignores the rare ones.
+
+Dataset palette distribution (~80.8 billion pixels across 23 colors):
+
+| Rank | Color Index | Probability | Cumulative |
+|------|-------------|-------------|------------|
+| 1    | 4           | 41.60%      | 41.60%     |
+| 2    | 14          | 35.00%      | 76.60%     |
+| 3    | 9           | 5.31%       | 81.92%     |
+| 4    | 18          | 3.85%       | 85.76%     |
+| 5    | 6           | 3.71%       | 89.48%     |
+| 6    | 5           | 2.49%       | 91.96%     |
+| 7–23 | (17 others) | < 2% each   | 100%       |
+
+The top 2 colors alone cover ~77% of all pixels. The rarest color appears in only 0.005% of pixels — a ~8,600× imbalance vs. the most common.
+
+**Approach:**
+
+Three changes layered on top of each other:
+
+1. **Focal loss** (`--focal-gamma`): Down-weights easy (well-classified) pixels so the model spends more capacity on hard ones. Gamma of 1.0 is a mild version; 2.0 is the typical aggressive setting.
+
+2. **Inverse-frequency class weights** (`--use-class-weights`): Weights each palette color by $w_i = p_i^{-\alpha}$ (normalized to mean 1), with default $\alpha = 0.5$. The most frequent color (41.6%) gets weight 0.05, the rarest (0.005%) gets 4.87 — a ~95× ratio. Full inverse-frequency ($\alpha = 1$) would be ~8,600× (probably to large?). Computed offline from `palette_distribution.json`.
+
+3. **GAN with LeCAM regularization** (`--use-gan`, `--use-lecam`): A compact 3D hinge-loss discriminator that pushes reconstructions toward sharper, more realistic output. LeCAM EMA regularization stabilizes discriminator training by penalizing when its real/fake logit gap drifts too far from the running average.
+
+**Result:**
+
+Results look good so far. Model is training. Adding LeCAM regularization made discriminator training actually work.
+
+<br>
+<br>
+
+# LTX Video And Audio VAE
+
+**Context:**
+
+The magvit2 tokenizer (from `magvit2-pytorch`) works but getting good reconstruction quality requires very large codebooks. I'm concerned that as the codebook size grows, learning the dynamics model on top of the discrete codes will become too difficult — the transformer has to predict over an enormous vocabulary. A continuous KL-regularized latent avoids this problem entirely. I also wanted an audio counterpart for the mel spectrograms.
+
+**Approach:**
+
+Wrote two custom VAEs from scratch:
+
+- **LTX Video VAE** (`ltx_video_vae.py`, ~19.3M params): A 3D convolutional VAE with spatial patchify/unpatchify (4×4), causal temporal convolutions, and no temporal downsampling. The encoder uses strided 3D convs for 2 levels of spatial downsampling, residual blocks, and outputs a mean/logvar pair. The decoder mirrors the encoder with nearest-neighbor upsampling. KL-regularized continuous latent space instead of LFQ discrete codes.
+
+- **LTX Audio VAE** (`ltx_audio_vae.py`, ~6.2M params): A 2D convolutional VAE operating on log-mel spectrograms (time × frequency). Same architectural pattern — causal temporal convolutions with 4× temporal compression via strided convs, residual blocks, KL-regularized latent. Outputs L1-reconstructed mel spectrograms.
+
+Both use causal convolutions (replicate-pad the first frame rather than zero-pad) so they can be applied autoregressively without information leaking from the future.
+
+**Result:**
+
+The LTX video VAE converges noticeably faster than the magvit2 baseline on a per-step basis:
+
+| Step  | Magvit2 (13M) recon | LTX Video VAE (19.3M) recon |
+|-------|---------------------|-----------------------------|
+| 1k    | 0.2202              | 0.2048                      |
+| 5k    | 0.0747              | 0.0248                      |
+| 10k   | 0.0510              | 0.0114                      |
+| 20k   | 0.0257              | 0.0076                      |
+| 25k   | 0.0316              | 0.0066                      |
+
+The LTX VAE reached recon loss ~0.007 at 25k steps — a level the magvit2 only hit around 60k+ steps. The LTX VAE also runs at batch size 64 vs magvit2's batch size 4, so it sees far more data per step. KL loss stays low (~2.0) and stable.
+
+The VAE does have periodic KL spikes (e.g. step 2k, 6.6k, 10.8k) where recon loss temporarily jumps, but it recovers quickly each time. Not yet clear what causes them.
+
+<br>
+<br>
+
+# Title
+
+**Context:**
+
+**Approach:**
+
+**Result:**
 
 <!-- Template -->
 

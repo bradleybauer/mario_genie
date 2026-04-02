@@ -39,6 +39,45 @@ $$\text{recon\_loss} = \frac{\ln 2}{B \times T \times H \times W}$$
 
 Example: batch=6, seq_len=16, image_size=224 → $N = 4{,}816{,}896$ pixels → minimum loss ≈ $1.44 \times 10^{-7}$.
 
+## What Signal The GAN Gives The Decoder
+
+In the current palette-video GAN setup, the discriminator does **not** see hard argmax palette indices. It sees the decoder's **softmax probabilities** over palette colors for the full video tensor:
+
+$$x_{fake} = \operatorname{softmax}(z)$$
+
+where $z$ are the decoder logits with shape $(B, K, T, H, W)$. The generator-side adversarial loss is then:
+
+$$\mathcal{L}_{gan} = -D(x_{fake})$$
+
+So compared with cross-entropy, the signal is very different:
+
+- **Cross-entropy / focal CE**: local, per-pixel supervision. It says "increase probability of the ground-truth color here."
+- **GAN**: global/contextual supervision. It says "change the output in whatever way makes this whole clip look more real to the discriminator."
+
+This means a pixel can be "correct" under cross-entropy and still receive nonzero GAN gradient. If the surrounding context is wrong — edge shape, local neighborhood, sprite silhouette, temporal consistency, etc. — the discriminator can still push on that pixel because its score depends on the whole video, not independent pixel labels.
+
+Conceptually the gradient to one decoder logit depends on the discriminator's judgment of many nearby outputs:
+
+$$
+\frac{\partial \mathcal{L}_{gan}}{\partial z_{p,c}}
+=
+\sum_{q,k}
+\frac{\partial \mathcal{L}_{gan}}{\partial x_{q,k}}
+\frac{\partial x_{q,k}}{\partial z_{p,c}}
+$$
+
+So the GAN can provide signal "through" a pixel the decoder already got right, because that pixel participates in a larger structure the discriminator thinks looks fake.
+
+What this likely helps with in this project:
+
+- crisper sprite and HUD edges
+- more coherent local color arrangements
+- cleaner object silhouettes
+- fewer implausible palette mixtures
+- better temporal consistency / less flicker
+
+Important caveat: the current discriminator is a **global** 3D conv discriminator with adaptive average pooling to one logit per sample, not a PatchGAN. So the signal is richer than pure per-pixel cross-entropy, but it is still fairly coarse and global rather than explicitly local.
+
 
 ## LTX-Video 2.3 Style DiT
 

@@ -20,6 +20,7 @@ from magvit2_pytorch import VideoTokenizer
 from magvit2_pytorch import magvit2_pytorch as magvit_impl
 from magvit2_pytorch.magvit2_pytorch import LossBreakdown
 
+from mario_world_model.config import CONTEXT_FRAMES
 from mario_world_model.losses import focal_cross_entropy
 
 
@@ -131,7 +132,7 @@ class PaletteVideoTokenizer(VideoTokenizer):
         multiscale_adversarial_loss_weight: float | None = None,
         *,
         targets: Tensor | None = None,
-        context_frames: int = 6,
+        context_frames: int = CONTEXT_FRAMES,
         focal_gamma: float = 1.0,
         class_weight: Tensor | None = None,
     ):
@@ -187,7 +188,7 @@ class PaletteVideoTokenizer(VideoTokenizer):
         # conv_in consumes conv_in_time_pad input frames (no temporal F.pad),
         # so the decoder already outputs that many fewer frames than the input.
         if context_frames > 0:
-            skip_logits = context_frames - self.conv_in_time_pad
+            skip_logits = max(context_frames - self.conv_in_time_pad, 0)
             logits = logits[:, :, skip_logits:]
             targets = targets[:, context_frames:]
         ce_loss = focal_cross_entropy(

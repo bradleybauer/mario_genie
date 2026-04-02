@@ -18,4 +18,5 @@ Instead of all combinations of architecture variables maybe just define an order
 half res / 2d init
 audio
 bit size / reconstruction expectations
-gan: what kind of signal really would a gan provide to the decoder?
+
+image inflation with 2d model trained on sprite sheets? is that too much engineering?

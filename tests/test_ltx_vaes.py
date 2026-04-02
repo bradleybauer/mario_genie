@@ -10,7 +10,9 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from mario_world_model.gan_discriminator import build_mel_discriminator, build_palette_discriminator
 from mario_world_model.ltx_audio_vae import LTXAudioVAE
+from mario_world_model.ltx_audio_vocoder import LTXAudioVocoder
 from mario_world_model.ltx_video_vae import LTXVideoVAE
 
 
@@ -36,3 +38,46 @@ def test_audio_vae_preserves_mel_shape() -> None:
     assert output.posterior_mean.shape == (2, 4, 16, 16)
     assert output.posterior_logvar.shape == (2, 4, 16, 16)
     assert output.latents.shape == (2, 4, 16, 16)
+
+
+def test_audio_vocoder_output_length_matches_expected_formula() -> None:
+    model = LTXAudioVocoder(
+        in_channels=1,
+        n_mels=64,
+        out_channels=1,
+        upsample_initial_channel=128,
+        upsample_rates=(5, 5, 4),
+        upsample_kernel_sizes=(11, 11, 8),
+        resblock_kernel_sizes=(3,),
+        resblock_dilation_sizes=((1, 3, 9),),
+        hop_length=100,
+        n_fft=400,
+    )
+    mel = torch.rand(2, 1, 61, 64)
+
+    waveform = model(mel)
+
+    assert waveform.shape == (2, 1, model.expected_output_length(61))
+
+
+def test_audio_vocoder_default_model_fits_project_size_budget() -> None:
+    model = LTXAudioVocoder()
+    assert model.num_parameters <= 5_000_000
+
+
+def test_video_discriminator_returns_one_logit_per_clip() -> None:
+    discriminator = build_palette_discriminator(8, target_size="~5m")
+    video = torch.rand(2, 8, 4, 32, 32)
+
+    logits = discriminator(video)
+
+    assert logits.shape == (2,)
+
+
+def test_mel_discriminator_returns_one_logit_per_sample() -> None:
+    discriminator = build_mel_discriminator(in_channels=1, target_size="~5m")
+    mel = torch.rand(2, 1, 64, 64)
+
+    logits = discriminator(mel)
+
+    assert logits.shape == (2,)
