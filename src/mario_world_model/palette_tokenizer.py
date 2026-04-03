@@ -210,4 +210,4 @@ class PaletteVideoTokenizer(VideoTokenizer):
             multiscale_gen_adaptive_weights=[],
         )
 
-        return total_loss, loss_breakdown
+        return total_loss, loss_breakdown, logits

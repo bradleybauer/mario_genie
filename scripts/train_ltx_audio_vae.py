@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -29,7 +30,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
     parser.add_argument("--kl-weight", type=float, default=1e-5)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
@@ -313,7 +316,9 @@ def evaluate(
             energy = float(mel[0].mean())
             if energy > preview_energy:
                 preview_energy = energy
-                preview = (mel.detach().cpu(), outputs.reconstruction.detach().cpu())
+                preview_out = model(mel[:1], sample_posterior=False)
+                preview = (mel[:1].detach().cpu(), preview_out.reconstruction.detach().cpu())
+                del preview_out
     model.train()
 
     if not recon_losses:
@@ -333,7 +338,7 @@ def save_training_state(
     *,
     model: torch.nn.Module,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: LambdaLR,
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
@@ -512,10 +517,29 @@ def main() -> None:
     if args.compile:
         console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
+        if discriminator is not None:
+            console.print("[compile] Compiling discriminator with torch.compile()...")
+            discriminator = torch.compile(discriminator)
         console.print("[compile] Compilation complete.")
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.max_steps, eta_min=args.lr * 0.1)
+    warmup_steps = max(int(args.warmup_steps), 0)
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step + 1, 1) / float(warmup_steps)
+        if args.max_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.1 + 0.9 * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if warmup_steps > 0:
+        console.print(f"[lr] Warmup: {warmup_steps} steps \u2192 cosine decay to 10% of peak")
+    else:
+        console.print("[lr] Cosine decay (no warmup)")
 
     start_step = 0
     best_eval = float("inf")
@@ -636,19 +660,47 @@ def main() -> None:
                     context_lengths=context_lengths,
                 )
 
-            mel_for_discriminator = mel.float()
+            mel_for_discriminator = mel
             if valid_mask is not None:
-                mel_for_discriminator = mel_for_discriminator * valid_mask.expand_as(mel)
+                mel_for_discriminator = mel_for_discriminator * valid_mask.to(dtype=mel_for_discriminator.dtype).expand_as(mel_for_discriminator)
 
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(mel)
+            recon_loss = masked_l1_loss(
+                outputs.reconstruction,
+                mel,
+                None if recon_mask is None else recon_mask.expand_as(mel),
+            )
+            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
+            loss = recon_loss + args.kl_weight * kl_loss
+
+            # Save detached fakes for discriminator update (before graph is freed).
+            fake_mel_detached = None
+            if gan_active and discriminator is not None:
+                fake_mel = outputs.reconstruction
+                if valid_mask is not None:
+                    fake_mel = fake_mel * valid_mask.to(dtype=fake_mel.dtype).expand_as(fake_mel)
+                fake_mel_detached = fake_mel.detach()
+
+                # --- Generator adversarial loss (live graph through discriminator) ---
+                set_requires_grad(discriminator, False)
+                gen_adv_loss = hinge_generator_loss(discriminator(fake_mel))
+                gan_gen_loss_value = gen_adv_loss.item()
+                loss = loss + args.gan_weight * gen_adv_loss
+                del fake_mel, gen_adv_loss
+
+            # Generator backward (frees computation graph before discriminator update).
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            # --- Discriminator update (after generator graph is freed) ---
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    fake_mel_for_discriminator = model(mel).reconstruction.float()
-                    if valid_mask is not None:
-                        fake_mel_for_discriminator = fake_mel_for_discriminator * valid_mask.expand_as(mel)
                 real_scores = discriminator(mel_for_discriminator)
-                fake_scores = discriminator(fake_mel_for_discriminator)
+                fake_scores = discriminator(fake_mel_detached)
                 discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
                 if args.use_lecam and lecam_ema is not None:
                     lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
@@ -664,28 +716,7 @@ def main() -> None:
                 gan_discr_loss_value = discr_loss.item()
                 gan_real_logit_value = real_scores.mean().item()
                 gan_fake_logit_value = fake_scores.mean().item()
-
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(mel)
-            recon_loss = masked_l1_loss(
-                outputs.reconstruction,
-                mel,
-                None if recon_mask is None else recon_mask.expand_as(mel),
-            )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
-            loss = recon_loss + args.kl_weight * kl_loss
-            if gan_active and discriminator is not None:
-                set_requires_grad(discriminator, False)
-                fake_mel_for_generator = outputs.reconstruction.float()
-                if valid_mask is not None:
-                    fake_mel_for_generator = fake_mel_for_generator * valid_mask.expand_as(mel)
-                gen_adv_loss = hinge_generator_loss(discriminator(fake_mel_for_generator))
-                gan_gen_loss_value = gen_adv_loss.item()
-                loss = loss + args.gan_weight * gen_adv_loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
+                del real_scores, fake_scores, discr_loss, fake_mel_detached
 
             perf_window_steps += 1
             perf_window_samples += audio.shape[0]
@@ -790,7 +821,7 @@ def main() -> None:
                         energy = float(train_mel[0].mean())
                         if energy > best_train_energy:
                             best_train_energy = energy
-                            train_outputs = model(train_mel)
+                            train_outputs = model(train_mel, sample_posterior=False)
                             best_train_mel = train_mel.detach().cpu()
                             best_train_recon = train_outputs.reconstruction.detach().cpu()
                     if best_train_mel is not None:

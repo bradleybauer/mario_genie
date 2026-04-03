@@ -252,3 +252,56 @@ The DiT jointly denoises both modalities using a shared diffusion timestep, with
 - This is a normal video-model initialization idea, especially when bootstrapping from strong image models. It is not the same thing as half-resolution warm start, but the two ideas can be combined: first learn good spatial filters cheaply in 2D or at lower resolution, then transfer them into the spatiotemporal model.
 
 - Main question to test: for this project, does 2D initialization help enough to justify the mismatch with causal temporal structure, or does training the 3D stack directly work just as well at this scale?
+
+### Inference-Time Use Of The GAN Discriminator
+
+- A reasonable question is whether the GAN discriminator could be reused at inference time to help correct bad samples or guide the world model toward more realistic futures.
+
+- In the current codebase, the discriminator is a training-only component:
+	- defined in `src/mario_world_model/gan_discriminator.py`
+	- used in the GAN training loops in `scripts/train_ltx_video_vae.py` and `scripts/train_magvit.py`
+	- explicitly disabled in `scripts/rank_samples.py`
+
+- So this is not implemented today, but it is technically feasible.
+
+Practical inference-time uses:
+
+- **Best-of-$N$ reranking**: sample $N$ candidate futures, score each with the discriminator, and keep the highest-scoring one. This is the simplest and lowest-risk first experiment.
+
+- **Rejection sampling**: keep sampling until the discriminator score exceeds a threshold.
+
+- **Guided decoding / guided sampling**: choose samples that maximize a combined objective
+
+$$
+J(x) = \log p_{\theta}(x \mid c, a) + \lambda D_{\phi}(x)
+$$
+
+where $D_{\phi}(x)$ is the discriminator realism score and $\lambda$ controls how much weight to give the discriminator relative to the world-model likelihood.
+
+- **Latent refinement**: generate a sample once, then take a few gradient steps on the latent variables to improve discriminator score while constraining drift from the original sample or from model likelihood.
+
+Main caveat for world models:
+
+- A standard GAN discriminator mainly learns **realism**, not **dynamics correctness**.
+
+- That means it may prefer futures that look plausible frame-by-frame while still being wrong about game state, object identity, action consequences, or temporal consistency.
+
+- For this project, a pure discriminator score is probably not enough. A better target is a combined score, or eventually a more task-specific critic that checks state/action consistency rather than only visual realism.
+
+Best first experiment:
+
+- Start with **best-of-$N$ reranking** on short rollout chunks.
+
+- Score each candidate with something like
+
+$$
+S(x) = \log p_{\theta}(x \mid c, a) + \lambda D_{\phi}(x)
+$$
+
+using a small $\lambda$ so the discriminator nudges the choice rather than dominating it.
+
+- Evaluate not just visual quality, but also rollout correctness over longer horizons.
+
+- Compare the improvement against the extra inference cost from generating multiple candidates.
+
+- If this helps, the next step would be discriminator-guided sampling rather than pure reranking.

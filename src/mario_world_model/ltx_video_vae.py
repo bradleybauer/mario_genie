@@ -194,7 +194,7 @@ class LTXVideoVAE(nn.Module):
         x = self.encoder_block3(x)
         x = self.encoder_mid(x)
         mean, logvar = self.encoder_out(x).chunk(2, dim=1)
-        return mean, torch.clamp(logvar, min=-30.0, max=20.0)
+        return mean, torch.clamp(logvar, min=-30.0, max=10.0)
 
     def reparameterize(self, mean: Tensor, logvar: Tensor, sample_posterior: bool = True) -> Tensor:
         if not sample_posterior:

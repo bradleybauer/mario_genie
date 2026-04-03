@@ -352,12 +352,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         cfg = run["config"]
         metrics = run["metrics"]
 
-        smoothed_recon_losses = [
-            m["smoothed_recon_loss"] for m in metrics if "smoothed_recon_loss" in m
-        ]
-        min_smoothed_recon = (
-            min(smoothed_recon_losses) if smoothed_recon_losses else float("nan")
-        )
+        _, recon_values = get_recon_values(metrics)
+        min_recon = min(recon_values) if recon_values else float("nan")
 
         # Final codebook usage
         cb_entries = [m for m in metrics if "codebook_usage" in m]
@@ -394,7 +390,7 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
             ("cb_size", cb_size),
             ("num_params", f"{cfg.get('num_parameters', 0):,}"),
             ("batch_size", cfg.get("batch_size", "?")),
-            ("min_sm_recon", f"{min_smoothed_recon:.4f}"),
+            ("min_recon", f"{min_recon:.4f}"),
             ("eval_recon", f"{eval_recon:.4f}" if eval_recon is not None else ""),
             ("eval_px_acc", f"{eval_pixel_acc:.4f}" if eval_pixel_acc is not None else ""),
             ("final_cb", final_cb),
@@ -412,8 +408,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
     # Sort by eval_recon (if available), then min_smoothed_recon as fallback
     def _sort_key(r):
         eval_val = float(r["eval_recon"]) if r["eval_recon"] else float("inf")
-        smooth_val = float(r["min_sm_recon"])
-        return (eval_val, smooth_val)
+        recon_val = float(r["min_recon"])
+        return (eval_val, recon_val)
     rows.sort(key=_sort_key)
     return rows
 

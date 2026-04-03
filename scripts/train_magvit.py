@@ -272,6 +272,31 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.1f} {unit}"
 
 
+def indices_to_onehot_reuse(
+    indices: torch.Tensor,
+    num_classes: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if indices.ndim != 4:
+        raise ValueError(f"Expected indices with shape (B, T, H, W), got {tuple(indices.shape)}")
+    if indices.dtype != torch.long:
+        indices = indices.long()
+
+    expected_shape = (indices.shape[0], num_classes, indices.shape[1], indices.shape[2], indices.shape[3])
+    if (
+        out is None
+        or out.shape != expected_shape
+        or out.dtype != dtype
+        or out.device != indices.device
+    ):
+        out = torch.empty(expected_shape, dtype=dtype, device=indices.device)
+    out.zero_()
+    out.scatter_(1, indices.unsqueeze(1), 1)
+    return out
+
+
 def load_class_weights(
     data_dir: str,
     *,
@@ -891,6 +916,9 @@ def train():
     if args.compile:
         print("[compile] Compiling the model with torch.compile()…")
         tokenizer = torch.compile(tokenizer)
+        if discriminator is not None:
+            print("[compile] Compiling discriminator with torch.compile()...")
+            discriminator = torch.compile(discriminator)
         print("[compile] Compilation complete.")
 
     # ── Perf tracking ────────────────────────────────────────────────
@@ -1001,16 +1029,19 @@ def train():
         )
         eval_progress.start()
         eval_task = eval_progress.add_task(f"Eval@{step_label}", total=len(eval_loader))
+        onehot_buffer = None
         with torch.no_grad():
             for eval_batch in eval_loader:
                 eval_batch = eval_batch.to(device, non_blocking=True)
                 last_eval_batch = eval_batch
                 targets = eval_batch.long()
-                inp = PaletteVideoTokenizer.indices_to_onehot(
+                inp = indices_to_onehot_reuse(
                     targets,
                     num_palette_colors,
                     dtype=onehot_dtype,
+                    out=onehot_buffer,
                 )
+                onehot_buffer = inp
                 with autocast_context():
                     codes = tokenizer(inp, return_codes=True, video_contains_first_frame=video_contains_first_frame)
                 code_counts += torch.bincount(codes.cpu().flatten(), minlength=mc.codebook_size)
@@ -1100,6 +1131,7 @@ def train():
     gan_lecam_reg_value = 0.0
     gan_lecam_ema_real_value = 0.0
     gan_lecam_ema_fake_value = 0.0
+    onehot_buffer = None
     for batch in batch_iter():
         if args.max_steps > 0 and global_step >= args.max_steps:
             print(f"\n[max-steps] Reached {global_step} steps. Stopping.")
@@ -1120,47 +1152,15 @@ def train():
         optimizer.zero_grad()
         try:
             targets = batch.long()
-            inp = PaletteVideoTokenizer.indices_to_onehot(
+            inp = indices_to_onehot_reuse(
                 targets, num_palette_colors,
                 dtype=onehot_dtype,
+                out=onehot_buffer,
             )
-
-            if gan_active and discriminator is not None and discriminator_optimizer is not None:
-                set_requires_grad(discriminator, True)
-                discriminator_optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    with autocast_context():
-                        fake_logits_for_discriminator = tokenizer(
-                            inp,
-                            return_loss=False,
-                            video_contains_first_frame=video_contains_first_frame,
-                        )
-                real_video = inp.float()
-                fake_video = fake_logits_for_discriminator.float().softmax(dim=1)
-                real_scores = discriminator(real_video)
-                fake_scores = discriminator(fake_video)
-                discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
-                if args.use_lecam and lecam_ema is not None:
-                    lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
-                    gan_lecam_reg_value = lecam_reg.item()
-                    discr_loss = discr_loss + args.lecam_weight * lecam_reg
-                discr_loss.backward()
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                discriminator_optimizer.step()
-
-                if args.use_lecam and lecam_ema is not None:
-                    lecam_ema.update(real_scores.mean(), fake_scores.mean())
-                    if lecam_ema.logits_real_ema is not None:
-                        gan_lecam_ema_real_value = float(lecam_ema.logits_real_ema.item())
-                    if lecam_ema.logits_fake_ema is not None:
-                        gan_lecam_ema_fake_value = float(lecam_ema.logits_fake_ema.item())
-
-                gan_discr_loss_value = discr_loss.item()
-                gan_real_logit_value = real_scores.mean().item()
-                gan_fake_logit_value = fake_scores.mean().item()
+            onehot_buffer = inp
 
             with autocast_context():
-                loss, loss_breakdown = tokenizer(
+                loss, loss_breakdown, recon_logits = tokenizer(
                     inp,
                     targets=targets,
                     return_loss=True,
@@ -1170,26 +1170,27 @@ def train():
                     class_weight=class_weight,
                 )
 
+            # Save detached fakes for discriminator update (before graph is freed).
+            fake_video_detached = None
             if gan_active and discriminator is not None:
+                # --- Generator adversarial loss (live graph through discriminator) ---
                 set_requires_grad(discriminator, False)
                 with autocast_context():
-                    fake_logits_for_generator = tokenizer(
-                        inp,
-                        return_loss=False,
-                        video_contains_first_frame=video_contains_first_frame,
-                    )
-                generator_fake_video = fake_logits_for_generator.float().softmax(dim=1)
-                gen_adv_loss = hinge_generator_loss(discriminator(generator_fake_video))
+                    fake_video = recon_logits.softmax(dim=1)
+                    gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
+                fake_video_detached = fake_video.detach()
                 gan_gen_loss_value = gen_adv_loss.item()
                 loss = loss + args.gan_weight * gen_adv_loss
+                del fake_video, gen_adv_loss
 
+            # Generator backward (frees computation graph before discriminator update).
             if grad_scaler.is_enabled():
                 grad_scaler.scale(loss).backward()
             else:
                 loss.backward()
         except torch.cuda.OutOfMemoryError:
             optimizer.zero_grad(set_to_none=True)
-            inp = targets = batch = loss = loss_breakdown = None
+            inp = targets = batch = loss = loss_breakdown = fake_video_detached = None
             gc.collect()
             torch.cuda.empty_cache()
             if global_step == start_step:
@@ -1213,6 +1214,34 @@ def train():
         else:
             optimizer.step()
         scheduler.step()
+
+        # --- Discriminator update (after generator graph is freed) ---
+        if gan_active and discriminator is not None and discriminator_optimizer is not None and fake_video_detached is not None:
+            set_requires_grad(discriminator, True)
+            discriminator_optimizer.zero_grad(set_to_none=True)
+            with autocast_context():
+                real_scores = discriminator(inp)
+                fake_scores = discriminator(fake_video_detached)
+                discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
+                if args.use_lecam and lecam_ema is not None:
+                    lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
+                    gan_lecam_reg_value = lecam_reg.item()
+                    discr_loss = discr_loss + args.lecam_weight * lecam_reg
+            discr_loss.backward()
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+            discriminator_optimizer.step()
+
+            if args.use_lecam and lecam_ema is not None:
+                lecam_ema.update(real_scores.mean(), fake_scores.mean())
+                if lecam_ema.logits_real_ema is not None:
+                    gan_lecam_ema_real_value = float(lecam_ema.logits_real_ema.item())
+                if lecam_ema.logits_fake_ema is not None:
+                    gan_lecam_ema_fake_value = float(lecam_ema.logits_fake_ema.item())
+
+            gan_discr_loss_value = discr_loss.item()
+            gan_real_logit_value = real_scores.mean().item()
+            gan_fake_logit_value = fake_scores.mean().item()
+            del real_scores, fake_scores, discr_loss, fake_video_detached
 
         current_lr = optimizer.param_groups[0]['lr']
         recon = loss_breakdown.recon_loss.item()

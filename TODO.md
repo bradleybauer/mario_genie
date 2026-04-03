@@ -15,8 +15,14 @@ Skimmed the magvit2 paper, notes: Increase warmup period, push the temporal down
 
 Instead of all combinations of architecture variables maybe just define an order to test them as additions to some base model
 
-half res / 2d init
-audio
-bit size / reconstruction expectations
+ half res / 2d init
+ audio
+ bit size / reconstruction expectations
 
 image inflation with 2d model trained on sprite sheets? is that too much engineering?
+
+find nicer abstractions between the training scripts, de-duplicate code/fixes/optimizations/...!
+
+deeper smaller models?
+why even train an encoder?
+Adding the gan actually made training more stable

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import math
 import os
 import random
 import sys
@@ -26,7 +27,7 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +74,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--warmup-steps", type=int, default=1000,
+                        help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
     parser.add_argument("--kl-weight", type=float, default=1e-4)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
@@ -86,8 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
-    parser.add_argument("--base-channels", type=int, default=48)
-    parser.add_argument("--latent-channels", type=int, default=32)
+    parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument("--latent-channels", type=int, default=64)
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tf16", action="store_true", help="Enable TF16 matmul precision")
@@ -127,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class-weight-soften",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
     )
     parser.add_argument(
@@ -252,18 +255,24 @@ def frames_to_one_hot(
     num_colors: int,
     *,
     dtype: torch.dtype = torch.float32,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if frames.ndim != 4:
         raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
 
-    frames = frames.long()
-    one_hot = torch.zeros(
-        (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3]),
-        dtype=dtype,
-        device=frames.device,
-    )
-    one_hot.scatter_(1, frames.unsqueeze(1), 1)
-    return one_hot
+    if frames.dtype != torch.long:
+        frames = frames.long()
+    expected_shape = (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3])
+    if (
+        out is None
+        or out.shape != expected_shape
+        or out.dtype != dtype
+        or out.device != frames.device
+    ):
+        out = torch.empty(expected_shape, dtype=dtype, device=frames.device)
+    out.zero_()
+    out.scatter_(1, frames.unsqueeze(1), 1)
+    return out
 
 
 def split_context_targets(
@@ -310,6 +319,7 @@ def evaluate(
     recon_losses: list[float] = []
     kl_losses: list[float] = []
     preview: tuple[torch.Tensor, torch.Tensor] | None = None
+    onehot_buffer: torch.Tensor | None = None
 
     def autocast_context():
         if not autocast_enabled:
@@ -319,9 +329,11 @@ def evaluate(
     with torch.no_grad():
         for batch in loader:
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype)
+            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+            onehot_buffer = inputs
             with autocast_context():
-                outputs = model(inputs)
+                # Deterministic eval: decode from posterior mean (no latent sampling noise).
+                outputs = model(inputs, sample_posterior=False)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
             recon_loss = focal_cross_entropy(
                 recon_logits,
@@ -333,8 +345,11 @@ def evaluate(
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
             if preview is None:
-                # Keep only a single sample preview to cap host and device transient memory.
-                preview = (frames[:1].detach().cpu(), outputs.logits[:1].detach().cpu())
+                # Deterministic forward pass (no posterior sampling) for a clean preview.
+                with autocast_context():
+                    preview_out = model(inputs[:1], sample_posterior=False)
+                preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
+                del preview_out
             del recon_logits, recon_targets, recon_loss, kl_loss, outputs, inputs, frames
     model.train()
     if torch.cuda.is_available():
@@ -357,7 +372,7 @@ def save_training_state(
     *,
     model: torch.nn.Module,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: LambdaLR,
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
@@ -559,7 +574,6 @@ def main() -> None:
             target_size=args.gan_target_size,
         ).to(device)
         discriminator_num_parameters = count_trainable_parameters(discriminator)
-        discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
         if args.use_lecam:
             lecam_ema = LeCAMEMA(decay=args.lecam_decay)
         console.print(
@@ -573,10 +587,31 @@ def main() -> None:
     if args.compile:
         console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
+        if discriminator is not None:
+            console.print("[compile] Compiling discriminator with torch.compile()...")
+            discriminator = torch.compile(discriminator)
         console.print("[compile] Compilation complete.")
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.max_steps, eta_min=args.lr * 0.1)
+    if discriminator is not None:
+        discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
+    warmup_steps = max(int(args.warmup_steps), 0)
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step + 1, 1) / float(warmup_steps)
+        if args.max_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.1 + 0.9 * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if warmup_steps > 0:
+        console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 10% of peak")
+    else:
+        console.print("[lr] Cosine decay (no warmup)")
 
     start_step = 0
     best_eval = float("inf")
@@ -653,10 +688,12 @@ def main() -> None:
     ) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
+        onehot_buffer: torch.Tensor | None = None
         for step in range(start_step, args.max_steps):
             batch = next(train_iter)
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype)
+            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+            onehot_buffer = inputs
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
@@ -673,33 +710,6 @@ def main() -> None:
                     * torch.tensor([], dtype=onehot_dtype).element_size()
                 )
 
-            if gan_active and discriminator is not None and discriminator_optimizer is not None:
-                set_requires_grad(discriminator, True)
-                discriminator_optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    with autocast_context():
-                        fake_logits_for_discriminator = model(inputs).logits
-                real_video = inputs.float()
-                fake_video = fake_logits_for_discriminator.float().softmax(dim=1)
-                real_scores = discriminator(real_video)
-                fake_scores = discriminator(fake_video)
-                discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
-                if args.use_lecam and lecam_ema is not None:
-                    lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
-                    gan_lecam_reg_value = lecam_reg.item()
-                    discr_loss = discr_loss + args.lecam_weight * lecam_reg
-                discr_loss.backward()
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
-                discriminator_optimizer.step()
-
-                if args.use_lecam and lecam_ema is not None:
-                    lecam_ema.update(real_scores.mean(), fake_scores.mean())
-
-                gan_discr_loss_value = discr_loss.item()
-                gan_real_logit_value = real_scores.mean().item()
-                gan_fake_logit_value = fake_scores.mean().item()
-                del fake_logits_for_discriminator, fake_video, real_video, real_scores, fake_scores
-
             optimizer.zero_grad(set_to_none=True)
             with autocast_context():
                 outputs = model(inputs)
@@ -712,20 +722,28 @@ def main() -> None:
             )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
+
+            # Save detached fakes for discriminator update (before graph is freed).
+            fake_video_detached = None
             if gan_active and discriminator is not None:
+                # --- Generator adversarial loss (live graph through discriminator) ---
                 set_requires_grad(discriminator, False)
-                generator_fake_video = outputs.logits.float().softmax(dim=1)
-                gen_adv_loss = hinge_generator_loss(discriminator(generator_fake_video))
+                with autocast_context():
+                    fake_video = outputs.logits.softmax(dim=1)
+                    gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
+                fake_video_detached = fake_video.detach()
                 gan_gen_loss_value = gen_adv_loss.item()
                 loss = loss + args.gan_weight * gen_adv_loss
-                del generator_fake_video, gen_adv_loss
+                del fake_video, gen_adv_loss
+
+            # Generator backward (frees computation graph before discriminator update).
             if grad_scaler.is_enabled():
                 grad_scaler.scale(loss).backward()
             else:
                 loss.backward()
             if grad_scaler.is_enabled():
                 grad_scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             if grad_scaler.is_enabled():
                 grad_scaler.step(optimizer)
                 grad_scaler.update()
@@ -733,6 +751,30 @@ def main() -> None:
                 optimizer.step()
             scheduler.step()
             del outputs, recon_logits, recon_targets
+
+            # --- Discriminator update (after generator graph is freed) ---
+            if gan_active and discriminator is not None and discriminator_optimizer is not None:
+                set_requires_grad(discriminator, True)
+                discriminator_optimizer.zero_grad(set_to_none=True)
+                with autocast_context():
+                    real_scores = discriminator(inputs)
+                    fake_scores = discriminator(fake_video_detached)
+                    discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
+                    if args.use_lecam and lecam_ema is not None:
+                        lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
+                        gan_lecam_reg_value = lecam_reg.item()
+                        discr_loss = discr_loss + args.lecam_weight * lecam_reg
+                discr_loss.backward()
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                discriminator_optimizer.step()
+
+                if args.use_lecam and lecam_ema is not None:
+                    lecam_ema.update(real_scores.mean(), fake_scores.mean())
+
+                gan_discr_loss_value = discr_loss.item()
+                gan_real_logit_value = real_scores.mean().item()
+                gan_fake_logit_value = fake_scores.mean().item()
+                del real_scores, fake_scores, discr_loss, fake_video_detached
 
             perf_window_steps += 1
             perf_window_samples += frames.shape[0]
@@ -751,6 +793,7 @@ def main() -> None:
             status = (
                 f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
                 f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                f"gnorm={grad_norm:.2f} "
                 f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
             )
             stats = gpu_stats(device)
@@ -782,7 +825,7 @@ def main() -> None:
                 log_console.print(
                     f"step={step:06d} loss={loss.item():.4f} recon={recon_loss.item():.4f} "
                     f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                    f"ex/s={examples_per_second:.1f}"
+                    f"gnorm={grad_norm:.2f} ex/s={examples_per_second:.1f}"
                     + (
                         f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f} "
                         f"real={gan_real_logit_value:.4f} fake={gan_fake_logit_value:.4f}"
@@ -825,6 +868,7 @@ def main() -> None:
                     continue
 
                 eval_metrics["step"] = step
+                eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 metrics.append(eval_metrics)
                 with (output_dir / "metrics.json").open("w") as handle:
                     json.dump(metrics, handle, indent=2)
@@ -850,7 +894,7 @@ def main() -> None:
                         train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
                         train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
                         with autocast_context():
-                            train_outputs = model(train_inputs)
+                            train_outputs = model(train_inputs, sample_posterior=False)
                         save_video_preview(
                             output_dir / f"train_preview_step_{step:06d}.png",
                             train_frames.detach().cpu(),
