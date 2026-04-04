@@ -1361,7 +1361,7 @@ def train():
         if (args.checkpoint_interval > 0
                 and global_step > 0
                 and global_step % args.checkpoint_interval == 0):
-            print(f"\n[checkpoint] Saving latest weights at step {global_step}")
+            checkpoint_line = f"[checkpoint] Saving latest at step {global_step}"
             unwrapped = getattr(tokenizer, '_orig_mod', tokenizer)
             _ckpt_sd = unwrapped.state_dict()
             torch.save(_ckpt_sd, os.path.join(args.output_dir, "magvit2_latest.pt"))
@@ -1401,8 +1401,9 @@ def train():
                     torch.save(_ckpt_sd, os.path.join(args.output_dir, "magvit2_best.pt"))
                     _training_state['best_eval_recon'] = best_eval_recon
                     torch.save(_training_state, os.path.join(args.output_dir, "training_state_best.pt"))
-                    print(f"[checkpoint] New best eval_recon_loss={best_eval_recon:.6f} → saved *_best.pt")
+                    checkpoint_line += f" | best={best_eval_recon:.6f}"
 
+            print(checkpoint_line)
             del _ckpt_sd, _training_state
 
         global_step += 1

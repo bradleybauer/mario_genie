@@ -605,7 +605,7 @@ def main() -> None:
         progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
         progress = min(max(progress, 0.0), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 0.1 + 0.9 * cosine
+        return 0.25 + 0.75 * cosine # 10% is too small
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     if warmup_steps > 0:
@@ -873,7 +873,7 @@ def main() -> None:
                 with (output_dir / "metrics.json").open("w") as handle:
                     json.dump(metrics, handle, indent=2)
 
-                log_console.print(
+                eval_line = (
                     f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
                     f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
                 )
@@ -928,16 +928,17 @@ def main() -> None:
                         discriminator_optimizer=discriminator_optimizer,
                         lecam_ema=lecam_ema,
                     )
-                    log_console.print(
-                        f"[checkpoint] New best eval_loss={best_eval:.6f} -> saved video_vae_best.pt"
-                    )
+                    eval_line += f" | best={best_eval:.6f}"
 
             should_checkpoint = (
                 (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
                 or step == args.max_steps - 1
             )
             if should_checkpoint:
-                log_console.print(f"[checkpoint] Saving latest weights at step {step}")
+                if should_eval:
+                    eval_line += " | saved latest"
+                else:
+                    log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
                     output_dir / "video_vae_latest.pt",
                     model=model,
@@ -950,6 +951,9 @@ def main() -> None:
                     discriminator_optimizer=discriminator_optimizer,
                     lecam_ema=lecam_ema,
                 )
+
+            if should_eval:
+                log_console.print(eval_line)
 
 
 if __name__ == "__main__":

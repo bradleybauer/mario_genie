@@ -904,7 +904,7 @@ def main() -> None:
                 with (output_dir / "metrics.json").open("w") as handle:
                     json.dump(metrics, handle, indent=2)
 
-                log_console.print(
+                eval_line = (
                     f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
                     f"wave={eval_metrics['wave_l1']:.4f} mel={eval_metrics['mel_l1']:.4f} "
                     f"sc={eval_metrics['stft_sc']:.4f} mag={eval_metrics['stft_mag']:.4f}"
@@ -940,16 +940,17 @@ def main() -> None:
                         best_eval=best_eval,
                         metrics=metrics,
                     )
-                    log_console.print(
-                        f"[checkpoint] New best eval_loss={best_eval:.6f} -> saved audio_vocoder_best.pt"
-                    )
+                    eval_line += f" | best={best_eval:.6f}"
 
             should_checkpoint = (
                 (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
                 or step == args.max_steps - 1
             )
             if should_checkpoint:
-                log_console.print(f"[checkpoint] Saving latest weights at step {step}")
+                if should_eval:
+                    eval_line += " | saved latest"
+                else:
+                    log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
                     output_dir / "audio_vocoder_latest.pt",
                     model=model,
@@ -959,6 +960,9 @@ def main() -> None:
                     best_eval=best_eval,
                     metrics=metrics,
                 )
+
+            if should_eval:
+                log_console.print(eval_line)
 
     if final_preview_payload is not None:
         save_vocoder_preview(
