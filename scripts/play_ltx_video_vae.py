@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Play NES through a live LTX Video VAE v2 reconstruction.
+"""Play NES through a live LTX Video VAE reconstruction.
 
 Usage examples:
-    python scripts/play_ltx_video_vae_v2.py --checkpoint checkpoints/run/video_vae_v2_best.pt
-    python scripts/play_ltx_video_vae_v2.py --checkpoint checkpoints/run/video_vae_v2_latest.pt --rom mario
-    python scripts/play_ltx_video_vae_v2.py --checkpoint checkpoints/run/video_vae_v2_best.pt --view side-by-side
+    python scripts/play_ltx_video_vae.py --checkpoint checkpoints/run/video_vae_best.pt
+    python scripts/play_ltx_video_vae.py --checkpoint checkpoints/run/video_vae_latest.pt --rom mario
+    python scripts/play_ltx_video_vae.py --checkpoint checkpoints/run/video_vae_best.pt --view side-by-side
 
 The script:
 1) reads NES observations from the emulator,
 2) maps RGB pixels -> palette indices,
-3) encodes + decodes with LTXVideoVAEv2,
+3) encodes + decodes with LTXVideoVAE,
 4) displays the reconstructed frame in real time.
 """
 from __future__ import annotations
@@ -35,7 +35,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from mario_world_model.ltx_video_vae_v2 import LTXVideoVAEv2
+from mario_world_model.ltx_video_vae import LTXVideoVAE
 from mario_world_model.normalized_dataset import load_palette_info
 
 import play_nes as nes_play
@@ -48,9 +48,9 @@ CROP_W = 224
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Play NES through LTX Video VAE v2 reconstruction.")
+    parser = argparse.ArgumentParser(description="Play NES through LTX Video VAE reconstruction.")
     parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to a v2 checkpoint (.pt) from train_ltx_video_vae_v2.py")
+                        help="Path to a checkpoint (.pt) from train_ltx_video_vae.py")
     parser.add_argument("--config", type=str, default=None,
                         help="Optional config.json path. Defaults to sibling of --checkpoint if found.")
     parser.add_argument("--data-dir", type=str, default="data/normalized",
@@ -179,7 +179,7 @@ def _frames_to_one_hot(
 class LiveAutoencoder:
     def __init__(
         self,
-        model: LTXVideoVAEv2,
+        model: LTXVideoVAE,
         *,
         device: torch.device,
         palette_rgb: np.ndarray,
@@ -274,7 +274,7 @@ def _run_nes_py(
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption(f"{name} (LTX v2 reconstruction)")
+    pygame.display.set_caption(f"{name} (LTX reconstruction)")
     clock = pygame.time.Clock()
     controller = nes_play.GamepadController()
     hud_font = pygame.font.SysFont("monospace", 14, bold=True)
@@ -352,7 +352,7 @@ def _run_retro(
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h), pygame.DOUBLEBUF)
-    pygame.display.set_caption(f"{name} (LTX v2 reconstruction)")
+    pygame.display.set_caption(f"{name} (LTX reconstruction)")
     clock = pygame.time.Clock()
     controller = nes_play.GamepadController()
     hud_font = pygame.font.SysFont("monospace", 14, bold=True)
@@ -441,7 +441,7 @@ def main() -> None:
     if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         autocast_dtype = torch.float16
 
-    model = LTXVideoVAEv2(
+    model = LTXVideoVAE(
         num_colors=int(palette_rgb.shape[0]),
         patch_size=patch_size,
         base_channels=base_channels,

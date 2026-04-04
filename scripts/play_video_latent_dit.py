@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Play an action-conditioned video-latent world model in real time.
+"""Play an action-conditioned video-latent DiT in real time.
 
 This script:
-1) loads a trained world model checkpoint,
-2) loads the frozen video VAE used by that world model,
+1) loads a trained video-latent DiT checkpoint,
+2) loads the frozen video VAE used by that DiT,
 3) seeds latent context from a short emulator warmup,
-4) rolls latents forward from live controller actions,
+4) denoises one-step future latents from live controller actions,
 5) decodes predicted latents to video frames.
 
 Usage examples:
-  python scripts/play_video_latent_world_model.py \
-      --world-checkpoint checkpoints/world1/video_latent_world_model_best.pt
+    python scripts/play_video_latent_dit.py \
+      --dit-checkpoint checkpoints/world1/video_latent_dit_best.pt
 
-  python scripts/play_video_latent_world_model.py \
-      --world-checkpoint checkpoints/world1/video_latent_world_model_best.pt \
+    python scripts/play_video_latent_dit.py \
+      --dit-checkpoint checkpoints/world1/video_latent_dit_best.pt \
       --rom mario --view compare
 """
 
@@ -41,10 +41,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from mario_world_model.ltx_video_vae import LTXVideoVAE
-from mario_world_model.ltx_video_vae_v2 import LTXVideoVAEv2
+from mario_world_model.ltx_video_vae_v2 import LTXVideoVAEv2 as LTXVideoVAE
 from mario_world_model.normalized_dataset import load_palette_info
-from mario_world_model.video_latent_world_model import VideoLatentWorldModel
+from mario_world_model.video_latent_dit import VideoLatentDiT
 
 import play_nes as nes_play
 
@@ -55,31 +54,43 @@ CROP_H = 224
 CROP_W = 224
 
 
+def _nes_to_recorded_action_byte(nes_byte: int) -> int:
+    """Convert nes_py button layout to the recorded DataCollector action layout.
+
+    nes_py layout:
+        bit 0=A, 1=B, 2=Select, 3=Start, 4=Up, 5=Down, 6=Left, 7=Right
+    recorded layout (from .input.npy / actions.json):
+        bit 0=Up, 1=Down, 2=Left, 3=Right, 4=Start, 5=Select, 6=B, 7=A
+    """
+    recorded = 0
+    recorded |= ((nes_byte >> 4) & 1) << 0  # Up
+    recorded |= ((nes_byte >> 5) & 1) << 1  # Down
+    recorded |= ((nes_byte >> 6) & 1) << 2  # Left
+    recorded |= ((nes_byte >> 7) & 1) << 3  # Right
+    recorded |= ((nes_byte >> 3) & 1) << 4  # Start
+    recorded |= ((nes_byte >> 2) & 1) << 5  # Select
+    recorded |= ((nes_byte >> 1) & 1) << 6  # B
+    recorded |= ((nes_byte >> 0) & 1) << 7  # A
+    return recorded
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Play a trained video-latent world model.")
+    parser = argparse.ArgumentParser(description="Play a trained video-latent DiT.")
     parser.add_argument(
-        "--world-checkpoint",
+        "--dit-checkpoint",
         type=str,
         required=True,
-        help="Path to world model checkpoint (.pt) from train_video_latent_world_model.py",
+        help="Path to DiT checkpoint (.pt) from train_video_latent_dit.py",
     )
     parser.add_argument(
-        "--world-config",
+        "--dit-config",
         type=str,
         default=None,
-        help="Optional world model config.json path (defaults to sibling of --world-checkpoint)",
+        help="Optional DiT config.json path (defaults to sibling of --dit-checkpoint)",
     )
 
     parser.add_argument("--video-vae-checkpoint", type=str, default=None)
     parser.add_argument("--video-vae-config", type=str, default=None)
-    parser.add_argument(
-        "--video-vae-version",
-        type=str,
-        default="auto",
-        choices=["auto", "v1", "v2"],
-        help="VAE architecture override (default auto from config)",
-    )
-
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--rom", type=str, default=None)
     parser.add_argument("--scale", type=int, default=DEFAULT_SCALE)
@@ -96,13 +107,19 @@ def parse_args() -> argparse.Namespace:
         "--window-frames",
         type=int,
         default=None,
-        help="World-model context length used during rollout (defaults to clip_frames from world config)",
+        help="History length used for DiT conditioning (defaults to clip_frames from DiT config)",
     )
     parser.add_argument(
         "--warmup-frames",
         type=int,
         default=None,
-        help="Number of real emulator frames used to seed latent context (defaults to context_frames from config)",
+        help="Number of real emulator frames used to seed latent context (defaults to context_frames from DiT config)",
+    )
+    parser.add_argument(
+        "--ode-steps",
+        type=int,
+        default=8,
+        help="Euler denoising steps used per predicted frame",
     )
 
     parser.add_argument(
@@ -118,10 +135,10 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=["float32", "float16", "bfloat16"],
-        help="One-hot dtype for VAE encode path (defaults to world config or bfloat16)",
+        help="One-hot dtype for VAE encode path (defaults to DiT config or bfloat16)",
     )
     parser.add_argument("--autocast", action="store_true", help="Enable CUDA autocast")
-    parser.add_argument("--compile", action="store_true", help="Compile world model with torch.compile")
+    parser.add_argument("--compile", action="store_true", help="Compile DiT with torch.compile")
     parser.add_argument("--tf16", action="store_true", help="Enable lower precision float32 matmul on CUDA")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
@@ -197,33 +214,33 @@ def _is_readable_file(path: Path) -> bool:
         return False
 
 
-def _infer_world_config_path(args: argparse.Namespace) -> Path:
-    if args.world_config is not None:
-        return Path(args.world_config).resolve()
+def _infer_dit_config_path(args: argparse.Namespace) -> Path:
+    if args.dit_config is not None:
+        return Path(args.dit_config).resolve()
 
-    sibling = Path(args.world_checkpoint).resolve().parent / "config.json"
+    sibling = Path(args.dit_checkpoint).resolve().parent / "config.json"
     if sibling.is_file():
         return sibling
     raise FileNotFoundError(
-        "Could not infer --world-config from --world-checkpoint directory; pass --world-config explicitly."
+        "Could not infer --dit-config from --dit-checkpoint directory; pass --dit-config explicitly."
     )
 
 
 def _infer_video_vae_paths(
     *,
     args: argparse.Namespace,
-    world_cfg: dict[str, Any],
-    world_cfg_dir: Path,
+    model_cfg: dict[str, Any],
+    model_cfg_dir: Path,
 ) -> tuple[Path, Path]:
-    vae_ckpt_val = args.video_vae_checkpoint or world_cfg.get("video_vae_checkpoint")
-    vae_cfg_val = args.video_vae_config or world_cfg.get("video_vae_config")
+    vae_ckpt_val = args.video_vae_checkpoint or model_cfg.get("video_vae_checkpoint")
+    vae_cfg_val = args.video_vae_config or model_cfg.get("video_vae_config")
 
-    vae_ckpt = _resolve_path(vae_ckpt_val, config_dir=world_cfg_dir)
-    vae_cfg = _resolve_path(vae_cfg_val, config_dir=world_cfg_dir)
+    vae_ckpt = _resolve_path(vae_ckpt_val, config_dir=model_cfg_dir)
+    vae_cfg = _resolve_path(vae_cfg_val, config_dir=model_cfg_dir)
 
     if vae_ckpt is None:
         raise FileNotFoundError(
-            "Video VAE checkpoint path is missing. Pass --video-vae-checkpoint or include it in world config."
+            "Video VAE checkpoint path is missing. Pass --video-vae-checkpoint or include it in the DiT config."
         )
     # If config is missing or points to an unreadable machine-specific absolute path,
     # fall back to config.json beside the resolved VAE checkpoint.
@@ -233,7 +250,7 @@ def _infer_video_vae_paths(
             vae_cfg = inferred
         elif vae_cfg is None:
             raise FileNotFoundError(
-                "Video VAE config path is missing. Pass --video-vae-config or ensure world config contains video_vae_config."
+                "Video VAE config path is missing. Pass --video-vae-config or ensure DiT config contains video_vae_config."
             )
 
     if not _is_readable_file(vae_ckpt):
@@ -257,7 +274,7 @@ def _load_action_remap(data_dir: str | Path, *, num_actions: int) -> tuple[dict[
     action_to_index = {orig: idx for idx, orig in enumerate(reduced_to_original)}
     if any(idx >= num_actions for idx in action_to_index.values()):
         raise ValueError(
-            f"actions.json contains indices outside world model action range [0, {num_actions - 1}]"
+            f"actions.json contains indices outside model action range [0, {num_actions - 1}]"
         )
 
     default_index = action_to_index.get(0, 0)
@@ -324,22 +341,10 @@ def _load_video_vae(
     *,
     checkpoint_path: Path,
     config_path: Path,
-    version_hint: str,
     num_colors: int,
     device: torch.device,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     cfg = _load_json(config_path)
-    model_version = str(cfg.get("model_version", "")).lower()
-
-    if version_hint == "auto":
-        if model_version in {"v1", "v2"}:
-            version = model_version
-        elif "v2" in checkpoint_path.name.lower() or "v2" in config_path.name.lower():
-            version = "v2"
-        else:
-            version = "v1"
-    else:
-        version = version_hint
 
     patch_size = int(cfg.get("patch_size", 4))
     base_channels = int(cfg.get("base_channels", 64))
@@ -351,22 +356,12 @@ def _load_video_vae(
             f"VAE config expects num_colors={vae_num_colors} but palette has {num_colors}."
         )
 
-    if version == "v2":
-        vae: torch.nn.Module = LTXVideoVAEv2(
-            num_colors=vae_num_colors,
-            patch_size=patch_size,
-            base_channels=base_channels,
-            latent_channels=latent_channels,
-        )
-    elif version == "v1":
-        vae = LTXVideoVAE(
-            num_colors=vae_num_colors,
-            patch_size=patch_size,
-            base_channels=base_channels,
-            latent_channels=latent_channels,
-        )
-    else:
-        raise ValueError(f"Unknown video VAE version: {version}")
+    vae: torch.nn.Module = LTXVideoVAE(
+        num_colors=vae_num_colors,
+        patch_size=patch_size,
+        base_channels=base_channels,
+        latent_channels=latent_channels,
+    )
 
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
@@ -377,7 +372,6 @@ def _load_video_vae(
         parameter.requires_grad_(False)
 
     summary = {
-        "version": version,
         "patch_size": patch_size,
         "base_channels": base_channels,
         "latent_channels": latent_channels,
@@ -386,18 +380,18 @@ def _load_video_vae(
     return vae, summary
 
 
-def _load_world_model(
+def _load_dit_model(
     *,
     checkpoint_path: Path,
     config: dict[str, Any],
     device: torch.device,
     compile_model: bool,
-) -> VideoLatentWorldModel:
-    model = VideoLatentWorldModel(
+) -> VideoLatentDiT:
+    model = VideoLatentDiT(
         latent_channels=int(config["latent_channels"]),
         num_actions=int(config["num_actions"]),
-        d_model=int(config.get("d_model", 256)),
-        num_layers=int(config.get("num_layers", 8)),
+        d_model=int(config.get("d_model", 512)),
+        num_layers=int(config.get("num_layers", 12)),
         num_heads=int(config.get("num_heads", 8)),
         mlp_ratio=float(config.get("mlp_ratio", 4.0)),
         dropout=float(config.get("dropout", 0.0)),
@@ -415,11 +409,11 @@ def _load_world_model(
     return model
 
 
-class LiveWorldModel:
+class LiveDiTWorldModel:
     def __init__(
         self,
         *,
-        world_model: VideoLatentWorldModel,
+        dit_model: VideoLatentDiT,
         video_vae: torch.nn.Module,
         device: torch.device,
         palette_rgb: np.ndarray,
@@ -427,10 +421,11 @@ class LiveWorldModel:
         autocast_enabled: bool,
         autocast_dtype: torch.dtype,
         window_frames: int,
+        ode_steps: int,
         action_to_index: dict[int, int],
         default_action_index: int,
     ) -> None:
-        self.world_model = world_model
+        self.dit_model = dit_model
         self.video_vae = video_vae
         self.device = device
         self.palette_rgb = palette_rgb
@@ -438,9 +433,10 @@ class LiveWorldModel:
         self.autocast_enabled = autocast_enabled
         self.autocast_dtype = autocast_dtype
         self.window_frames = window_frames
+        self.ode_steps = int(ode_steps)
         self.action_to_index = action_to_index
         self.default_action_index = int(default_action_index)
-        self.num_actions = int(self.world_model.action_embed.num_embeddings)
+        self.num_actions = int(self.dit_model.action_embed.num_embeddings)
 
         self.num_colors = int(palette_rgb.shape[0])
         self.rgb_lut = _build_rgb_lut(palette_rgb)
@@ -463,6 +459,30 @@ class LiveWorldModel:
                 f"Reduced action index {encoded} out of range [0, {self.num_actions - 1}]"
             )
         return encoded
+
+    def _denoise_future_segment(self, history_latents: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        batch, channels, context_frames, height, width = history_latents.shape
+        future = torch.randn(
+            batch,
+            channels,
+            1,
+            height,
+            width,
+            device=history_latents.device,
+            dtype=history_latents.dtype,
+        )
+
+        dt = 1.0 / float(self.ode_steps)
+        for step in range(self.ode_steps, 0, -1):
+            t_val = (step - 0.5) / float(self.ode_steps)
+            t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
+            model_input = torch.cat((history_latents, future), dim=2)
+            with self._autocast_context():
+                velocity = self.dit_model(model_input, actions, t)
+            velocity_future = velocity[:, :, context_frames:]
+            future = future - dt * velocity_future
+
+        return future
 
     def _autocast_context(self):
         if not self.autocast_enabled:
@@ -526,24 +546,25 @@ class LiveWorldModel:
 
     def predict_next_frame(self, action_byte: int) -> np.ndarray:
         if not self.latent_history:
-            raise RuntimeError("World model context is empty")
+            raise RuntimeError("DiT context is empty")
 
-        latents = torch.cat(list(self.latent_history), dim=2)
-        steps = int(latents.shape[2])
+        history_latents = torch.cat(list(self.latent_history), dim=2)
+        history_steps = int(history_latents.shape[2])
 
         history_actions = list(self.action_history)
-        if len(history_actions) != steps - 1:
+        if len(history_actions) != history_steps - 1:
             raise RuntimeError(
-                f"Action/latent history mismatch: actions={len(history_actions)} latents={steps}"
+                f"Action/latent history mismatch: actions={len(history_actions)} latents={history_steps}"
             )
 
         next_action = self._encode_action(action_byte)
-        actions = torch.tensor(history_actions + [next_action], device=self.device, dtype=torch.long).unsqueeze(0)
+        actions_seq = [self.default_action_index] + history_actions + [next_action]
+        actions = torch.tensor(actions_seq, device=self.device, dtype=torch.long).unsqueeze(0)
 
-        with torch.no_grad(), self._autocast_context():
-            predicted = self.world_model(latents, actions)
-            next_latent = predicted[:, :, -1:].float()
-            logits = self.video_vae.decode(next_latent)
+        with torch.no_grad():
+            next_latent = self._denoise_future_segment(history_latents, actions).float()
+            with self._autocast_context():
+                logits = self.video_vae.decode(next_latent)
 
         frame_idx = logits.argmax(dim=1)[0, 0].detach().cpu().numpy()
 
@@ -575,7 +596,7 @@ def _frame_to_surface(frame_rgb: np.ndarray, out_size: tuple[int, int]) -> pygam
 def _warmup_nes_py(
     env: Any,
     controller: nes_play.GamepadController,
-    world: LiveWorldModel,
+    world: LiveDiTWorldModel,
     *,
     initial_obs: np.ndarray,
     warmup_frames: int,
@@ -588,11 +609,12 @@ def _warmup_nes_py(
 
     while not world.ready(warmup_frames):
         if warmup_policy == "live":
-            action = controller.get_action()
+            nes_action = controller.get_action()
         else:
-            action = 0
+            nes_action = 0
+        recorded_action = _nes_to_recorded_action_byte(nes_action)
 
-        obs, _reward, done, _info = env.step(action)
+        obs, _reward, done, _info = env.step(nes_action)
         if done:
             obs = env.reset()
             current_obs = obs
@@ -602,8 +624,8 @@ def _warmup_nes_py(
             continue
 
         current_obs = obs
-        action_history.append(int(action))
-        real_cropped_idx = world.ingest_transition(action, obs)
+        action_history.append(int(recorded_action))
+        real_cropped_idx = world.ingest_transition(recorded_action, obs)
         frame_history.append(real_cropped_idx.copy())
 
     return {
@@ -617,7 +639,7 @@ def _warmup_nes_py(
 def _warmup_retro(
     env: Any,
     controller: nes_play.GamepadController,
-    world: LiveWorldModel,
+    world: LiveDiTWorldModel,
     *,
     initial_obs: np.ndarray,
     warmup_frames: int,
@@ -630,11 +652,14 @@ def _warmup_retro(
 
     while not world.ready(warmup_frames):
         if warmup_policy == "live":
-            action = controller.get_action()
+            nes_action = controller.get_action()
         else:
-            action = 0
+            nes_action = 0
+        recorded_action = _nes_to_recorded_action_byte(nes_action)
 
-        obs, _reward, terminated, truncated, _info = env.step(nes_play.nes_byte_to_retro_action(action))
+        obs, _reward, terminated, truncated, _info = env.step(
+            nes_play.nes_byte_to_retro_action(nes_action)
+        )
         if terminated or truncated:
             obs, _info = env.reset()
             current_obs = obs
@@ -644,8 +669,8 @@ def _warmup_retro(
             continue
 
         current_obs = obs
-        action_history.append(int(action))
-        real_cropped_idx = world.ingest_transition(action, obs)
+        action_history.append(int(recorded_action))
+        real_cropped_idx = world.ingest_transition(recorded_action, obs)
         frame_history.append(real_cropped_idx.copy())
 
     return {
@@ -660,7 +685,7 @@ def _run_nes_py(
     name: str,
     rom_path: str,
     *,
-    world: LiveWorldModel,
+    world: LiveDiTWorldModel,
     scale: int,
     fps: int,
     view: str,
@@ -675,12 +700,12 @@ def _run_nes_py(
     pygame.init()
     win_w, win_h, panel_w, panel_h = _make_display_sizes(scale, view)
     screen = pygame.display.set_mode((win_w, win_h))
-    pygame.display.set_caption(f"{name} (world model)")
+    pygame.display.set_caption(f"{name} (video-latent DiT)")
     clock = pygame.time.Clock()
     controller = nes_play.GamepadController()
     hud_font = pygame.font.SysFont("monospace", 14, bold=True)
 
-    print(f"Warming up world context with {warmup_frames} frame(s)...")
+    print(f"Warming up DiT context with {warmup_frames} frame(s)...")
     warmup_state = _warmup_nes_py(
         env,
         controller,
@@ -713,10 +738,11 @@ def _run_nes_py(
             world.recontext_from_history(list(frame_history), list(action_history))
             print(f"[recontext] rebuilt context from {len(frame_history)} real frame(s)")
 
-        action = controller.get_action()
-        predicted_rgb = world.predict_next_frame(action)
+        nes_action = controller.get_action()
+        recorded_action = _nes_to_recorded_action_byte(nes_action)
+        predicted_rgb = world.predict_next_frame(recorded_action)
 
-        obs, _reward, done, _info = env.step(action)
+        obs, _reward, done, _info = env.step(nes_action)
         if done:
             obs = env.reset()
             warmup_state = _warmup_nes_py(
@@ -735,7 +761,7 @@ def _run_nes_py(
         else:
             real_idx = world.preprocess_frame(obs)
             real_rgb = world.palette_rgb[real_idx]
-            action_history.append(int(action))
+            action_history.append(int(recorded_action))
             frame_history.append(real_idx.copy())
 
         screen.fill((8, 8, 12))
@@ -744,11 +770,11 @@ def _run_nes_py(
             pred_surface = _frame_to_surface(predicted_rgb, (panel_w, panel_h))
             screen.blit(real_surface, (0, 0))
             screen.blit(pred_surface, (panel_w, 0))
-            label = "REAL | WORLD"
+            label = "REAL | DIT"
         else:
             pred_surface = _frame_to_surface(predicted_rgb, (panel_w, panel_h))
             screen.blit(pred_surface, (0, 0))
-            label = "WORLD"
+            label = "DIT"
 
         fps_frame += 1
         if fps_frame >= 30:
@@ -772,7 +798,7 @@ def _run_retro(
     name: str,
     rom_path: str,
     *,
-    world: LiveWorldModel,
+    world: LiveDiTWorldModel,
     scale: int,
     fps: int,
     view: str,
@@ -794,12 +820,12 @@ def _run_retro(
     pygame.init()
     win_w, win_h, panel_w, panel_h = _make_display_sizes(scale, view)
     screen = pygame.display.set_mode((win_w, win_h), pygame.DOUBLEBUF)
-    pygame.display.set_caption(f"{name} (world model)")
+    pygame.display.set_caption(f"{name} (video-latent DiT)")
     clock = pygame.time.Clock()
     controller = nes_play.GamepadController()
     hud_font = pygame.font.SysFont("monospace", 14, bold=True)
 
-    print(f"Warming up world context with {warmup_frames} frame(s)...")
+    print(f"Warming up DiT context with {warmup_frames} frame(s)...")
     warmup_state = _warmup_retro(
         env,
         controller,
@@ -832,10 +858,13 @@ def _run_retro(
             world.recontext_from_history(list(frame_history), list(action_history))
             print(f"[recontext] rebuilt context from {len(frame_history)} real frame(s)")
 
-        action = controller.get_action()
-        predicted_rgb = world.predict_next_frame(action)
+        nes_action = controller.get_action()
+        recorded_action = _nes_to_recorded_action_byte(nes_action)
+        predicted_rgb = world.predict_next_frame(recorded_action)
 
-        obs, _reward, terminated, truncated, _info = env.step(nes_play.nes_byte_to_retro_action(action))
+        obs, _reward, terminated, truncated, _info = env.step(
+            nes_play.nes_byte_to_retro_action(nes_action)
+        )
         if terminated or truncated:
             obs, _info = env.reset()
             warmup_state = _warmup_retro(
@@ -854,7 +883,7 @@ def _run_retro(
         else:
             real_idx = world.preprocess_frame(obs)
             real_rgb = world.palette_rgb[real_idx]
-            action_history.append(int(action))
+            action_history.append(int(recorded_action))
             frame_history.append(real_idx.copy())
 
         screen.fill((8, 8, 12))
@@ -863,11 +892,11 @@ def _run_retro(
             pred_surface = _frame_to_surface(predicted_rgb, (panel_w, panel_h))
             screen.blit(real_surface, (0, 0))
             screen.blit(pred_surface, (panel_w, 0))
-            label = "REAL | WORLD"
+            label = "REAL | DIT"
         else:
             pred_surface = _frame_to_surface(predicted_rgb, (panel_w, panel_h))
             screen.blit(pred_surface, (0, 0))
-            label = "WORLD"
+            label = "DIT"
 
         fps_frame += 1
         if fps_frame >= 30:
@@ -894,10 +923,12 @@ def main() -> None:
         raise SystemExit("--scale must be >= 1")
     if args.fps < 1:
         raise SystemExit("--fps must be >= 1")
+    if args.ode_steps < 1:
+        raise SystemExit("--ode-steps must be >= 1")
 
-    world_checkpoint = Path(args.world_checkpoint).resolve()
-    if not world_checkpoint.is_file():
-        raise FileNotFoundError(f"World checkpoint not found: {world_checkpoint}")
+    dit_checkpoint = Path(args.dit_checkpoint).resolve()
+    if not dit_checkpoint.is_file():
+        raise FileNotFoundError(f"DiT checkpoint not found: {dit_checkpoint}")
 
     device = _resolve_device(args.device)
     if device.type == "cuda":
@@ -909,10 +940,10 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    world_config_path = _infer_world_config_path(args)
-    if not _is_readable_file(world_config_path):
-        raise FileNotFoundError(f"World config not found: {world_config_path}")
-    world_config = _load_json(world_config_path)
+    dit_config_path = _infer_dit_config_path(args)
+    if not _is_readable_file(dit_config_path):
+        raise FileNotFoundError(f"DiT config not found: {dit_config_path}")
+    dit_config = _load_json(dit_config_path)
 
     palette_info = load_palette_info(args.data_dir)
     palette_rgb = np.asarray(palette_info["colors_rgb"], dtype=np.uint8)
@@ -921,11 +952,11 @@ def main() -> None:
 
     vae_ckpt, vae_cfg = _infer_video_vae_paths(
         args=args,
-        world_cfg=world_config,
-        world_cfg_dir=world_config_path.parent,
+        model_cfg=dit_config,
+        model_cfg_dir=dit_config_path.parent,
     )
 
-    onehot_name = args.onehot_dtype or str(world_config.get("onehot_dtype", "bfloat16"))
+    onehot_name = args.onehot_dtype or str(dit_config.get("onehot_dtype", "bfloat16"))
     onehot_dtype = _dtype_from_name(onehot_name)
 
     autocast_enabled = bool(args.autocast and device.type == "cuda")
@@ -937,27 +968,26 @@ def main() -> None:
     video_vae, vae_summary = _load_video_vae(
         checkpoint_path=vae_ckpt,
         config_path=vae_cfg,
-        version_hint=args.video_vae_version,
         num_colors=num_colors,
         device=device,
     )
 
-    world_model = _load_world_model(
-        checkpoint_path=world_checkpoint,
-        config=world_config,
+    dit_model = _load_dit_model(
+        checkpoint_path=dit_checkpoint,
+        config=dit_config,
         device=device,
         compile_model=bool(args.compile),
     )
 
     action_to_index, default_action_index = _load_action_remap(
         args.data_dir,
-        num_actions=int(world_config["num_actions"]),
+        num_actions=int(dit_config["num_actions"]),
     )
 
-    model_max_frames = int(world_config.get("max_frames", 64))
-    default_window = int(world_config.get("clip_frames", min(16, model_max_frames)))
+    model_max_frames = int(dit_config.get("max_frames", 64))
+    default_window = int(dit_config.get("clip_frames", max(2, min(16, model_max_frames - 1))))
     window_frames = int(args.window_frames or default_window)
-    warmup_frames = int(args.warmup_frames or world_config.get("context_frames", 4))
+    warmup_frames = int(args.warmup_frames or dit_config.get("context_frames", 4))
 
     if window_frames < 2:
         raise SystemExit("--window-frames must be >= 2")
@@ -965,13 +995,13 @@ def main() -> None:
         raise SystemExit("--warmup-frames must be >= 1")
     if warmup_frames > window_frames:
         raise SystemExit("--warmup-frames must be <= --window-frames")
-    if window_frames > model_max_frames:
+    if window_frames + 1 > model_max_frames:
         raise SystemExit(
-            f"--window-frames ({window_frames}) exceeds world model max_frames ({model_max_frames})"
+            f"--window-frames ({window_frames}) + 1 exceeds DiT max_frames ({model_max_frames})"
         )
 
-    world = LiveWorldModel(
-        world_model=world_model,
+    world = LiveDiTWorldModel(
+        dit_model=dit_model,
         video_vae=video_vae,
         device=device,
         palette_rgb=palette_rgb,
@@ -979,6 +1009,7 @@ def main() -> None:
         autocast_enabled=autocast_enabled,
         autocast_dtype=autocast_dtype,
         window_frames=window_frames,
+        ode_steps=args.ode_steps,
         action_to_index=action_to_index,
         default_action_index=default_action_index,
     )
@@ -995,20 +1026,20 @@ def main() -> None:
 
     print(f"Using device: {device}")
     print(
-        f"World: d_model={world_config.get('d_model')} layers={world_config.get('num_layers')} "
-        f"heads={world_config.get('num_heads')} max_frames={model_max_frames}"
+        f"DiT: d_model={dit_config.get('d_model')} layers={dit_config.get('num_layers')} "
+        f"heads={dit_config.get('num_heads')} max_frames={model_max_frames}"
     )
     print(
-        f"VAE: version={vae_summary['version']} latent_channels={vae_summary['latent_channels']} "
+        f"VAE: latent_channels={vae_summary['latent_channels']} "
         f"onehot_dtype={onehot_name}"
     )
     print(
         f"Rollout: window_frames={window_frames}, warmup_frames={warmup_frames}, "
-        f"warmup_policy={args.warmup_policy}, view={args.view}"
+        f"ode_steps={args.ode_steps}, warmup_policy={args.warmup_policy}, view={args.view}"
     )
     print(
         f"Actions: {len(action_to_index)} mapped -> reduced space of "
-        f"{world_config.get('num_actions')} (fallback index={default_action_index})"
+        f"{dit_config.get('num_actions')} (fallback index={default_action_index})"
     )
     print(f"Loading {name} (backend: {backend})")
     print(

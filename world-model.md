@@ -37,8 +37,7 @@ Important current-state detail:
 2. LTXAudioVAE
 3. LTXAudioVocoder
 4. PaletteVideoTokenizer (MagViT-derived)
-5. LFQ quantizer variant used in MagViT route
-6. Compact 3D GAN discriminator (optional in MagViT training)
+5. Compact 3D GAN discriminator (optional in video vae training)
 - Planned/design-direction:
 1. MatrixGame-style joint world model (not yet present as code in this repo)
 2. Action-conditioned latent dynamics core replacing DynamicsTransformer + LatentDenoiser concept noted in ai-notes.md

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Train the LTX Video VAE (learned-upsample decoder)."""
 from __future__ import annotations
 
 import argparse
@@ -61,7 +62,7 @@ def _format_bytes(num_bytes: int) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the LTX-style palette video VAE.")
+    parser = argparse.ArgumentParser(description="Train the LTX Video VAE (learned-upsample decoder).")
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -91,7 +92,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--latent-channels", type=int, default=64)
-    parser.add_argument("--patch-size", type=int, default=4)
+    parser.add_argument("--patch-size", type=int, default=4,
+                        help="Encoder patchify size (decoder uses learned upsampling).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tf16", action="store_true", help="Enable TF16 matmul precision")
     parser.add_argument(
@@ -332,7 +334,6 @@ def evaluate(
             inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
             onehot_buffer = inputs
             with autocast_context():
-                # Deterministic eval: decode from posterior mean (no latent sampling noise).
                 outputs = model(inputs, sample_posterior=False)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
             recon_loss = focal_cross_entropy(
@@ -345,7 +346,6 @@ def evaluate(
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
             if preview is None:
-                # Deterministic forward pass (no posterior sampling) for a clean preview.
                 with autocast_context():
                     preview_out = model(inputs[:1], sample_posterior=False)
                 preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
@@ -605,11 +605,11 @@ def main() -> None:
         progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
         progress = min(max(progress, 0.0), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 0.25 + 0.75 * cosine # 10% is too small
+        return 0.25 + 0.75 * cosine
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     if warmup_steps > 0:
-        console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 10% of peak")
+        console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")
     else:
         console.print("[lr] Cosine decay (no warmup)")
 
@@ -647,6 +647,7 @@ def main() -> None:
     config = vars(args).copy()
     config.update(
         {
+            "model_name": "ltx_video_vae",
             "num_colors": int(num_colors),
             "num_parameters": int(sum(parameter.numel() for parameter in model.parameters())),
             "discriminator_parameters": int(discriminator_num_parameters),
@@ -659,7 +660,7 @@ def main() -> None:
     console.print(f"Config saved to {output_dir / 'config.json'}")
     console.print(json.dumps(config, indent=2))
 
-    console.print(f"Training LTX video VAE on {len(train_dataset)} samples")
+    console.print(f"Training LTX Video VAE on {len(train_dataset)} samples")
     console.print(f"Output directory: {output_dir}")
     console.print(f"Device: {device}")
     console.print(f"Model parameters: {config['num_parameters']:,}")
@@ -723,10 +724,8 @@ def main() -> None:
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
 
-            # Save detached fakes for discriminator update (before graph is freed).
             fake_video_detached = None
             if gan_active and discriminator is not None:
-                # --- Generator adversarial loss (live graph through discriminator) ---
                 set_requires_grad(discriminator, False)
                 with autocast_context():
                     fake_video = outputs.logits.softmax(dim=1)
@@ -736,7 +735,6 @@ def main() -> None:
                 loss = loss + args.gan_weight * gen_adv_loss
                 del fake_video, gen_adv_loss
 
-            # Generator backward (frees computation graph before discriminator update).
             if grad_scaler.is_enabled():
                 grad_scaler.scale(loss).backward()
             else:
@@ -752,7 +750,6 @@ def main() -> None:
             scheduler.step()
             del outputs, recon_logits, recon_targets
 
-            # --- Discriminator update (after generator graph is freed) ---
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
