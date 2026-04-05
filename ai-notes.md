@@ -13,6 +13,27 @@ Concretely:
 
 Gradients pass through the quantization via the straight-through estimator (`x + (quantized - x).detach()`). An entropy auxiliary loss encourages codebook utilization: per-sample entropy is minimized (confident predictions) while batch-wide entropy is maximized (uniform code usage). The discrete indices are just the binary pattern of positive/negative dimensions packed into integers.
 
+### Rotation Trick For Vector Quantization
+
+Standard VQ-VAE training usually handles the non-differentiable nearest-code lookup with a straight-through estimator, so the encoder effectively receives gradients that bypass the quantization step rather than gradients that reflect what the quantizer actually did.
+
+One proposed alternative is the **rotation trick** for vector quantization. Instead of treating quantization as a hard stop in backprop, the encoder output is smoothly mapped onto its selected codebook vector with a linear transformation consisting of a rotation plus rescaling. That transformation is treated as constant during backpropagation.
+
+The key idea is that the backward pass can then preserve some geometric information from the quantization event itself:
+
+- the relative angle between the encoder output and the chosen codebook vector
+- the relative magnitude mismatch between them
+
+So instead of the encoder seeing only a crude straight-through surrogate, the gradient carries information about how the encoder output needed to move to better align with the assigned code.
+
+Reported benefits from this idea include:
+
+- lower reconstruction error
+- better codebook utilization
+- lower quantization error
+
+This seems relevant if we return to explicit VQ or codebook-based tokenizers. It is less directly applicable to the current KL-VAE path, but it could be worth testing in any future MAGVIT / LFQ / VQ-VAE-style experiments where codebook collapse or weak quantizer-aware gradients become a bottleneck.
+
 ### Context Frames & Temporal Padding in PaletteVideoTokenizer
 
 The `PaletteVideoTokenizer` disables temporal padding on `conv_in` and replaces it with real context frames from the data.
@@ -104,7 +125,6 @@ Explored whether a 100× downscaled LTX-Video 2.3 architecture (DiT-based latent
 ### Why LTX/DiT Is a Better Fit
 - **Unified model**: DiT replaces both DynamicsTransformer and LatentDenoiser with a single transformer that does denoising via self-attention over spatiotemporal latent patches. Architecturally simpler.
 - **Flow matching over DDPM**: LTX uses rectified flow matching (linear interpolation $x_t = (1-t)x_0 + t\epsilon$, velocity prediction). Trains faster, samples in 5–20 steps instead of 200 DDPM steps.
-- **RoPE** for spatiotemporal position encoding instead of learned embeddings (better generalization).
 - **Action conditioning via AdaLN** (adaptive layer norm) replaces LTX's text-conditioning cross-attention path — much cheaper and appropriate for our discrete action space.
 
 ### What "Patchifying" Means
@@ -157,17 +177,34 @@ LTX-Video full is ~2B. Scaling knobs for 100× reduction:
 
 Example config: dim=384, 8 layers, 6 heads on 4×14×14 latents (196 spatial patches × ~8 frames) ≈ **30–40M params** unified model.
 
-### Causal Temporal Masking
-For autoregressive rollout, mask attention so frame $t$ only attends to frames $\leq t$. LTX already does this for video continuation, so the architecture natively supports it.
-
 ### Attention Feasibility
 With 196 spatial tokens × 16 frames = 3,136 tokens, full causal attention is feasible at this model size. Windowed attention optional but not strictly necessary.
 
 ### Key Modifications to LTX for This Project
-1. **Keep existing tokenizer** — reuse the MAGVIT-2 (discrete, 16×16) to produce latent patches. No need to train a new 3D VAE.
 2. **Action conditioning via AdaLN** — replace text cross-attention with adaptive layer norm conditioned on action embeddings.
 3. **Flow matching replaces DDPM** — linear interpolant, velocity prediction, 5–20 sampling steps.
-4. **Causal temporal masking** built into the attention for autoregressive rollout.
+
+### DiT Tricks Still Worth Testing For This Project
+
+Assuming the dynamics transformer will always run at the same context length and the same latent spatial resolution seen during training, the most relevant remaining DiT-style improvements are conditioning and normalization tricks.
+
+Priority order:
+
+1. **Use q/k RMSNorm on every attention path**
+	- The current model already benefited from RMSNorm.
+	- The next clean step is to make it consistent across all self-attention and cross-attention modules rather than only some of them.
+
+2. **Upgrade to full adaLN-zero style conditioning**
+	- Use timestep-conditioned modulation on each transformer sublayer, with zero-initialized modulation so the network starts close to an identity residual stack.
+	- This is one of the most standard and proven DiT training tricks.
+
+3. **Add residual gating on attention / MLP branches**
+	- Per-branch or per-head gating is a standard stability/control trick in modern transformer variants.
+	- This fits naturally with adaLN-style conditioning and can help prevent any one branch from dominating early in training.
+
+4. **Consider RMSNorm for the main residual-stream norms too**
+	- Beyond q/k normalization, the remaining LayerNorm sites in the residual stack could be converted to RMSNorm.
+	- This is a broader change than q/k RMSNorm, so it should be treated as a later ablation rather than the first follow-up.
 
 ---
 
@@ -227,11 +264,6 @@ Concatenate audio latent patches with video latent patches in the transformer se
 ```
 
 The DiT jointly denoises both modalities using a shared diffusion timestep, with modality-specific input/output projection layers. This is how recent joint audio-video diffusion models work.
-
-### What Wouldn't Work Well
-- Full bidirectional spatiotemporal attention over very long sequences at 20M params (but causal/windowed attention is fine).
-- Trying to generate high-fidelity audio waveforms purely from APU register prediction (bypassed by having actual audio in AVIs).
-- Training a full 3D video VAE from scratch at this scale (unnecessary — reuse existing tokenizers).
 
 ### Half-Resolution Warm Start
 
@@ -305,3 +337,29 @@ using a small $\lambda$ so the discriminator nudges the choice rather than domin
 - Compare the improvement against the extra inference cost from generating multiple candidates.
 
 - If this helps, the next step would be discriminator-guided sampling rather than pure reranking.
+
+## Video VAE Latents
+
+**Context:**
+
+The diffusion transformer (DiT) trained on the video VAE latent codes showed notably slow convergence and struggled to learn meaningful temporal dynamics. AI suggested the latent space might be either too entangled (mixing visual and temporal information in ways that confuse the transformer) or too noisy for reliable prediction. The issue likely stems from the continuous KL-regularized latent space not being well-suited for discrete token prediction, or the latent representations compressing information in ways that obscure the underlying game dynamics.
+
+**Approach:**
+
+Several engineering strategies were considered to improve the learnability of the video latent space for autoregressive generation:
+
+1. **Increase KL weight** — Boost the KL regularization term to encourage a tighter, more structured latent distribution that may be easier for the transformer to model.
+
+2. **Cross-latent constraints** — Enforce structural alignment between video and RAM latent embeddings via MSE or contrastive losses. Since RAM contains ground-truth game state while video is high-dimensional observations, clipping or matching them could encourage the video encoder to prioritize semantically meaningful features over visual details.
+
+3. **Temporal consistency regularization** — Add explicit smoothness constraints by penalizing divergence between latents from consecutive frames (should be similar) and random temporal frames (should differ). This pushes the latent space to encode meaningful temporal structure.
+
+4. **Factorized latent spaces** — Separate the latent into semantic (game state) and visual (appearance) components. While the decoder could theoretically ignore the semantic part, it may help the transformer focus on the right variable during prediction.
+
+5. **Data augmentation** — Apply more aggressive augmentation during training to improve generalization and robustness of the learned representation.
+
+6. **Decoder architecture reduction** — Simplify the decoder (fewer channels, fewer residual blocks) to reduce model capacity and force the encoder to preserve more information in the latent rather than deferring complexity to reconstruction.
+
+**Result:**
+
+TODO

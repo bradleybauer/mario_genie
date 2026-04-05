@@ -226,7 +226,7 @@ Check if frame spilts can be prevented with Mesen.
 
 **Result:** 
 
-I have not seen any frame splits with mesen but I have seen some other graphical glitches. I'm not sure if there is a reasonable way to deal with those. Luckily they are sparse and affect only a small amount of pixels.
+I have not seen any frame splits with mesen. Mesen's data is super duper clean.
 
 <br>
 <br>
@@ -399,6 +399,79 @@ These values came from scanning the full dataset audio distribution. At `24` kHz
 The initial audio VAE run produced decent reconstructions, though I have not yet measured how aggressively the bottleneck can be tightened before quality falls off. There is still a fair amount of tuning left to do.
 
 The vocoder successfully overfit a single sample and produced high-quality output audio. The sample happened to contain a power-up sound, which made it especially easy to hear that the model was capturing the characteristic NES sound rather than just broad envelope shape.
+
+<br>
+<br>
+
+# Initial Video Only World Model Tests
+
+**Context:**
+
+The first video-only world model experiments used pre-encoded `LTXVideoVAE` latents and trained an action-conditioned latent DiT with a continuous flow-matching objective rather than discrete next-token prediction.
+
+The initial problem was straightforward: training in full precision was stable but slow, while `bf16` made training roughly `10x` faster but introduced severe gradient blow-ups. At that point it was hard to tell whether the bottleneck was numerical instability, model size, or the latent representation itself.
+
+**Approach:**
+
+Several engineering changes were made to make the latent DiT cheaper and more stable:
+
+1. **Reduced model size**: cut the DiT configuration down by about an order of magnitude in compute. The working assumption was that Mario latents probably do not need the aggressive hidden-dimension inflation common in large image/video transformers.
+
+2. **Switched to Diffusers + Accelerate**: this simplified mixed-precision training, checkpointing, and general training boilerplate.
+
+3. **Added per-channel latent standardization**: latent channels are normalized using dataset mean/std before training. For flow matching, this makes the interpolation
+
+$$
+x_t = (1 - t)x_0 + t\epsilon
+$$
+
+better behaved by putting the clean latent target $x_0$ and Gaussian noise $\epsilon$ on a more comparable scale.
+
+4. **Added RMS-normalized attention logits**: `qk_norm="rms_norm"` was added to the most sensitive attention paths to reduce exploding attention activations under mixed precision.
+
+5. **Added verbose gradient norm logging**: this made it easier to see whether failures were coming from the attention stack, the output projection, or the optimizer step itself.
+
+The model was still trained in a causal setup: future latent frames are noised, the model predicts velocity targets, and actions are shifted causally so the action at step $t$ only conditions predictions at or after that step.
+
+**Result:**
+
+`qk` RMS normalization mostly fixed the catastrophic gradient blow-ups and made `bf16` training practical.
+
+However, once the numerical instability was under control, a second issue became clearer: the loss still was not dropping as quickly as hoped on a per-step basis.
+
+The current best hypothesis is that the video VAE latent is still too entangled or too reconstruction-oriented for a small dynamics model to predict efficiently. In other words, fixing the training stack made the optimization healthier, but it also made it more obvious that latent quality is now the main bottleneck rather than raw numerical instability.
+
+That is what motivated the next set of experiments in the **Video VAE Latents** section below.
+
+<br>
+<br>
+
+# Video VAE Latents
+
+**Context:**
+
+The diffusion transformer (DiT) trained on the video VAE latent codes showed notably slow convergence and struggled to learn meaningful temporal dynamics. AI suggested the latent space might be either too entangled (mixing visual and temporal information in ways that confuse the transformer) or too noisy for reliable prediction. The issue likely stems from the continuous KL-regularized latent space not being well-suited for discrete token prediction, or the latent representations compressing information in ways that obscure the underlying game dynamics.
+
+**Approach:**
+
+Several engineering strategies were considered to improve the learnability of the video latent space for autoregressive generation:
+
+1. **Increase KL weight** — Boost the KL regularization term to encourage a tighter, more structured latent distribution that may be easier for the transformer to model.
+
+2. **Cross-latent constraints** — Enforce structural alignment between video and RAM latent embeddings via MSE or contrastive losses. Since RAM contains ground-truth game state while video is high-dimensional observations, clipping or matching them could encourage the video encoder to prioritize semantically meaningful features over visual details.
+
+3. **Temporal consistency regularization** — Add explicit smoothness constraints by penalizing divergence between latents from consecutive frames (should be similar) and random temporal frames (should differ). This pushes the latent space to encode meaningful temporal structure.
+
+4. **Factorized latent spaces** — Separate the latent into semantic (game state) and visual (appearance) components. While the decoder could theoretically ignore the semantic part, it may help the transformer focus on the right variable during prediction.
+
+5. **Data augmentation** — Apply more aggressive augmentation during training to improve generalization and robustness of the learned representation.
+
+6. **Decoder architecture reduction** — Simplify the decoder (fewer channels, fewer residual blocks) to reduce model capacity and force the encoder to preserve more information in the latent rather than deferring complexity to reconstruction.
+
+**Result:**
+
+TODO
+
 
 <!-- Template -->
 

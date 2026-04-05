@@ -6,15 +6,17 @@ from pathlib import Path
 import pytest
 import torch
 
+pytest.importorskip("diffusers")
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.video_latent_dit import VideoLatentDiT
+from mario_world_model.video_latent_dit_diffusers import VideoLatentDiTDiffusers
 
 
-def _make_model(**kwargs) -> VideoLatentDiT:
+def _make_model(**kwargs) -> VideoLatentDiTDiffusers:
     defaults = dict(
         latent_channels=8,
         num_actions=16,
@@ -25,7 +27,7 @@ def _make_model(**kwargs) -> VideoLatentDiT:
         max_frames=32,
     )
     defaults.update(kwargs)
-    return VideoLatentDiT(**defaults)
+    return VideoLatentDiTDiffusers(**defaults)
 
 
 def test_forward_output_shape() -> None:
