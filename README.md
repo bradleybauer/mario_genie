@@ -11,8 +11,11 @@
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
 - [Tokenizer Variables To Explore](#tokenizer-variables-to-explore)
+- [Memory Optimizations](#memory-optimizations)
+- [Video VAE Training Updates](#video-vae-training-updates)
 - [Training Recipe](#training-recipe)
 - [LTX Video And Audio VAE](#ltx-video-and-audio-vae)
+- [First Audio Experiments](#first-audio-experiments)
 
 <br>
 
@@ -268,34 +271,6 @@ Context images idea worked quite nicely. Non-context images consistently have be
 <br>
 <br>
 
-# Audio
-
-**Context:**
-![](pictures/audio.png)
-
-**Approach:**
-
-Run a dataset-wide spectrum analysis over the raw Mesen AVI recordings, then pick mel front-end parameters that preserve most of the energy while staying aligned with the NES frame rate.
-
-**Result:**
-
-Current mel defaults for SMB1 audio:
-
-- Sample rate: `24000` Hz mono
-- Window / `n_fft`: `400` samples
-- Hop length: `100` samples
-- Mel bins / `n_mels`: `64`
-- `fmin`: `40` Hz
-- `fmax`: `8000` Hz
-- Log floor: `80` dB
-- STFT window: Hann
-
-These values came from scanning the full dataset audio distribution. At `24` kHz, about `98.5%` of spectral energy is retained relative to the original audio. Only about `2.5%` of energy falls below `40` Hz, and only about `2.4%` sits above `8` kHz. A `400`-sample window is also convenient because it is almost exactly one NES video frame at `~60.1` FPS, while a `100`-sample hop gives about four mel steps per frame.
-
-
-<br>
-<br>
-
 # Memory Optimizations
 
 **Context:**
@@ -313,11 +288,11 @@ Cuts memory enough to increase batch size or use larger models on the same GPU. 
 <br>
 <br>
 
-# Training Updates
+# Video VAE Training Updates
 
 **Context:**
 
-The baseline cross-entropy loss treats all palette colors equally, but the NES color distribution is extremely skewed — sky blue and black dominate, while rare colors like coin-gold or power-up red appear in a tiny fraction of pixels. The model learns the dominant colors quickly and ignores the rare ones.
+Baseline cross-entropy loss treats all palette colors equally. But the NES color distribution is extremely skewed — sky blue and black dominate, while rare colors like coin-gold or power-up red appear in a tiny fraction of pixels. The model learns the dominant colors quickly and ignores the rare ones.
 
 Dataset palette distribution (~80.8 billion pixels across 23 colors):
 
@@ -345,7 +320,7 @@ Three changes layered on top of each other:
 
 **Result:**
 
-Results look good so far. Model is training. Adding LeCAM regularization made discriminator training actually work.
+Results look good. LeCAM regularization made the discriminator training actually work. Adding a discriminator improved training stability of the vae model even.
 
 <br>
 <br>
@@ -382,16 +357,48 @@ The LTX VAE reached recon loss ~0.007 at 25k steps — a level the magvit2 only 
 
 The VAE does have periodic KL spikes (e.g. step 2k, 6.6k, 10.8k) where recon loss temporarily jumps, but it recovers quickly each time. Not yet clear what causes them.
 
+
 <br>
 <br>
 
-# Title
+# First Audio Experiments
 
 **Context:**
+I wanted to explore and do some engineering around the audio data.
 
 **Approach:**
 
+I first ran a dataset-wide spectrum analysis over the raw Mesen AVI recordings to choose a compact mel front-end that still preserves most of the useful signal while staying aligned with the NES frame rate.
+
+From there I extended the normalized dataset format to store per-frame audio chunks together with `audio_lengths` and `audio_sample_rate` so the audio models could train from the same `.npz` files as the video models.
+
+Then I built two initial models:
+
+- **LTX Audio VAE**: a causal 2D convolutional VAE over log-mel spectrograms with two stride-2 encoder downsamples, giving `4x` temporal compression. The model reconstructs mel spectrograms and uses a KL-regularized continuous latent.
+- **LTX Audio Vocoder**: a compact BigVGAN-style mel-to-waveform decoder with `SnakeBeta` activations, dilated residual blocks, and transposed-convolution upsampling. The default upsampling schedule `(5, 5, 4)` gives an exact `100x` expansion, matching the mel hop length.
+
+Finally, I ran baseline overfit tests on both models and listened to the reconstructions as a sanity check before doing broader hyperparameter work.
+
+![](pictures/audio.png)
+
 **Result:**
+
+Current mel defaults for SMB1 audio:
+
+- Sample rate: `24000` Hz mono
+- Window / `n_fft`: `400` samples
+- Hop length: `100` samples
+- Mel bins / `n_mels`: `64`
+- `fmin`: `40` Hz
+- `fmax`: `8000` Hz
+- Log floor: `80` dB
+- STFT window: Hann
+
+These values came from scanning the full dataset audio distribution. At `24` kHz, about `98.5%` of spectral energy is retained relative to the original audio. Only about `2.5%` of energy falls below `40` Hz, and only about `2.4%` sits above `8` kHz. A `400`-sample window is also convenient because it is almost exactly one NES video frame at `~60.1` FPS, while a `100`-sample hop gives about four mel steps per frame.
+
+The initial audio VAE run produced decent reconstructions, though I have not yet measured how aggressively the bottleneck can be tightened before quality falls off. There is still a fair amount of tuning left to do.
+
+The vocoder successfully overfit a single sample and produced high-quality output audio. The sample happened to contain a power-up sound, which made it especially easy to hear that the model was capturing the characteristic NES sound rather than just broad envelope shape.
 
 <!-- Template -->
 
@@ -405,7 +412,6 @@ The VAE does have periodic KL spikes (e.g. step 2k, 6.6k, 10.8k) where recon los
 **Approach:**
 
 **Result:**
-
 
 Random picture of me and my mom (her name is claudette)
 ![alt text](pictures/claudette.png)

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Compare sweep results across multiple training runs.
+"""Compare metrics across multiple training runs.
 
-Scans a results directory recursively for folders containing config.json +
-metrics.json, then produces:
-  1. A summary table (printed and optionally saved as CSV).
-  2. A multi-panel comparison plot (recon loss + codebook usage).
+Scans one or more results directories recursively for folders containing
+config.json + metrics.json, then produces:
+    1. A summary table (printed and optionally saved as CSV).
+    2. A comparison plot for reconstruction loss and related metrics.
 
 Usage:
-    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2
-    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 results/capacity_sweep
-    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 -o sweep_comparison.png
-    python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 --x-axis step
+        python scripts/compare_sweeps.py --results-dir checkpoints/magvit2
+        python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 checkpoints/capacity_runs
+        python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 -o run_comparison.png
+        python scripts/compare_sweeps.py --results-dir checkpoints/magvit2 --x-axis step
 """
 
 import argparse
@@ -63,6 +63,40 @@ DISTINCT_COLORS = [
 LINE_STYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), (0, (5, 2, 1, 2, 1, 2))]
 LINE_WIDTHS = [1.8, 1.2, 2.4]
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_FONT_SCALE = 1.6
+DEFAULT_FIGURE_SCALE = 1.25
+DEFAULT_SAVE_DPI = 180
+BASE_PLOT_RC = {
+    "font.size": 11.0,
+    "axes.titlesize": 15.0,
+    "axes.labelsize": 13.0,
+    "xtick.labelsize": 12.0,
+    "ytick.labelsize": 12.0,
+    "legend.fontsize": 11.0,
+    "legend.title_fontsize": 12.0,
+    "figure.titlesize": 18.0,
+}
+
+
+def build_plot_rc(font_scale: float) -> dict[str, float]:
+    """Build matplotlib rcParams for readable high-DPI plots."""
+    scale = max(font_scale, 0.5)
+    return {key: value * scale for key, value in BASE_PLOT_RC.items()}
+
+
+def scale_figsize(width: float, height: float, figure_scale: float) -> tuple[float, float]:
+    """Scale a base figure size without repeating the math at each call site."""
+    scale = max(figure_scale, 0.5)
+    return width * scale, height * scale
+
+
+def legend_columns(num_series: int) -> int:
+    """Choose a compact legend layout based on the number of compared runs."""
+    if num_series <= 4:
+        return 1
+    if num_series <= 10:
+        return 2
+    return 3
 
 
 def get_metric_series(metrics: list[dict], key: str, x_axis: str) -> tuple[list[float], list[float]]:
@@ -442,7 +476,15 @@ def save_csv(rows: list[OrderedDict], path: str) -> None:
     print(f"Saved CSV to {path}")
 
 
-def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: str = "step", smooth_window: int = 1, show_legend: bool = True) -> None:
+def plot_comparison(
+    runs: list[dict],
+    output_path: str | None = None,
+    x_axis: str = "step",
+    smooth_window: int = 1,
+    show_legend: bool = True,
+    font_scale: float = DEFAULT_FONT_SCALE,
+    figure_scale: float = DEFAULT_FIGURE_SCALE,
+) -> None:
     if not runs:
         print("Nothing to plot.")
         return
@@ -467,186 +509,230 @@ def plot_comparison(runs: list[dict], output_path: str | None = None, x_axis: st
         panels.append("lr")
     nrows = len(panels)
     height_ratios = [2] + [1] * (nrows - 1)
-    fig, axes = plt.subplots(nrows, 1, figsize=(12, 4 * nrows), sharex=True,
-                             gridspec_kw={"height_ratios": height_ratios})
-    if nrows == 1:
-        axes = [axes]
 
-    # Sort runs by the best available reconstruction curve so the legend is ordered.
-    sorted_runs = sorted(
-        runs,
-        key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
-    )
+    with plt.rc_context(build_plot_rc(font_scale)):
+        fig, axes = plt.subplots(
+            nrows,
+            1,
+            figsize=scale_figsize(12, 4 * nrows, figure_scale),
+            sharex=True,
+            gridspec_kw={"height_ratios": height_ratios},
+        )
+        if nrows == 1:
+            axes = [axes]
 
-    # --- Recon loss ---
-    ax = axes[0]
-    for run in sorted_runs:
-        _, x_values, recon = get_recon_series(run["metrics"], x_axis)
-        if x_values:
-            style = run_styles[run["name"]]
-            label = run["name"]
-            params = run["config"].get("num_parameters", 0)
-            if params:
-                label += f" ({params / 1e6:.1f}M)"
-            ax.plot(
-                x_values,
-                smooth(recon, smooth_window),
-                label=label,
-                color=style["color"],
-                linestyle=style["linestyle"],
-                alpha=0.9,
-                linewidth=style["linewidth"],
-            )
-    ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
-    title = "Smoothed Reconstruction Loss Comparison" if has_smoothed_recon else "Reconstruction Loss Comparison"
-    ax.set_ylabel(ylabel)
-    ax.set_yscale("log")
-    ax.set_title(title)
-    if show_legend:
-        ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
-    ax.grid(True, alpha=0.3)
+        marker_small = max(3.0, 2.0 * font_scale)
+        marker_medium = max(4.0, 2.4 * font_scale)
+        marker_large = max(6.0, 3.8 * font_scale)
+        legend_ncols = legend_columns(len(runs))
 
-    # --- Codebook usage ---
-    if "codebook" in panels:
-        ax = axes[panels.index("codebook")]
+        # Sort runs by the best available reconstruction curve so the legend is ordered.
+        sorted_runs = sorted(
+            runs,
+            key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
+        )
+
+        # --- Recon loss ---
+        ax = axes[0]
         for run in sorted_runs:
-            metrics = run["metrics"]
-            style = run_styles[run["name"]]
-            cb_points = [m for m in metrics if "codebook_usage" in m and axis_key in m]
-            cb_steps = [m[axis_key] * axis_scale for m in cb_points]
-            cb_usage = [m["codebook_usage"] for m in cb_points]
-            if cb_steps:
-                cb_size = run["config"].get("codebook_size", None)
-                label = run["name"]
-                line = ax.plot(
-                    cb_steps,
-                    smooth(cb_usage, smooth_window),
-                    marker=".",
-                    markersize=2,
-                    label=label,
-                    color=style["color"],
-                    linestyle=style["linestyle"],
-                    alpha=0.85,
-                    linewidth=style["linewidth"],
-                )[0]
-                if cb_size is not None:
-                    ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.6)
-        usage_ylim = get_codebook_usage_ylim(sorted_runs)
-        if usage_ylim is not None:
-            ax.set_ylim(*usage_ylim)
-        ax.set_ylabel("Unique codes used")
-        ax.set_title("Codebook Usage")
-        if show_legend:
-            ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
-        ax.grid(True, alpha=0.3)
-
-    # --- Eval recon loss + pixel accuracy ---
-    if "eval" in panels:
-        ax = axes[panels.index("eval")]
-        ax2 = ax.twinx()
-        for run in sorted_runs:
-            style = run_styles[run["name"]]
-            x_vals, eval_recon = get_metric_series(run["metrics"], "eval_recon_loss", x_axis)
-            if x_vals:
-                ax.plot(x_vals, eval_recon, label=run["name"],
-                        color=style["color"], linestyle=style["linestyle"],
-                        marker="o", markersize=3,
-                        alpha=0.9, linewidth=style["linewidth"])
-            x_vals, px_acc = get_metric_series(run["metrics"], "eval_pixel_accuracy", x_axis)
-            if x_vals:
-                ax2.plot(x_vals, px_acc,
-                         color=style["color"], linestyle=":",
-                         marker="s", markersize=2,
-                         alpha=0.5, linewidth=max(0.8, style["linewidth"] * 0.6))
-        ax.set_ylabel("Eval Recon Loss")
-        ax.set_yscale("log")
-        ax2.set_ylabel("Pixel Accuracy", alpha=0.5)
-        ax.set_title("Eval Recon Loss (solid) + Pixel Accuracy (dotted)")
-        if show_legend:
-            ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
-        ax.grid(True, alpha=0.3)
-
-    # --- LFQ loss breakdown ---
-    if "lfq" in panels:
-        ax = axes[panels.index("lfq")]
-        ax2 = ax.twinx()
-        for run in sorted_runs:
-            style = run_styles[run["name"]]
-            x_vals, batch_h = get_metric_series(run["metrics"], "lfq_batch_entropy", x_axis)
-            if x_vals:
-                ax.plot(x_vals, smooth(batch_h, smooth_window),
-                        label=f"{run['name']} (batch H)",
-                        color=style["color"], linestyle=style["linestyle"],
-                        alpha=0.9, linewidth=style["linewidth"])
-            x_vals, commit = get_metric_series(run["metrics"], "lfq_commitment", x_axis)
-            if x_vals:
-                ax2.plot(x_vals, smooth(commit, smooth_window),
-                         label=f"{run['name']} (commit)",
-                         color=style["color"], linestyle=":",
-                         alpha=0.5, linewidth=max(0.8, style["linewidth"] * 0.6))
-        ax.set_ylabel("Batch Entropy")
-        ax2.set_ylabel("Commitment", alpha=0.5)
-        ax.set_title("Quantizer Health: Batch Entropy (solid) + Commitment (dotted)")
-        if show_legend:
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6, ncol=2, frameon=True, handlelength=3.0)
-        ax.grid(True, alpha=0.3)
-
-    # --- Learning rate schedule ---
-    if "lr" in panels:
-        ax = axes[panels.index("lr")]
-        marker_cycle = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "8"]
-        lr_series = []
-        for run in sorted_runs:
-            x_vals, lr_vals = get_metric_series(run["metrics"], "lr", x_axis)
-            if x_vals:
-                lr_series.append((run, x_vals, lr_vals))
-
-        if lr_series:
-            x_min = min(min(x_vals) for _, x_vals, _ in lr_series)
-            x_max = max(max(x_vals) for _, x_vals, _ in lr_series)
-            x_span = max(x_max - x_min, 1.0)
-            jitter = x_span * 0.0015 if len(lr_series) > 1 else 0.0
-            offsets = np.linspace(-0.5, 0.5, len(lr_series)) if len(lr_series) > 1 else np.array([0.0])
-
-            for idx, (run, x_vals, lr_vals) in enumerate(lr_series):
+            _, x_values, recon = get_recon_series(run["metrics"], x_axis)
+            if x_values:
                 style = run_styles[run["name"]]
-                x_plot = [x + offsets[idx] * jitter for x in x_vals] if jitter > 0 else x_vals
-                marker = marker_cycle[idx % len(marker_cycle)]
-                markevery = max(1, len(x_plot) // 10)
+                label = run["name"]
+                params = run["config"].get("num_parameters", 0)
+                if params:
+                    label += f" ({params / 1e6:.1f}M)"
                 ax.plot(
-                    x_plot,
-                    lr_vals,
-                    label=run["name"],
+                    x_values,
+                    smooth(recon, smooth_window),
+                    label=label,
                     color=style["color"],
                     linestyle=style["linestyle"],
                     alpha=0.9,
                     linewidth=style["linewidth"],
-                    marker=marker,
-                    markersize=6,
-                    markerfacecolor="none",
-                    markeredgewidth=1.4,
-                    markevery=markevery,
                 )
-        ax.set_ylabel("Learning Rate")
-        ax.set_title("LR Schedule (tiny x-offsets for overlap visibility)")
-        ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
+        ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
+        title = "Smoothed Reconstruction Loss by Run" if has_smoothed_recon else "Reconstruction Loss by Run"
+        ax.set_ylabel(ylabel)
+        ax.set_yscale("log")
+        ax.set_title(title)
         if show_legend:
-            ax.legend(fontsize=7, ncol=2, frameon=True, handlelength=3.0)
+            ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel(axis_label)
-    fig.tight_layout()
+        # --- Codebook usage ---
+        if "codebook" in panels:
+            ax = axes[panels.index("codebook")]
+            for run in sorted_runs:
+                metrics = run["metrics"]
+                style = run_styles[run["name"]]
+                cb_points = [m for m in metrics if "codebook_usage" in m and axis_key in m]
+                cb_steps = [m[axis_key] * axis_scale for m in cb_points]
+                cb_usage = [m["codebook_usage"] for m in cb_points]
+                if cb_steps:
+                    cb_size = run["config"].get("codebook_size", None)
+                    label = run["name"]
+                    line = ax.plot(
+                        cb_steps,
+                        smooth(cb_usage, smooth_window),
+                        marker=".",
+                        markersize=marker_small,
+                        label=label,
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        alpha=0.85,
+                        linewidth=style["linewidth"],
+                    )[0]
+                    if cb_size is not None:
+                        ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.8)
+            usage_ylim = get_codebook_usage_ylim(sorted_runs)
+            if usage_ylim is not None:
+                ax.set_ylim(*usage_ylim)
+            ax.set_ylabel("Unique Codes Used")
+            ax.set_title("Codebook Usage by Run")
+            if show_legend:
+                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
+            ax.grid(True, alpha=0.3)
 
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to {output_path}")
-    else:
-        plt.show()
+        # --- Eval recon loss + pixel accuracy ---
+        if "eval" in panels:
+            ax = axes[panels.index("eval")]
+            ax2 = ax.twinx()
+            for run in sorted_runs:
+                style = run_styles[run["name"]]
+                x_vals, eval_recon = get_metric_series(run["metrics"], "eval_recon_loss", x_axis)
+                if x_vals:
+                    ax.plot(
+                        x_vals,
+                        eval_recon,
+                        label=run["name"],
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        marker="o",
+                        markersize=marker_medium,
+                        alpha=0.9,
+                        linewidth=style["linewidth"],
+                    )
+                x_vals, px_acc = get_metric_series(run["metrics"], "eval_pixel_accuracy", x_axis)
+                if x_vals:
+                    ax2.plot(
+                        x_vals,
+                        px_acc,
+                        color=style["color"],
+                        linestyle=":",
+                        marker="s",
+                        markersize=marker_small,
+                        alpha=0.5,
+                        linewidth=max(0.8, style["linewidth"] * 0.6),
+                    )
+            ax.set_ylabel("Eval Recon Loss")
+            ax.set_yscale("log")
+            ax2.set_ylabel("Pixel Accuracy", alpha=0.6)
+            ax.set_title("Eval Recon Loss and Pixel Accuracy by Run")
+            if show_legend:
+                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
+            ax.grid(True, alpha=0.3)
+
+        # --- LFQ loss breakdown ---
+        if "lfq" in panels:
+            ax = axes[panels.index("lfq")]
+            ax2 = ax.twinx()
+            for run in sorted_runs:
+                style = run_styles[run["name"]]
+                x_vals, batch_h = get_metric_series(run["metrics"], "lfq_batch_entropy", x_axis)
+                if x_vals:
+                    ax.plot(
+                        x_vals,
+                        smooth(batch_h, smooth_window),
+                        label=f"{run['name']} (batch H)",
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        alpha=0.9,
+                        linewidth=style["linewidth"],
+                    )
+                x_vals, commit = get_metric_series(run["metrics"], "lfq_commitment", x_axis)
+                if x_vals:
+                    ax2.plot(
+                        x_vals,
+                        smooth(commit, smooth_window),
+                        label=f"{run['name']} (commit)",
+                        color=style["color"],
+                        linestyle=":",
+                        alpha=0.5,
+                        linewidth=max(0.8, style["linewidth"] * 0.6),
+                    )
+            ax.set_ylabel("Batch Entropy")
+            ax2.set_ylabel("Commitment", alpha=0.6)
+            ax.set_title("Quantizer Health by Run")
+            if show_legend:
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, ncol=legend_ncols, frameon=True, handlelength=3.0)
+            ax.grid(True, alpha=0.3)
+
+        # --- Learning rate schedule ---
+        if "lr" in panels:
+            ax = axes[panels.index("lr")]
+            marker_cycle = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">", "h", "8"]
+            lr_series = []
+            for run in sorted_runs:
+                x_vals, lr_vals = get_metric_series(run["metrics"], "lr", x_axis)
+                if x_vals:
+                    lr_series.append((run, x_vals, lr_vals))
+
+            if lr_series:
+                x_min = min(min(x_vals) for _, x_vals, _ in lr_series)
+                x_max = max(max(x_vals) for _, x_vals, _ in lr_series)
+                x_span = max(x_max - x_min, 1.0)
+                jitter = x_span * 0.0015 if len(lr_series) > 1 else 0.0
+                offsets = np.linspace(-0.5, 0.5, len(lr_series)) if len(lr_series) > 1 else np.array([0.0])
+
+                for idx, (run, x_vals, lr_vals) in enumerate(lr_series):
+                    style = run_styles[run["name"]]
+                    x_plot = [x + offsets[idx] * jitter for x in x_vals] if jitter > 0 else x_vals
+                    marker = marker_cycle[idx % len(marker_cycle)]
+                    markevery = max(1, len(x_plot) // 10)
+                    ax.plot(
+                        x_plot,
+                        lr_vals,
+                        label=run["name"],
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        alpha=0.9,
+                        linewidth=style["linewidth"],
+                        marker=marker,
+                        markersize=marker_large,
+                        markerfacecolor="none",
+                        markeredgewidth=1.4,
+                        markevery=markevery,
+                    )
+            ax.set_ylabel("Learning Rate")
+            ax.set_title("Learning Rate Schedule by Run")
+            ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
+            if show_legend:
+                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
+            ax.grid(True, alpha=0.3)
+
+        axes[-1].set_xlabel(axis_label)
+        fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
+
+        if output_path:
+            fig.savefig(output_path, dpi=DEFAULT_SAVE_DPI, bbox_inches="tight")
+            print(f"Saved plot to {output_path}")
+        else:
+            plt.show()
 
 
-def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None, x_axis: str = "step", smooth_window: int = 1, show_legend: bool = True) -> None:
+def plot_faceted(
+    runs: list[dict],
+    facet_by: str,
+    output_path: str | None = None,
+    x_axis: str = "step",
+    smooth_window: int = 1,
+    show_legend: bool = True,
+    font_scale: float = DEFAULT_FONT_SCALE,
+    figure_scale: float = DEFAULT_FIGURE_SCALE,
+) -> None:
     """Small-multiple plot: one subplot per facet value, shared y-axis."""
     if not runs:
         print("Nothing to plot.")
@@ -669,46 +755,60 @@ def plot_faceted(runs: list[dict], facet_by: str, output_path: str | None = None
     has_smoothed = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
     axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
 
-    fig, axes = plt.subplots(1, ncols, figsize=(6 * ncols, 5), sharey=True)
-    if ncols == 1:
-        axes = [axes]
+    with plt.rc_context(build_plot_rc(font_scale)):
+        fig, axes = plt.subplots(1, ncols, figsize=scale_figsize(6 * ncols, 5, figure_scale), sharey=True)
+        if ncols == 1:
+            axes = [axes]
 
-    for ax, key in zip(axes, sorted_keys):
-        group_runs = sorted(
-            groups[key],
-            key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
-        )
-        for run in group_runs:
-            _, x_values, recon = get_recon_series(run["metrics"], x_axis)
-            if x_values:
-                style = run_styles[run["name"]]
-                label = run["name"].rsplit("/", 1)[-1]
-                params = run["config"].get("num_parameters", 0)
-                if params:
-                    label += f" ({params / 1e6:.1f}M)"
-                ax.plot(x_values, smooth(recon, smooth_window), label=label,
-                        color=style["color"], linestyle=style["linestyle"],
-                        alpha=0.9, linewidth=style["linewidth"])
-        ax.set_title(key)
-        ax.set_yscale("log")
-        ax.set_xlabel(axis_label)
-        if show_legend:
-            ax.legend(fontsize=7, frameon=True)
-        ax.grid(True, alpha=0.3)
+        for ax, key in zip(axes, sorted_keys):
+            group_runs = sorted(
+                groups[key],
+                key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
+            )
+            for run in group_runs:
+                _, x_values, recon = get_recon_series(run["metrics"], x_axis)
+                if x_values:
+                    style = run_styles[run["name"]]
+                    label = run["name"].rsplit("/", 1)[-1]
+                    params = run["config"].get("num_parameters", 0)
+                    if params:
+                        label += f" ({params / 1e6:.1f}M)"
+                    ax.plot(
+                        x_values,
+                        smooth(recon, smooth_window),
+                        label=label,
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        alpha=0.9,
+                        linewidth=style["linewidth"],
+                    )
+            ax.set_title(str(key))
+            ax.set_yscale("log")
+            ax.set_xlabel(axis_label)
+            if show_legend:
+                ax.legend(ncol=legend_columns(len(group_runs)), frameon=True)
+            ax.grid(True, alpha=0.3)
 
-    ylabel = "Smoothed Recon Loss" if has_smoothed else "Recon Loss"
-    axes[0].set_ylabel(ylabel)
-    fig.suptitle(f"Loss by {facet_by}", fontsize=14, y=1.02)
-    fig.tight_layout()
+        ylabel = "Smoothed Recon Loss" if has_smoothed else "Recon Loss"
+        axes[0].set_ylabel(ylabel)
+        fig.suptitle(f"Reconstruction Loss by {facet_by}", y=1.02)
+        fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
 
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to {output_path}")
-    else:
-        plt.show()
+        if output_path:
+            fig.savefig(output_path, dpi=DEFAULT_SAVE_DPI, bbox_inches="tight")
+            print(f"Saved plot to {output_path}")
+        else:
+            plt.show()
 
 
-def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | None = None, show_legend: bool = True) -> None:
+def plot_bar(
+    runs: list[dict],
+    output_path: str | None = None,
+    color_by: str | None = None,
+    show_legend: bool = True,
+    font_scale: float = DEFAULT_FONT_SCALE,
+    figure_scale: float = DEFAULT_FIGURE_SCALE,
+) -> None:
     """Horizontal bar chart of best reconstruction loss per run."""
     if not runs:
         print("Nothing to plot.")
@@ -742,36 +842,37 @@ def plot_bar(runs: list[dict], output_path: str | None = None, color_by: str | N
     else:
         colors = [DISTINCT_COLORS[0]] * len(entries)
 
-    fig, ax = plt.subplots(figsize=(10, max(4, len(labels) * 0.45)))
-    y_pos = range(len(labels))
-    ax.barh(y_pos, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.invert_yaxis()  # best (smallest) at top
-    ax.set_xlabel("Best Reconstruction Loss")
-    ax.set_title("Best Reconstruction Loss by Run")
-    ax.grid(True, axis="x", alpha=0.3)
+    with plt.rc_context(build_plot_rc(font_scale)):
+        fig, ax = plt.subplots(figsize=scale_figsize(10, max(4, len(labels) * 0.45), figure_scale))
+        y_pos = range(len(labels))
+        ax.barh(y_pos, values, color=colors, edgecolor="white", linewidth=0.5)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(labels)
+        ax.invert_yaxis()  # best (smallest) at top
+        ax.set_xlabel("Best Reconstruction Loss")
+        ax.set_title("Best Reconstruction Loss by Run")
+        ax.grid(True, axis="x", alpha=0.3)
 
-    if color_by and show_legend:
-        from matplotlib.patches import Patch
-        legend_handles = [Patch(facecolor=prop_colors[p], label=f"{color_by}={p}") for p in unique_props]
-        ax.legend(handles=legend_handles, fontsize=8, loc="lower right")
+        if color_by and show_legend:
+            from matplotlib.patches import Patch
+            legend_handles = [Patch(facecolor=prop_colors[p], label=f"{color_by}={p}") for p in unique_props]
+            ax.legend(handles=legend_handles, loc="lower right")
 
-    fig.tight_layout()
+        fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
 
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches="tight")
-        print(f"Saved plot to {output_path}")
-    else:
-        plt.show()
+        if output_path:
+            fig.savefig(output_path, dpi=DEFAULT_SAVE_DPI, bbox_inches="tight")
+            print(f"Saved plot to {output_path}")
+        else:
+            plt.show()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--results-dir", type=str, nargs="+", default=["results/"],
+    parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/"],
                         help="One or more directories containing run folders anywhere under them")
     parser.add_argument("-o", "--output", type=str, default=None,
-                        help="Save comparison plot to file (e.g. sweep_comparison.png)")
+                        help="Save comparison plot to file (e.g. run_comparison.png)")
     parser.add_argument("--csv", type=str, default=None,
                         help="Save summary table as CSV")
     parser.add_argument("--filter", type=str, default=None,
@@ -788,6 +889,10 @@ def parse_args() -> argparse.Namespace:
                         help="Gaussian sigma for plot smoothing (0 = no smoothing)")
     parser.add_argument("--no-legend", action="store_true",
                         help="Hide the legend on plots")
+    parser.add_argument("--font-scale", type=float, default=DEFAULT_FONT_SCALE,
+                        help="Scale all plot text for higher-DPI displays")
+    parser.add_argument("--figure-scale", type=float, default=DEFAULT_FIGURE_SCALE,
+                        help="Scale the base figure size used for plots")
     return parser.parse_args()
 
 
@@ -815,11 +920,35 @@ def main():
 
     show_legend = not args.no_legend
     if args.bar:
-        plot_bar(runs, output_path=args.output, color_by=args.color_by, show_legend=show_legend)
+        plot_bar(
+            runs,
+            output_path=args.output,
+            color_by=args.color_by,
+            show_legend=show_legend,
+            font_scale=args.font_scale,
+            figure_scale=args.figure_scale,
+        )
     elif args.facet:
-        plot_faceted(runs, args.facet, output_path=args.output, x_axis=args.x_axis, smooth_window=args.smooth, show_legend=show_legend)
+        plot_faceted(
+            runs,
+            args.facet,
+            output_path=args.output,
+            x_axis=args.x_axis,
+            smooth_window=args.smooth,
+            show_legend=show_legend,
+            font_scale=args.font_scale,
+            figure_scale=args.figure_scale,
+        )
     else:
-        plot_comparison(runs, output_path=args.output, x_axis=args.x_axis, smooth_window=args.smooth, show_legend=show_legend)
+        plot_comparison(
+            runs,
+            output_path=args.output,
+            x_axis=args.x_axis,
+            smooth_window=args.smooth,
+            show_legend=show_legend,
+            font_scale=args.font_scale,
+            figure_scale=args.figure_scale,
+        )
 
 
 if __name__ == "__main__":

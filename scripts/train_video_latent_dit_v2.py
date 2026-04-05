@@ -1,0 +1,1108 @@
+#!/usr/bin/env python3
+"""Train VideoLatentDiT using Accelerate for mixed-precision and safetensors checkpoints.
+
+Key differences from train_video_latent_dit.py:
+  - Accelerator replaces manual torch.autocast / GradScaler boilerplate.
+    Pass --mixed-precision bf16 (default), fp16, or no.
+  - Safetensors (.safetensors) for model-only checkpoints; accelerator.save_state()
+    for full training-state (optimizer + scheduler) checkpoints.
+  - Optional shifted logit-normal timestep sampler (--timestep-sampler logit_normal)
+    concentrates training on mid-range noise levels, which improves sample quality.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import os
+import random
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from PIL import Image
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from safetensors.torch import load_file as safetensors_load, save_file as safetensors_save
+from torch.nn import functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, RandomSampler, Subset
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from mario_world_model.latent_dataset import LatentSequenceDataset
+from mario_world_model.ltx_video_vae import LTXVideoVAE
+from mario_world_model.path_utils import resolve_workspace_path
+from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.video_latent_dit import VideoLatentDiT
+
+console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Timestep sampling
+# ---------------------------------------------------------------------------
+
+class UniformTimestepSampler:
+    def sample(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.rand(batch_size, device=device, dtype=dtype)
+
+
+class LogitNormalTimestepSampler:
+    """Shifted logit-normal sampler that concentrates on mid-range noise levels.
+
+    Ported from LTX-2/packages/ltx-trainer/src/ltx_trainer/timestep_samplers.py.
+    """
+
+    def __init__(self, std: float = 1.0, eps: float = 1e-3, uniform_prob: float = 0.1) -> None:
+        self.std = std
+        self.eps = eps
+        self.uniform_prob = uniform_prob
+        self._p999 = 3.0902 * std
+        self._p005 = -2.5758 * std
+
+    def sample(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        normal = torch.randn(batch_size, device=device) * self.std
+        logitnormal = torch.sigmoid(normal)
+
+        p999 = torch.sigmoid(torch.tensor(self._p999, device=device))
+        p005 = torch.sigmoid(torch.tensor(self._p005, device=device))
+
+        raw = (logitnormal - p005) / (p999 - p005)
+        stretched = torch.where(raw >= self.eps, raw, 2 * self.eps - raw).clamp(0, 1)
+
+        uniform = (1 - self.eps) * torch.rand(batch_size, device=device) + self.eps
+        mask = torch.rand(batch_size, device=device) > self.uniform_prob
+        return torch.where(mask, stretched, uniform).to(dtype)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train VideoLatentDiT with Accelerate.")
+    parser.add_argument("--data-dir", type=str, default=None)
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument(
+        "--model-backend",
+        type=str,
+        choices=["custom", "diffusers"],
+        default="diffusers",
+        help="Model implementation backend.",
+    )
+
+    parser.add_argument("--video-vae-checkpoint", type=str, default=None)
+    parser.add_argument("--video-vae-config", type=str, default=None)
+    parser.add_argument("--latent-stats", type=str, default=None)
+    parser.add_argument("--disable-latent-normalization", action="store_true")
+
+    parser.add_argument("--clip-frames", type=int, default=20)
+    parser.add_argument("--context-frames", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
+
+    parser.add_argument("--max-steps", type=int, required=True)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+
+    parser.add_argument("--eval-samples", type=int, default=1024)
+    parser.add_argument("--eval-batch-size", type=int, default=None)
+    parser.add_argument("--log-interval", type=int, default=20)
+    parser.add_argument("--eval-interval", type=int, default=1000)
+    parser.add_argument("--checkpoint-interval", type=int, default=1000)
+
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--action-dim", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, default=None,
+                        help="Sets encoder and decoder layers to half this value each.")
+    parser.add_argument("--num-encoder-layers", type=int, default=None)
+    parser.add_argument("--num-decoder-layers", type=int, default=None)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--max-frames", type=int, default=64)
+
+    parser.add_argument("--flow-loss", type=str, choices=["mse", "huber"], default="huber")
+    parser.add_argument("--huber-delta", type=float, default=0.03)
+    parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument("--grad-norm-skip", type=float, default=0.0,
+                        help="Skip optimizer step when pre-clip grad norm exceeds this (0 disables).")
+
+    parser.add_argument("--timestep-sampler", type=str, choices=["uniform", "logit_normal"],
+                        default="uniform")
+
+    parser.add_argument(
+        "--error-buffer-size", type=int, default=0,
+        help="Residual clips retained for history perturbation.",
+    )
+    parser.add_argument("--error-inject-prob", type=float, default=0.0)
+    parser.add_argument("--error-inject-scale", type=float, default=0.05)
+    parser.add_argument("--error-inject-start-step", type=int, default=20000)
+    parser.add_argument("--error-buffer-clip", type=float, default=3.0)
+
+    parser.add_argument("--preview-ode-steps", type=int, default=24)
+
+    parser.add_argument("--mixed-precision", type=str, default="bf16",
+                        choices=["no", "fp16", "bf16"],
+                        help="Mixed precision mode passed to Accelerator.")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume-from", type=str, default=None)
+
+    args = parser.parse_args()
+
+    if args.clip_frames < 2:
+        parser.error("--clip-frames must be >= 2")
+    if args.context_frames < 1:
+        parser.error("--context-frames must be >= 1")
+    if args.context_frames >= args.clip_frames:
+        parser.error("--context-frames must be smaller than --clip-frames")
+    if args.max_frames < args.clip_frames:
+        parser.error("--max-frames must be >= --clip-frames")
+
+    default_half = (args.num_layers // 2) if args.num_layers is not None else 6
+    if args.num_encoder_layers is None:
+        args.num_encoder_layers = default_half
+    if args.num_decoder_layers is None:
+        args.num_decoder_layers = default_half
+    if args.num_encoder_layers <= 0:
+        parser.error("--num-encoder-layers must be > 0")
+    if args.num_decoder_layers <= 0:
+        parser.error("--num-decoder-layers must be > 0")
+
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Utilities carried over from the original trainer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LatentNormalization:
+    mean: torch.Tensor
+    std: torch.Tensor
+    stats_path: str
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.std + self.mean
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open() as fh:
+        return json.load(fh)
+
+
+def _resolve_data_dir(args: argparse.Namespace) -> Path:
+    if args.data_dir is not None:
+        p = Path(args.data_dir).resolve()
+        if not p.is_dir():
+            raise FileNotFoundError(f"Dataset directory not found: {p}")
+        return p
+    candidate = PROJECT_ROOT / "data" / "latents"
+    if candidate.is_dir():
+        return candidate.resolve()
+    raise FileNotFoundError("Could not infer --data-dir. Pass it explicitly.")
+
+
+def _resolve_path(value: str | None, *, config_dir: Path | None = None) -> Path | None:
+    return resolve_workspace_path(value, project_root=PROJECT_ROOT, config_dir=config_dir)
+
+
+def _is_readable(p: Path | None) -> bool:
+    try:
+        return p is not None and p.is_file()
+    except (PermissionError, OSError):
+        return False
+
+
+def make_output_dir(args: argparse.Namespace) -> Path:
+    if args.output_dir is not None:
+        return Path(args.output_dir)
+    if args.resume_from is not None:
+        return Path(args.resume_from).resolve()
+    run_name = args.run_name or datetime.now().strftime("video_latent_dit_%Y%m%d_%H%M%S")
+    return PROJECT_ROOT / "checkpoints" / run_name
+
+
+def load_latent_normalization(
+    *, stats_path: Path, latent_channels: int, device: torch.device
+) -> LatentNormalization:
+    stats = _load_json(stats_path)
+    mean_v = stats.get("channel_mean")
+    std_v = stats.get("channel_std_clamped") or stats.get("channel_std")
+    if mean_v is None or std_v is None:
+        raise ValueError(f"{stats_path}: must contain channel_mean and channel_std(_clamped)")
+    if len(mean_v) != latent_channels or len(std_v) != latent_channels:
+        raise ValueError("Latent stats channel count mismatch")
+    eps = max(float(stats.get("std_epsilon", 1e-6)), 1e-6)
+    mean = torch.tensor(mean_v, dtype=torch.float32, device=device).view(1, latent_channels, 1, 1, 1)
+    std = torch.tensor(std_v, dtype=torch.float32, device=device).view(1, latent_channels, 1, 1, 1)
+    std = torch.nan_to_num(std, nan=eps, posinf=eps, neginf=eps).clamp_min(eps)
+    return LatentNormalization(mean=mean, std=std, stats_path=str(stats_path))
+
+
+def load_latent_stats_path(
+    args: argparse.Namespace, *, data_dir: Path, latent_meta: dict | None
+) -> Path | None:
+    if args.disable_latent_normalization:
+        return None
+    if args.latent_stats is not None:
+        p = _resolve_path(args.latent_stats, config_dir=data_dir)
+        if not _is_readable(p):
+            raise FileNotFoundError(f"Latent stats not found: {args.latent_stats}")
+        return p
+    if latent_meta is not None:
+        for key in ("latent_stats_path", "latent_stats_file"):
+            v = latent_meta.get(key)
+            if isinstance(v, str):
+                p = _resolve_path(v, config_dir=data_dir)
+                if _is_readable(p):
+                    return p
+    default = data_dir / "latent_stats.json"
+    return default.resolve() if default.is_file() else None
+
+
+def load_palette_tensor(data_dir: Path) -> torch.Tensor:
+    info = _load_json(data_dir / "palette.json")
+    return torch.tensor(info["colors_rgb"], dtype=torch.float32) / 255.0
+
+
+def load_video_vae(
+    *, checkpoint_path: Path, config_path: Path, num_colors: int | None, device: torch.device
+) -> tuple[torch.nn.Module, dict]:
+    cfg = _load_json(config_path)
+    patch_size = int(cfg.get("patch_size", 4))
+    base_channels = int(cfg.get("base_channels", 64))
+    latent_channels = int(cfg.get("latent_channels", 64))
+    vae_num_colors = int(cfg.get("num_colors", num_colors or 0))
+    if vae_num_colors <= 0:
+        raise ValueError("Cannot determine VAE num_colors.")
+    vae = LTXVideoVAE(
+        num_colors=vae_num_colors,
+        patch_size=patch_size,
+        base_channels=base_channels,
+        latent_channels=latent_channels,
+    )
+    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    vae.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
+    vae.to(device).eval()
+    for p in vae.parameters():
+        p.requires_grad_(False)
+    return vae, {"latent_channels": latent_channels, "num_colors": vae_num_colors}
+
+
+def shift_actions_causal(actions: torch.Tensor, *, default_action_index: int) -> torch.Tensor:
+    shifted = torch.empty_like(actions)
+    shifted[:, 0] = default_action_index
+    shifted[:, 1:] = actions[:, :-1]
+    return shifted
+
+
+def prepare_batch(
+    batch: dict,
+    *,
+    device: torch.device,
+    default_action_index: int,
+    latent_normalization: LatentNormalization | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    actions = shift_actions_causal(
+        batch["actions"].to(device, non_blocking=True).long(),
+        default_action_index=default_action_index,
+    )
+    latents = batch["latents"].to(device, non_blocking=True).float()
+    if latent_normalization is not None:
+        latents = latent_normalization.normalize(latents)
+    return latents, actions
+
+
+def sample_flow_target(
+    x0: torch.Tensor, t_sampler: UniformTimestepSampler | LogitNormalTimestepSampler
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Linear flow matching: x_t = (1-t)*x0 + t*eps,  v* = eps - x0."""
+    t = t_sampler.sample(x0.shape[0], device=x0.device, dtype=x0.dtype)
+    eps = torch.randn_like(x0)
+    t_b = t.view(x0.shape[0], 1, 1, 1, 1)
+    x_t = (1.0 - t_b) * x0 + t_b * eps
+    return x_t, eps - x0, t, eps
+
+
+def compute_flow_loss(
+    pred: torch.Tensor, target: torch.Tensor, *, loss_type: str, huber_delta: float
+) -> torch.Tensor:
+    if loss_type == "mse":
+        return F.mse_loss(pred, target)
+    return F.smooth_l1_loss(pred, target, beta=huber_delta)
+
+
+def build_video_latent_dit(*, backend: str, model_config: dict) -> torch.nn.Module:
+    if backend == "custom":
+        return VideoLatentDiT(**model_config)
+    if backend == "diffusers":
+        try:
+            from mario_world_model.video_latent_dit_diffusers import VideoLatentDiTDiffusers
+        except ModuleNotFoundError as exc:
+            if exc.name == "diffusers":
+                raise RuntimeError(
+                    "Diffusers backend requested but the 'diffusers' package is not installed in this env. "
+                    "Install it with: conda run -n mario pip install diffusers"
+                ) from exc
+            raise
+        return VideoLatentDiTDiffusers(**model_config)
+    raise ValueError(f"Unknown model backend: {backend}")
+
+
+def maybe_diffusers_version(backend: str) -> str | None:
+    if backend != "diffusers":
+        return None
+    try:
+        import diffusers
+
+        return str(diffusers.__version__)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Residual error buffer (unchanged from original)
+# ---------------------------------------------------------------------------
+
+class ResidualErrorBuffer:
+    def __init__(self, capacity: int, *, clip_abs: float = 0.0) -> None:
+        self.capacity = int(capacity)
+        self.clip_abs = max(float(clip_abs), 0.0)
+        self._bank: deque[torch.Tensor] = deque(maxlen=max(self.capacity, 1))
+
+    def enabled(self) -> bool:
+        return self.capacity > 0
+
+    def __len__(self) -> int:
+        return len(self._bank)
+
+    def clear(self) -> None:
+        self._bank.clear()
+
+    def add_batch(self, residual: torch.Tensor) -> None:
+        if not self.enabled():
+            return
+        residual = residual.detach()
+        if self.clip_abs > 0:
+            residual = residual.clamp(-self.clip_abs, self.clip_abs)
+        finite = torch.isfinite(residual.flatten(start_dim=1)).all(dim=1)
+        for sample in residual[finite]:
+            self._bank.append(sample.unsqueeze(0))
+
+    def sample(
+        self, batch_size: int, *, device: torch.device, dtype: torch.dtype, frames: int
+    ) -> torch.Tensor | None:
+        if len(self._bank) == 0:
+            return None
+        indices = [random.randrange(len(self._bank)) for _ in range(batch_size)]
+        samples = [self._bank[i] for i in indices]
+        out = torch.cat(samples, dim=0).to(device=device, dtype=dtype)
+        B, C, T, H, W = out.shape
+        if T < frames:
+            out = out.repeat(1, 1, math.ceil(frames / T), 1, 1)[:, :, :frames]
+        elif T > frames:
+            out = out[:, :, :frames]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint save / load (safetensors + JSON config)
+# ---------------------------------------------------------------------------
+
+def save_model_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    model_config: dict,
+    step: int,
+    best_eval: float,
+    metrics: list,
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    raw = getattr(model, "_orig_mod", model)
+    raw = getattr(raw, "module", raw)
+    safetensors_save(raw.state_dict(), path / "model.safetensors")
+
+    # Persist a native Diffusers bundle when using a ModelMixin backend.
+    if hasattr(raw, "save_pretrained"):
+        try:
+            raw.save_pretrained(path / "diffusers", safe_serialization=True)
+        except TypeError:
+            raw.save_pretrained(path / "diffusers")
+
+    meta = {
+        "model_config": model_config,
+        "step": step,
+        "best_eval": best_eval,
+    }
+    with (path / "meta.json").open("w") as fh:
+        json.dump(meta, fh, indent=2)
+    with (path / "metrics.json").open("w") as fh:
+        json.dump(metrics, fh, indent=2)
+
+
+def load_model_weights(model: torch.nn.Module, path: Path) -> None:
+    raw = getattr(model, "_orig_mod", model)
+    raw = getattr(raw, "module", raw)
+    raw.load_state_dict(safetensors_load(path / "model.safetensors"))
+
+
+# ---------------------------------------------------------------------------
+# Inference utilities
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def denoise_future_segment(
+    model: torch.nn.Module,
+    *,
+    history_latents: torch.Tensor,
+    actions: torch.Tensor,
+    future_frames: int,
+    ode_steps: int,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    batch, channels, context_frames, height, width = history_latents.shape
+    future = torch.randn(batch, channels, future_frames, height, width,
+                         device=history_latents.device, dtype=history_latents.dtype)
+
+    raw_model = accelerator.unwrap_model(model)
+    with accelerator.autocast():
+        encoded = raw_model.encode_history(history_latents, actions[:, :context_frames])
+
+    dt = 1.0 / float(ode_steps)
+    for step in range(ode_steps, 0, -1):
+        t_val = (step - 0.5) / float(ode_steps)
+        t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
+        with accelerator.autocast():
+            velocity = raw_model.decode_future(future, actions, t, encoded, context_frames)
+        future = future - dt * velocity
+    return future
+
+
+@torch.inference_mode()
+def latents_to_frame_indices(
+    vae: torch.nn.Module,
+    latents: torch.Tensor,
+    *,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    with accelerator.autocast():
+        logits = vae.decode(latents)
+    return logits.argmax(dim=1)
+
+
+def save_preview_image(
+    path: Path,
+    *,
+    frames_gt: torch.Tensor,
+    frames_sample: torch.Tensor,
+    palette: torch.Tensor,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pal = (palette.detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+    gt_rgb = pal[frames_gt.detach().cpu().numpy()]
+    sa_rgb = pal[frames_sample.detach().cpu().numpy()]
+    rows = [np.concatenate((gt_rgb[t], sa_rgb[t]), axis=1) for t in range(gt_rgb.shape[0])]
+    Image.fromarray(np.concatenate(rows, axis=0)).save(path)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate(
+    model: torch.nn.Module,
+    *,
+    loader: DataLoader,
+    device: torch.device,
+    context_frames: int,
+    accelerator: Accelerator,
+    default_action_index: int,
+    loss_type: str,
+    huber_delta: float,
+    latent_normalization: LatentNormalization | None,
+    t_sampler: UniformTimestepSampler | LogitNormalTimestepSampler,
+) -> dict[str, float]:
+    model.eval()
+    flow_losses: list[float] = []
+    x0_mses: list[float] = []
+    with torch.no_grad():
+        for batch in loader:
+            latents, actions = prepare_batch(
+                batch,
+                device=device,
+                default_action_index=default_action_index,
+                latent_normalization=latent_normalization,
+            )
+            history = latents[:, :, :context_frames]
+            future = latents[:, :, context_frames:]
+            noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
+            model_input = torch.cat((history, noisy_future), dim=2)
+
+            with accelerator.autocast():
+                v_pred = model(model_input, actions, t, context_frames)
+
+            flow_losses.append(
+                compute_flow_loss(v_pred, v_target, loss_type=loss_type, huber_delta=huber_delta).item()
+            )
+            x0_mses.append(F.mse_loss(eps - v_pred, future).item())
+
+    model.train()
+    if not flow_losses:
+        return {"flow_loss": 0.0, "x0_mse": 0.0}
+    return {"flow_loss": float(np.mean(flow_losses)), "x0_mse": float(np.mean(x0_mses))}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+    set_seed(args.seed)
+
+    data_dir = _resolve_data_dir(args)
+    output_dir = make_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        project_config=ProjectConfiguration(project_dir=str(output_dir)),
+    )
+    device = accelerator.device
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+    system_info = collect_system_info()
+    if accelerator.is_main_process:
+        print_system_info(system_info)
+
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
+    latent_meta: dict | None = None
+    latent_meta_path = data_dir / "latent_config.json"
+    if latent_meta_path.is_file():
+        latent_meta = _load_json(latent_meta_path)
+
+    with accelerator.main_process_first():
+        dataset = LatentSequenceDataset(
+            data_dir=data_dir,
+            clip_frames=args.clip_frames,
+            include_actions=True,
+            num_workers=args.num_workers,
+            system_info=system_info,
+        )
+    if len(dataset) == 0:
+        raise RuntimeError("No training samples found.")
+
+    generator = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(len(dataset), generator=generator)
+    eval_dataset = Subset(dataset, perm[:args.eval_samples].tolist()) if args.eval_samples > 0 else None
+    train_dataset = Subset(dataset, perm[args.eval_samples:].tolist()) if eval_dataset else dataset
+
+    if accelerator.is_main_process:
+        console.print(f"Found {len(dataset)} segments of {args.clip_frames} frames.")
+        if eval_dataset:
+            console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=RandomSampler(train_dataset, replacement=True, num_samples=10 ** 7),
+        num_workers=max(args.num_workers, 0),
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
+    eval_loader = (
+        DataLoader(eval_dataset, batch_size=args.eval_batch_size or args.batch_size, num_workers=0)
+        if eval_dataset
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # Latent normalization
+    # ------------------------------------------------------------------
+    latent_channels = int(dataset.latent_channels)
+    latent_stats_path = load_latent_stats_path(args, data_dir=data_dir, latent_meta=latent_meta)
+    latent_normalization: LatentNormalization | None = None
+    if latent_stats_path is not None:
+        latent_normalization = load_latent_normalization(
+            stats_path=latent_stats_path, latent_channels=latent_channels, device=device
+        )
+        if accelerator.is_main_process:
+            console.print(f"[latents] Per-channel normalization from {latent_stats_path}")
+
+    # ------------------------------------------------------------------
+    # Palette and preview VAE
+    # ------------------------------------------------------------------
+    palette: torch.Tensor | None = None
+    video_vae: torch.nn.Module | None = None
+    palette_path = data_dir / "palette.json"
+    if palette_path.is_file():
+        palette = load_palette_tensor(data_dir)
+
+    vae_ckpt = args.video_vae_checkpoint
+    vae_cfg = args.video_vae_config
+    if latent_meta is not None:
+        vae_ckpt = vae_ckpt or latent_meta.get("video_vae_checkpoint")
+        vae_cfg = vae_cfg or latent_meta.get("video_vae_config_path")
+    vae_ckpt_path = _resolve_path(vae_ckpt, config_dir=data_dir)
+    vae_cfg_path = _resolve_path(vae_cfg, config_dir=data_dir)
+    if not _is_readable(vae_cfg_path) and _is_readable(vae_ckpt_path):
+        sibling = vae_ckpt_path.parent / "config.json"
+        if sibling.is_file():
+            vae_cfg_path = sibling
+    if _is_readable(vae_ckpt_path) and _is_readable(vae_cfg_path):
+        try:
+            video_vae, vae_summary = load_video_vae(
+                checkpoint_path=vae_ckpt_path, config_path=vae_cfg_path,
+                num_colors=int(palette.shape[0]) if palette is not None else None,
+                device=device,
+            )
+            if accelerator.is_main_process:
+                console.print("[vae] Loaded video VAE for preview generation")
+        except Exception as exc:
+            if accelerator.is_main_process:
+                console.print(f"[vae] Failed to load VAE ({exc}); previews disabled")
+
+    # ------------------------------------------------------------------
+    # Actions metadata
+    # ------------------------------------------------------------------
+    actions_path = data_dir / "actions.json"
+    if not actions_path.is_file():
+        raise FileNotFoundError(f"Missing actions metadata: {actions_path}")
+    actions_info = _load_json(actions_path)
+    num_actions = int(actions_info.get("num_actions", 0))
+    if num_actions <= 0:
+        raise ValueError(f"Invalid num_actions in {actions_path}")
+    action_values_meta = actions_info.get("reduced_to_original_value")
+    action_values = (
+        [int(v) for v in action_values_meta]
+        if action_values_meta is not None
+        else list(range(num_actions))
+    )
+    default_action_index = int({v: i for i, v in enumerate(action_values)}.get(0, 0))
+    if accelerator.is_main_process:
+        console.print(f"[actions] num_actions={num_actions} default_index={default_action_index}")
+
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
+    model_config = dict(
+        latent_channels=latent_channels,
+        num_actions=num_actions,
+        action_dim=args.action_dim,
+        action_values=action_values,
+        d_model=args.d_model,
+        num_encoder_layers=args.num_encoder_layers,
+        num_decoder_layers=args.num_decoder_layers,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.dropout,
+        max_frames=args.max_frames,
+    )
+    model: torch.nn.Module = build_video_latent_dit(
+        backend=args.model_backend,
+        model_config=model_config,
+    ).to(device)
+    diffusers_version = maybe_diffusers_version(args.model_backend)
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if accelerator.is_main_process:
+        backend_line = f"[model] backend={args.model_backend}"
+        if diffusers_version is not None:
+            backend_line += f" diffusers={diffusers_version}"
+        console.print(backend_line)
+        console.print(f"[model] {num_params:,} trainable parameters")
+
+    if args.compile:
+        if accelerator.is_main_process:
+            console.print("[compile] torch.compile()...")
+        model = torch.compile(model)
+
+    # ------------------------------------------------------------------
+    # Optimizer + scheduler
+    # ------------------------------------------------------------------
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
+
+    warmup_steps = max(args.warmup_steps, 0)
+
+    def lr_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step + 1, 1) / float(warmup_steps)
+        if args.max_steps <= warmup_steps:
+            return 1.0
+        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    lr_scheduler = LambdaLR(optimizer, lr_lambda)
+
+    # ------------------------------------------------------------------
+    # Accelerator prepare
+    # ------------------------------------------------------------------
+    if eval_loader is not None:
+        model, optimizer, train_loader, eval_loader = accelerator.prepare(
+            model, optimizer, train_loader, eval_loader
+        )
+    else:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+    # ------------------------------------------------------------------
+    # Resume
+    # ------------------------------------------------------------------
+    start_step = 0
+    best_eval = float("inf")
+    metrics: list[dict] = []
+
+    if args.resume_from is not None:
+        resume_path = Path(args.resume_from)
+        loaded_full_state = False
+        loaded_model_weights = False
+        if (resume_path / "training_state").is_dir():
+            accelerator.load_state(str(resume_path / "training_state"))
+            loaded_full_state = True
+        elif (resume_path / "model.safetensors").is_file():
+            load_model_weights(model, resume_path)
+            loaded_model_weights = True
+        meta_path = resume_path / "meta.json"
+        if meta_path.is_file():
+            meta = _load_json(meta_path)
+            start_step = int(meta.get("step", 0)) + 1
+            best_eval = float(meta.get("best_eval", float("inf")))
+        metrics_path = resume_path / "metrics.json"
+        if metrics_path.is_file():
+            metrics = _load_json(metrics_path)
+        if accelerator.is_main_process:
+            if loaded_full_state:
+                console.print(f"[resume] Loaded full training_state; resuming from step {start_step}")
+            elif loaded_model_weights:
+                console.print(f"[resume] Loaded model-only checkpoint; resuming from step {start_step}")
+            else:
+                console.print(f"[resume] Found metadata only; resuming from step {start_step}")
+
+    # ------------------------------------------------------------------
+    # Timestep sampler
+    # ------------------------------------------------------------------
+    t_sampler: UniformTimestepSampler | LogitNormalTimestepSampler = (
+        LogitNormalTimestepSampler() if args.timestep_sampler == "logit_normal"
+        else UniformTimestepSampler()
+    )
+
+    # ------------------------------------------------------------------
+    # Save training config
+    # ------------------------------------------------------------------
+    if accelerator.is_main_process:
+        with (output_dir / "config.json").open("w") as fh:
+            json.dump({
+                "model_config": model_config,
+                "training": vars(args),
+                "mixed_precision": args.mixed_precision,
+                "model_backend": args.model_backend,
+                "diffusers_version": diffusers_version,
+            }, fh, indent=2)
+
+    error_buffer = ResidualErrorBuffer(args.error_buffer_size, clip_abs=args.error_buffer_clip)
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+    def _batch_iter():
+        while True:
+            yield from train_loader
+
+    train_iter = _batch_iter()
+    start_time = time.time()
+    use_live = sys.stdout.isatty() and accelerator.is_main_process
+
+    if accelerator.is_main_process:
+        console.print(f"Training on {len(train_dataset)} samples | output: {output_dir}")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("{task.fields[status]}"),
+        disable=not use_live,
+        refresh_per_second=2,
+    ) as progress:
+        log_console = progress.console
+        task = progress.add_task("Training", total=max(args.max_steps - start_step, 0), status="")
+
+        for step in range(start_step, args.max_steps):
+            batch = next(train_iter)
+            latents, actions = prepare_batch(
+                batch,
+                device=device,
+                default_action_index=default_action_index,
+                latent_normalization=latent_normalization,
+            )
+
+            history = latents[:, :, :args.context_frames]
+            future = latents[:, :, args.context_frames:]
+
+            # Optional history perturbation
+            if (
+                error_buffer.enabled()
+                and step >= args.error_inject_start_step
+                and len(error_buffer) > 0
+                and random.random() < args.error_inject_prob
+            ):
+                perturb = error_buffer.sample(
+                    batch_size=history.shape[0],
+                    device=history.device,
+                    dtype=history.dtype,
+                    frames=args.context_frames,
+                )
+                if perturb is not None:
+                    history = history + args.error_inject_scale * perturb
+
+            noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
+            model_input = torch.cat((history, noisy_future), dim=2)
+
+            optimizer.zero_grad(set_to_none=True)
+            with accelerator.autocast():
+                v_pred = model(model_input, actions, t, args.context_frames)
+                loss = compute_flow_loss(v_pred, v_target, loss_type=args.flow_loss, huber_delta=args.huber_delta)
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                error_buffer.clear()
+                progress.update(task, advance=1, status=f"loss=nonfinite(skip) lr={lr_scheduler.get_last_lr()[0]:.2e}")
+                continue
+
+            accelerator.backward(loss)
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip).item()
+
+            if args.log_interval > 0 and step % args.log_interval == 0:
+                raw = accelerator.unwrap_model(model)
+                _groups = {
+                    "encoder_attn": [
+                        p for b in raw.encoder_blocks
+                        for name, p in b.named_parameters()
+                        if "attn" in name and p.grad is not None
+                    ],
+                    "decoder_attn": [
+                        p for b in raw.decoder_blocks
+                        for name, p in b.named_parameters()
+                        if "attn" in name and p.grad is not None
+                    ],
+                    "encoder_mlp": [
+                        p for b in raw.encoder_blocks
+                        for name, p in b.named_parameters()
+                        if "mlp" in name and p.grad is not None
+                    ],
+                    "decoder_mlp": [
+                        p for b in raw.decoder_blocks
+                        for name, p in b.named_parameters()
+                        if "mlp" in name and p.grad is not None
+                    ],
+                    "output_proj": [p for p in raw.output_proj.parameters() if p.grad is not None],
+                    "input_proj":  [p for p in raw.input_proj.parameters()  if p.grad is not None],
+                }
+                _gnorms = {
+                    k: torch.stack([p.grad.detach().norm() for p in ps]).norm().item()
+                    for k, ps in _groups.items() if ps
+                }
+                log_console.print("gnorms " + " ".join(f"{k}={v:.3f}" for k, v in _gnorms.items()))
+
+            if (
+                args.grad_norm_skip > 0.0
+                and math.isfinite(grad_norm)
+                and grad_norm > args.grad_norm_skip
+            ):
+                optimizer.zero_grad(set_to_none=True)
+                error_buffer.clear()
+                status = (
+                    f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
+                    f"gnorm={grad_norm:.2f} skip=gradnorm"
+                )
+                progress.update(task, advance=1, status=status)
+                lr_scheduler.step()
+                continue
+
+            optimizer.step()
+            lr_scheduler.step()
+
+            with torch.no_grad():
+                error_buffer.add_batch(eps - v_pred - future)
+
+            status = (
+                f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
+                f"gnorm={grad_norm:.2f} errbuf={len(error_buffer)}"
+            )
+            progress.update(task, advance=1, status=status)
+
+            if not use_live and args.log_interval > 0 and step % args.log_interval == 0:
+                elapsed = max(time.time() - start_time, 1e-6)
+                sps = ((step - start_step + 1) * args.batch_size) / elapsed
+                log_console.print(
+                    f"step={step:06d} loss={loss.item():.5f} "
+                    f"lr={lr_scheduler.get_last_lr()[0]:.2e} gnorm={grad_norm:.2f} samples/s={sps:.1f}"
+                )
+
+            # ------------------------------------------------------------------
+            # Evaluation
+            # ------------------------------------------------------------------
+            should_eval = (
+                eval_loader is not None
+                and accelerator.is_main_process
+                and args.eval_interval > 0
+                and ((step + 1) % args.eval_interval == 0 or step == args.max_steps - 1)
+            )
+            if should_eval:
+                gc.collect()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+                eval_metrics = evaluate(
+                    model,
+                    loader=eval_loader,
+                    device=device,
+                    context_frames=args.context_frames,
+                    accelerator=accelerator,
+                    default_action_index=default_action_index,
+                    loss_type=args.flow_loss,
+                    huber_delta=args.huber_delta,
+                    latent_normalization=latent_normalization,
+                    t_sampler=t_sampler,
+                )
+                eval_metrics["step"] = step
+                eval_metrics["lr"] = float(lr_scheduler.get_last_lr()[0])
+                metrics.append(eval_metrics)
+
+                eval_line = (
+                    f"eval step={step:06d} flow_loss={eval_metrics['flow_loss']:.6f} "
+                    f"x0_mse={eval_metrics['x0_mse']:.6f}"
+                )
+
+                # Preview
+                with torch.no_grad():
+                    try:
+                        if video_vae is not None and palette is not None:
+                            preview_batch = next(train_iter)
+                            prev_latents, prev_actions = prepare_batch(
+                                preview_batch,
+                                device=device,
+                                default_action_index=default_action_index,
+                                latent_normalization=latent_normalization,
+                            )
+                            idx = random.randrange(prev_latents.shape[0])
+                            prev_latents = prev_latents[idx:idx+1]
+                            prev_actions = prev_actions[idx:idx+1]
+
+                            history_prev = prev_latents[:, :, :args.context_frames]
+                            raw_model = accelerator.unwrap_model(model)
+                            sampled_future = denoise_future_segment(
+                                raw_model,
+                                history_latents=history_prev,
+                                actions=prev_actions,
+                                future_frames=args.clip_frames - args.context_frames,
+                                ode_steps=args.preview_ode_steps,
+                                accelerator=accelerator,
+                            )
+                            sampled_full = torch.cat((history_prev, sampled_future), dim=2)
+
+                            def maybe_denorm(x):
+                                return latent_normalization.denormalize(x) if latent_normalization else x
+
+                            sampled_frames = latents_to_frame_indices(
+                                video_vae, maybe_denorm(sampled_full), accelerator=accelerator
+                            )
+                            gt_frames = latents_to_frame_indices(
+                                video_vae, maybe_denorm(prev_latents), accelerator=accelerator
+                            )
+                            save_preview_image(
+                                output_dir / f"preview_step_{step:06d}.png",
+                                frames_gt=gt_frames[0],
+                                frames_sample=sampled_frames[0],
+                                palette=palette,
+                            )
+                    except torch.cuda.OutOfMemoryError:
+                        log_console.print("[eval][OOM] Preview skipped")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                if eval_metrics["flow_loss"] < best_eval:
+                    best_eval = eval_metrics["flow_loss"]
+                    save_model_checkpoint(
+                        output_dir / "best",
+                        model=model,
+                        model_config=model_config,
+                        step=step,
+                        best_eval=best_eval,
+                        metrics=metrics,
+                    )
+                    accelerator.save_state(str(output_dir / "best" / "training_state"))
+                    eval_line += f" | best={best_eval:.6f}"
+
+                with (output_dir / "metrics.json").open("w") as fh:
+                    json.dump(metrics, fh, indent=2)
+                log_console.print(eval_line)
+
+                gc.collect()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            # ------------------------------------------------------------------
+            # Periodic checkpoint
+            # ------------------------------------------------------------------
+            should_ckpt = (
+                accelerator.is_main_process
+                and args.checkpoint_interval > 0
+                and ((step + 1) % args.checkpoint_interval == 0 or step == args.max_steps - 1)
+            )
+            if should_ckpt:
+                ckpt_dir = output_dir / f"checkpoint_{step:06d}"
+                save_model_checkpoint(
+                    ckpt_dir,
+                    model=model,
+                    model_config=model_config,
+                    step=step,
+                    best_eval=best_eval,
+                    metrics=metrics,
+                )
+                accelerator.save_state(str(ckpt_dir / "training_state"))
+
+    if accelerator.is_main_process:
+        console.print(f"Training complete. Best eval flow_loss={best_eval:.6f}")
+
+
+if __name__ == "__main__":
+    main()

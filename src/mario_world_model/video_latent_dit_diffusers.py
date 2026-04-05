@@ -1,92 +1,13 @@
 from __future__ import annotations
 
-import math
-
 import torch
-import torch.nn.functional as F
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.attention import FeedForward
+from diffusers.models.attention_processor import Attention
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
 from torch import Tensor, nn
-
-
-class QKNormMultiheadAttention(nn.Module):
-    """nn.MultiheadAttention with per-head RMSNorm applied to Q and K after projection."""
-
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
-        self._attn = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        head_dim = embed_dim // num_heads
-        self.q_norm = nn.RMSNorm(head_dim)
-        self.k_norm = nn.RMSNorm(head_dim)
-        self._num_heads = num_heads
-        self._head_dim = head_dim
-        self._embed_dim = embed_dim
-
-    @property
-    def out_proj(self) -> nn.Linear:
-        return self._attn.out_proj
-
-    def forward(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        *,
-        need_weights: bool = False,
-        attn_mask: Tensor | None = None,
-    ) -> tuple[Tensor, None]:
-        B, Nq, D = query.shape
-        Nk = key.shape[1]
-        H, Dh = self._num_heads, self._head_dim
-
-        w = self._attn.in_proj_weight   # (3*D, D)
-        b = self._attn.in_proj_bias     # (3*D,) or None
-        q = F.linear(query, w[:D],    b[:D]    if b is not None else None)
-        k = F.linear(key,   w[D:2*D], b[D:2*D] if b is not None else None)
-        v = F.linear(value, w[2*D:],  b[2*D:]  if b is not None else None)
-
-        q = self.q_norm(q.view(B, Nq, H, Dh)).view(B, Nq, D)
-        k = self.k_norm(k.view(B, Nk, H, Dh)).view(B, Nk, D)
-
-        q = q.view(B, Nq, H, Dh).transpose(1, 2)
-        k = k.view(B, Nk, H, Dh).transpose(1, 2)
-        v = v.view(B, Nk, H, Dh).transpose(1, 2)
-
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.zeros_like(attn_mask, dtype=query.dtype).masked_fill(attn_mask, float("-inf"))
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.transpose(1, 2).contiguous().view(B, Nq, D)
-        return self._attn.out_proj(out), None
-
-
-def timestep_embedding(timesteps: Tensor, dim: int, max_period: int = 10000) -> Tensor:
-    """Create sinusoidal timestep embeddings.
-
-    timesteps: shape (B,) float in [0, 1] or any real-valued scale.
-    returns: shape (B, dim)
-    """
-    if timesteps.ndim != 1:
-        raise ValueError(f"Expected timesteps with shape (B,), got {tuple(timesteps.shape)}")
-
-    half = dim // 2
-    if half == 0:
-        return timesteps[:, None]
-
-    device = timesteps.device
-    exponent = -math.log(max_period) * torch.arange(0, half, device=device, dtype=torch.float32) / half
-    freqs = torch.exp(exponent)
-    args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
-    emb = torch.cat((torch.cos(args), torch.sin(args)), dim=1)
-    if dim % 2 == 1:
-        emb = torch.cat((emb, torch.zeros_like(emb[:, :1])), dim=1)
-    return emb
 
 
 class AdaLayerNorm(nn.Module):
@@ -107,13 +28,22 @@ class AdaLayerNorm(nn.Module):
         return self.norm(x) * (1.0 + scale) + shift
 
 
-class EncoderBlock(nn.Module):
-    """History encoder block.
+def _init_zero_attention_out(attn: Attention) -> None:
+    nn.init.zeros_(attn.to_out[0].weight)
+    if attn.to_out[0].bias is not None:
+        nn.init.zeros_(attn.to_out[0].bias)
 
-    Full spatiotemporal self-attention over history tokens + causal action
-    cross-attention + MLP.  No diffusion-timestep conditioning (history is
-    always clean).
-    """
+
+def _init_zero_ff_out(ff: FeedForward) -> None:
+    final_linear = ff.net[-1]
+    if isinstance(final_linear, nn.Linear):
+        nn.init.zeros_(final_linear.weight)
+        if final_linear.bias is not None:
+            nn.init.zeros_(final_linear.bias)
+
+
+class DiffusersEncoderBlock(nn.Module):
+    """History encoder block built from Diffusers attention/MLP layers."""
 
     def __init__(
         self,
@@ -127,30 +57,38 @@ class EncoderBlock(nn.Module):
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
 
+        head_dim = d_model // num_heads
         hidden_dim = int(d_model * mlp_ratio)
+
         self.norm1 = nn.LayerNorm(d_model)
-        self.self_attn = QKNormMultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.action_cross_attn = QKNormMultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout
-        )
-        self.norm3 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout),
+        self.self_attn = Attention(
+            query_dim=d_model,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=True,
+            out_bias=True,
+            qk_norm="rms_norm",
         )
 
-        nn.init.zeros_(self.self_attn.out_proj.weight)
-        nn.init.zeros_(self.self_attn.out_proj.bias)
-        nn.init.zeros_(self.action_cross_attn.out_proj.weight)
-        nn.init.zeros_(self.action_cross_attn.out_proj.bias)
-        nn.init.zeros_(self.mlp[3].weight)
-        nn.init.zeros_(self.mlp[3].bias)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.action_cross_attn = Attention(
+            query_dim=d_model,
+            cross_attention_dim=d_model,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=True,
+            out_bias=True,
+            qk_norm="rms_norm",
+        )
+
+        self.norm3 = nn.LayerNorm(d_model)
+        self.mlp = FeedForward(d_model, inner_dim=hidden_dim, dropout=dropout)
+
+        _init_zero_attention_out(self.self_attn)
+        _init_zero_attention_out(self.action_cross_attn)
+        _init_zero_ff_out(self.mlp)
 
     def forward(
         self,
@@ -160,26 +98,21 @@ class EncoderBlock(nn.Module):
         action_attn_mask: Tensor | None,
     ) -> Tensor:
         h = self.norm1(tokens)
-        tokens = tokens + self.self_attn(h, h, h, need_weights=False)[0]
+        tokens = tokens + self.self_attn(h)
 
         q = self.norm2(tokens)
         tokens = tokens + self.action_cross_attn(
-            q, action_tokens, action_tokens,
-            need_weights=False,
-            attn_mask=action_attn_mask,
-        )[0]
+            q,
+            encoder_hidden_states=action_tokens,
+            attention_mask=action_attn_mask,
+        )
 
         tokens = tokens + self.mlp(self.norm3(tokens))
         return tokens
 
 
-class DecoderBlock(nn.Module):
-    """Future decoder block.
-
-    Self-attention among future tokens + cross-attention to encoded history +
-    causal action cross-attention + MLP.  Conditioned on the diffusion
-    timestep via AdaLayerNorm.
-    """
+class DiffusersDecoderBlock(nn.Module):
+    """Future decoder block built from Diffusers attention/MLP layers."""
 
     def __init__(
         self,
@@ -193,36 +126,49 @@ class DecoderBlock(nn.Module):
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
 
+        head_dim = d_model // num_heads
         hidden_dim = int(d_model * mlp_ratio)
+
         self.norm1 = AdaLayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.history_cross_attn = QKNormMultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout
-        )
-        self.norm3 = nn.LayerNorm(d_model)
-        self.action_cross_attn = QKNormMultiheadAttention(
-            embed_dim=d_model, num_heads=num_heads, dropout=dropout
-        )
-        self.norm4 = AdaLayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout),
+        self.self_attn = Attention(
+            query_dim=d_model,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=True,
+            out_bias=True,
         )
 
-        nn.init.zeros_(self.self_attn.out_proj.weight)
-        nn.init.zeros_(self.self_attn.out_proj.bias)
-        nn.init.zeros_(self.history_cross_attn.out_proj.weight)
-        nn.init.zeros_(self.history_cross_attn.out_proj.bias)
-        nn.init.zeros_(self.action_cross_attn.out_proj.weight)
-        nn.init.zeros_(self.action_cross_attn.out_proj.bias)
-        nn.init.zeros_(self.mlp[3].weight)
-        nn.init.zeros_(self.mlp[3].bias)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.history_cross_attn = Attention(
+            query_dim=d_model,
+            cross_attention_dim=d_model,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=True,
+            out_bias=True,
+            qk_norm="rms_norm",
+        )
+
+        self.norm3 = nn.LayerNorm(d_model)
+        self.action_cross_attn = Attention(
+            query_dim=d_model,
+            cross_attention_dim=d_model,
+            heads=num_heads,
+            dim_head=head_dim,
+            dropout=dropout,
+            bias=True,
+            out_bias=True,
+        )
+
+        self.norm4 = AdaLayerNorm(d_model)
+        self.mlp = FeedForward(d_model, inner_dim=hidden_dim, dropout=dropout)
+
+        _init_zero_attention_out(self.self_attn)
+        _init_zero_attention_out(self.history_cross_attn)
+        _init_zero_attention_out(self.action_cross_attn)
+        _init_zero_ff_out(self.mlp)
 
     def forward(
         self,
@@ -234,47 +180,29 @@ class DecoderBlock(nn.Module):
         action_attn_mask: Tensor | None,
     ) -> Tensor:
         h = self.norm1(tokens, cond)
-        tokens = tokens + self.self_attn(h, h, h, need_weights=False)[0]
+        tokens = tokens + self.self_attn(h)
 
         q = self.norm2(tokens)
         tokens = tokens + self.history_cross_attn(
-            q, encoded_history, encoded_history, need_weights=False
-        )[0]
+            q,
+            encoder_hidden_states=encoded_history,
+        )
 
         q = self.norm3(tokens)
         tokens = tokens + self.action_cross_attn(
-            q, action_tokens, action_tokens,
-            need_weights=False,
-            attn_mask=action_attn_mask,
-        )[0]
+            q,
+            encoder_hidden_states=action_tokens,
+            attention_mask=action_attn_mask,
+        )
 
         tokens = tokens + self.mlp(self.norm4(tokens, cond))
         return tokens
 
 
-class VideoLatentDiT(nn.Module):
-    """Encoder-decoder video-latent DiT for flow-matching future prediction.
+class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
+    """Diffusers-native video-latent DiT for flow-matching future prediction."""
 
-    The encoder processes clean history latents once.  The decoder denoises
-    the noisy future segment conditioned on the encoded history, attending
-    only over the (much smaller) future token set.
-
-    This factoring reduces the dominant self-attention cost from
-    O((context + future)² * H * W)² to O(future² * H * W)² for the
-    per-denoising-step decoder, while caching the encoder output across
-    all ODE steps.
-
-    forward() interface (convenience, encode + decode in one call):
-        noisy_latents : (B, C, T, H, W)  clean history + noisy future
-        actions       : (B, T)            action IDs for the full clip
-        timesteps     : (B,)
-        context_frames: int               number of clean history frames
-        → velocity    : (B, C, future_frames, H, W)
-
-    For inference, prefer calling encode_history() once then decode_future()
-    in a loop to avoid re-running the encoder at every ODE step.
-    """
-
+    @register_to_config
     def __init__(
         self,
         *,
@@ -304,7 +232,7 @@ class VideoLatentDiT(nn.Module):
         self.num_actions = num_actions
         self.max_frames = max_frames
         self.d_model = d_model
-        self.action_dim = action_dim
+        self.num_heads = num_heads
 
         self.input_proj = nn.Linear(latent_channels, d_model)
         self.output_proj = nn.Linear(d_model, latent_channels)
@@ -333,18 +261,24 @@ class VideoLatentDiT(nn.Module):
             nn.SiLU(),
         )
         self.action_to_model = nn.Linear(action_dim, d_model)
+
         self.spatial_coord_proj = nn.Linear(2, d_model)
         self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, d_model))
 
-        self.time_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.SiLU(),
-            nn.Linear(d_model * 4, d_model),
+        self.time_proj = Timesteps(
+            num_channels=d_model,
+            flip_sin_to_cos=False,
+            downscale_freq_shift=0.0,
+        )
+        self.time_embedding = TimestepEmbedding(
+            in_channels=d_model,
+            time_embed_dim=d_model,
+            act_fn="silu",
         )
 
         self.encoder_blocks = nn.ModuleList(
             [
-                EncoderBlock(
+                DiffusersEncoderBlock(
                     d_model=d_model,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -356,7 +290,7 @@ class VideoLatentDiT(nn.Module):
 
         self.decoder_blocks = nn.ModuleList(
             [
-                DecoderBlock(
+                DiffusersDecoderBlock(
                     d_model=d_model,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -370,10 +304,6 @@ class VideoLatentDiT(nn.Module):
         self.final_mod = nn.Linear(d_model, 2 * d_model)
         nn.init.zeros_(self.final_mod.weight)
         nn.init.zeros_(self.final_mod.bias)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _spatial_coords(height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
@@ -392,23 +322,16 @@ class VideoLatentDiT(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
-        """Return (1, H*W*num_frames, D) positional encoding.
-
-        Temporal positions are absolute: [start_frame, start_frame+num_frames).
-        The (h, w, t) token ordering matches rearrange "b (h w t) c".
-        """
         temporal = self.temporal_pos[:, start_frame : start_frame + num_frames].to(dtype=dtype)
         spatial_coords = self._spatial_coords(height, width, device=device, dtype=dtype)
         spatial = self.spatial_coord_proj(spatial_coords)
-        # spatial: (H*W, D) → (1, H*W, 1, D); temporal: (1, num_frames, D) → (1, 1, num_frames, D)
         positional = spatial.unsqueeze(0).unsqueeze(2) + temporal.unsqueeze(1)
         return rearrange(positional, "b n t d -> b (n t) d")
 
-    def _encode_actions(self, actions: Tensor) -> Tensor:
-        """actions (B, T) → action_tokens (B, T, D)."""
+    def _encode_actions(self, actions: Tensor, *, dtype: torch.dtype) -> Tensor:
         if actions.dtype != torch.long:
             actions = actions.long()
-        bits = self.action_bit_lut[actions].to(dtype=self.temporal_pos.dtype)
+        bits = self.action_bit_lut[actions].to(dtype=dtype)
         return self.action_to_model(self.action_mlp(bits))
 
     @staticmethod
@@ -418,14 +341,22 @@ class VideoLatentDiT(nn.Module):
         num_action_steps: int,
         device: torch.device,
     ) -> Tensor:
-        """Boolean mask (True = masked out) for causal action cross-attention.
-
-        query_absolute_steps : (N_queries,) absolute time index of each query token
-        num_action_steps     : number of action key/value tokens (0..T-1)
-        Returns (N_queries, num_action_steps)
-        """
         key_steps = torch.arange(num_action_steps, device=device)
         return key_steps.unsqueeze(0) > query_absolute_steps.unsqueeze(1)
+
+    @staticmethod
+    def _to_attention_bias(
+        mask: Tensor,
+        *,
+        batch_size: int,
+        num_heads: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        # Diffusers Attention expects additive attention bias with shape (B*H, Nq, Nk).
+        bias = torch.zeros(mask.shape, device=device, dtype=dtype)
+        bias = bias.masked_fill(mask, torch.tensor(-10_000.0, device=device, dtype=dtype))
+        return bias.unsqueeze(0).repeat(batch_size * num_heads, 1, 1)
 
     def _validate_actions(self, actions: Tensor) -> None:
         if torch.any(actions < 0) or torch.any(actions >= self.num_actions):
@@ -434,19 +365,7 @@ class VideoLatentDiT(nn.Module):
                 f"but got min={int(actions.min())}, max={int(actions.max())}"
             )
 
-    # ------------------------------------------------------------------
-    # Public encode / decode API
-    # ------------------------------------------------------------------
-
     def encode_history(self, history_latents: Tensor, history_actions: Tensor) -> Tensor:
-        """Encode clean history latents.
-
-        history_latents : (B, C, context_frames, H, W)
-        history_actions : (B, context_frames)
-        Returns encoded_history : (B, H*W*context_frames, D)
-
-        Call this once per denoising rollout and cache the result.
-        """
         if history_latents.ndim != 5:
             raise ValueError(
                 f"Expected history_latents (B, C, T, H, W), got {tuple(history_latents.shape)}"
@@ -467,11 +386,15 @@ class VideoLatentDiT(nn.Module):
         tokens = rearrange(history_latents, "b c t h w -> b (h w t) c")
         tokens = self.input_proj(tokens)
         tokens = tokens + self._positional_encoding(
-            height, width, start_frame=0, num_frames=context_frames,
-            device=history_latents.device, dtype=tokens.dtype,
+            height,
+            width,
+            start_frame=0,
+            num_frames=context_frames,
+            device=history_latents.device,
+            dtype=tokens.dtype,
         )
 
-        action_tokens = self._encode_actions(history_actions)
+        action_tokens = self._encode_actions(history_actions, dtype=tokens.dtype)
 
         for block in self.encoder_blocks:
             tokens = block(tokens, action_tokens=action_tokens, action_attn_mask=None)
@@ -486,21 +409,13 @@ class VideoLatentDiT(nn.Module):
         encoded_history: Tensor,
         context_frames: int,
     ) -> Tensor:
-        """Predict velocity for the noisy future segment.
-
-        noisy_future     : (B, C, future_frames, H, W)
-        actions          : (B, context_frames + future_frames)  full-clip actions
-        timesteps        : (B,)
-        encoded_history  : (B, H*W*context_frames, D)  from encode_history()
-        context_frames   : int
-        Returns velocity : (B, C, future_frames, H, W)
-        """
         if noisy_future.ndim != 5:
             raise ValueError(
                 f"Expected noisy_future (B, C, future_frames, H, W), got {tuple(noisy_future.shape)}"
             )
         batch, channels, future_frames, height, width = noisy_future.shape
         total_frames = context_frames + future_frames
+
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
         if actions.shape != (batch, total_frames):
@@ -525,12 +440,15 @@ class VideoLatentDiT(nn.Module):
         tokens = rearrange(noisy_future, "b c t h w -> b (h w t) c")
         tokens = self.input_proj(tokens)
         tokens = tokens + self._positional_encoding(
-            height, width, start_frame=context_frames, num_frames=future_frames,
-            device=noisy_future.device, dtype=tokens.dtype,
+            height,
+            width,
+            start_frame=context_frames,
+            num_frames=future_frames,
+            device=noisy_future.device,
+            dtype=tokens.dtype,
         )
 
-        # Action tokens over full clip; decoder queries at absolute times ctx..T-1.
-        action_tokens = self._encode_actions(actions)
+        action_tokens = self._encode_actions(actions, dtype=tokens.dtype)
         spatial_tokens = height * width
         query_steps_abs = (
             torch.arange(future_frames, device=noisy_future.device).repeat(spatial_tokens)
@@ -541,9 +459,16 @@ class VideoLatentDiT(nn.Module):
             num_action_steps=total_frames,
             device=noisy_future.device,
         )
+        action_bias = self._to_attention_bias(
+            action_mask,
+            batch_size=batch,
+            num_heads=self.num_heads,
+            device=noisy_future.device,
+            dtype=tokens.dtype,
+        )
 
-        t_embed = timestep_embedding(timesteps, self.d_model).to(dtype=tokens.dtype)
-        cond = self.time_mlp(t_embed)  # (B, D)
+        t_proj = self.time_proj(timesteps.float()).to(device=noisy_future.device, dtype=tokens.dtype)
+        cond = self.time_embedding(t_proj).to(dtype=tokens.dtype)
 
         for block in self.decoder_blocks:
             tokens = block(
@@ -551,7 +476,7 @@ class VideoLatentDiT(nn.Module):
                 encoded_history=encoded_history,
                 action_tokens=action_tokens,
                 cond=cond,
-                action_attn_mask=action_mask,
+                action_attn_mask=action_bias,
             )
 
         tokens = self.final_norm(tokens)
@@ -562,10 +487,6 @@ class VideoLatentDiT(nn.Module):
         pred = self.output_proj(tokens)
         return rearrange(pred, "b (h w t) c -> b c t h w", h=height, w=width, t=future_frames)
 
-    # ------------------------------------------------------------------
-    # Convenience forward (encode + decode in one call)
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         latents: Tensor,
@@ -573,18 +494,8 @@ class VideoLatentDiT(nn.Module):
         timesteps: Tensor,
         context_frames: int,
     ) -> Tensor:
-        """Encode history and decode future in one pass.
-
-        latents       : (B, C, T, H, W)  clean history + noisy future concatenated
-        actions       : (B, T)
-        timesteps     : (B,)
-        context_frames: int
-        Returns velocity : (B, C, future_frames, H, W)
-        """
         if latents.ndim != 5:
-            raise ValueError(
-                f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}"
-            )
+            raise ValueError(f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}")
         if actions.ndim != 2:
             raise ValueError(f"Expected actions (B, T), got {tuple(actions.shape)}")
         _, _, total_frames, _, _ = latents.shape

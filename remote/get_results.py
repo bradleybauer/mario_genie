@@ -34,7 +34,7 @@ def _remote_result_roots(subdir: str | None) -> list[tuple[str, str]]:
     """Return candidate remote roots and matching local destinations."""
     candidates = []
     remote_suffix = "checkpoints/"
-    local_base = str(PROJECT_ROOT / "results")
+    local_base = str(PROJECT_ROOT / "checkpoints")
     if subdir:
         remote_suffix += subdir + "/"
         local_base = os.path.join(local_base, subdir)

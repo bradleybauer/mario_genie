@@ -1,3 +1,6 @@
 [submodule "mesen"]
 	path = mesen
 	url = https://github.com/bradleybauer/Mesen2
+[submodule "LTX-2"]
+	path = LTX-2
+	url = https://github.com/Lightricks/LTX-2.git

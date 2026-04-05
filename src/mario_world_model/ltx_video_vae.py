@@ -1,7 +1,7 @@
-"""LTX Video VAE v2 — learned upsampling decoder for pixel-perfect reconstruction.
+"""LTX Video VAE — learned upsampling decoder for pixel-perfect reconstruction.
 
-The encoder is identical to v1 (patchify 4× + 2 strided downsamples = 16× spatial
-compression).  The decoder replaces the 1×1-conv + unpatchify with four learned
+The encoder is patchify 4× + 2 strided downsamples = 16× spatial
+compressions.  The decoder replaces the 1×1-conv + unpatchify with four learned
 ``SpatialUpsample3D`` stages (each 2×), so every pixel is generated with full
 spatial context from its neighbors.
 
@@ -121,7 +121,7 @@ class SpatialUpsample3D(nn.Module):
         return self.conv(x)
 
 
-class LTXVideoVAEv2(nn.Module):
+class LTXVideoVAE(nn.Module):
     """Palette-aware 3D convolutional VAE with learned-upsample decoder.
 
     Encoder: patchify(4×) → conv → 2 strided downsamples → latent

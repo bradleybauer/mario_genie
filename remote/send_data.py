@@ -32,6 +32,12 @@ def send_data(worker):
         f"{worker.project_dir}/data/",
         extra_args=["--progress"],
     )
+    rsync_to(
+        worker,
+        str(PROJECT_ROOT / "data") + "/latents",
+        f"{worker.project_dir}/data/",
+        extra_args=["--progress"],
+    )
 
 
 def main():
