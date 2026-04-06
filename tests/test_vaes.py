@@ -11,13 +11,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
-from models.ltx_audio_vae import LTXAudioVAE
-from models.ltx_audio_vocoder import LTXAudioVocoder
-from models.ltx_video_vae import LTXVideoVAE
+from models.audio_vae import AudioVAE
+from models.audio_vocoder import AudioVocoder
+from models.video_vae import VideoVAE
 
 
 def test_video_vae_preserves_video_shape() -> None:
-    model = LTXVideoVAE(num_colors=8, patch_size=4, base_channels=8, latent_channels=4)
+    model = VideoVAE(num_colors=8, patch_size=4, base_channels=8, latent_channels=4)
     video = torch.randn(2, 8, 4, 32, 32)
 
     output = model(video, sample_posterior=False)
@@ -29,7 +29,7 @@ def test_video_vae_preserves_video_shape() -> None:
 
 
 def test_audio_vae_preserves_mel_shape() -> None:
-    model = LTXAudioVAE(in_channels=1, n_mels=64, base_channels=8, latent_channels=4)
+    model = AudioVAE(in_channels=1, n_mels=64, base_channels=8, latent_channels=4)
     mel = torch.rand(2, 1, 61, 64)
 
     output = model(mel, sample_posterior=False)
@@ -41,7 +41,7 @@ def test_audio_vae_preserves_mel_shape() -> None:
 
 
 def test_audio_vocoder_output_length_matches_expected_formula() -> None:
-    model = LTXAudioVocoder(
+    model = AudioVocoder(
         in_channels=1,
         n_mels=64,
         out_channels=1,
@@ -61,7 +61,7 @@ def test_audio_vocoder_output_length_matches_expected_formula() -> None:
 
 
 def test_audio_vocoder_default_model_fits_project_size_budget() -> None:
-    model = LTXAudioVocoder()
+    model = AudioVocoder()
     assert model.num_parameters <= 5_000_000
 
 

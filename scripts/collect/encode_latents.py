@@ -38,7 +38,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from models.ltx_video_vae import LTXVideoVAE
+from models.video_vae import VideoVAE
 from path_utils import serialize_project_path
 
 console = Console()
@@ -110,7 +110,7 @@ def load_video_vae(
             f"VAE config expects num_colors={vae_num_colors} but palette has {num_colors}."
         )
 
-    vae = LTXVideoVAE(
+    vae = VideoVAE(
         num_colors=vae_num_colors,
         patch_size=patch_size,
         base_channels=base_channels,

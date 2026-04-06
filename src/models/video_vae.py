@@ -1,4 +1,4 @@
-"""LTX Video VAE — learned upsampling decoder for pixel-perfect reconstruction.
+"""Video VAE — learned upsampling decoder for pixel-perfect reconstruction.
 
 The encoder is patchify 4× + 2 strided downsamples = 16× spatial
 compressions.  The decoder replaces the 1×1-conv + unpatchify with four learned
@@ -121,7 +121,7 @@ class SpatialUpsample3D(nn.Module):
         return self.conv(x)
 
 
-class LTXVideoVAE(nn.Module):
+class VideoVAE(nn.Module):
     """Palette-aware 3D convolutional VAE with learned-upsample decoder.
 
     Encoder: patchify(4×) → conv → 2 strided downsamples → latent

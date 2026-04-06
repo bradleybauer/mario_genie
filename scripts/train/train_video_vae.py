@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+"""Train the Video VAE (learned-upsample decoder)."""
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -11,40 +13,29 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from models.gan_discriminator import build_mel_discriminator, count_trainable_parameters
+from models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
-from data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
-from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
-from models.ltx_audio_vae import LTXAudioVAE
-from data.normalized_dataset import NormalizedSequenceDataset
+from training.losses import focal_cross_entropy, softened_inverse_frequency_weights
+from models.video_vae import VideoVAE
+from data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from training.palette_video_vae_training import (
+    evaluate_video_vae,
+    frames_to_one_hot,
+    save_video_preview,
+    split_context_targets,
+)
 from system_info import collect_system_info, print_system_info
 from training.training_utils import (
     ThroughputTracker,
@@ -79,7 +70,7 @@ def _format_bytes(num_bytes: int) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the LTX-style mel audio VAE.")
+    parser = argparse.ArgumentParser(description="Train the Video VAE (learned-upsample decoder).")
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -87,34 +78,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-frames",
         type=int,
-        default=0,
-        help="Number of leading clip frames used as context; reconstruction loss ignores this prefix.",
+        default=4,
+        help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
     )
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000,
                         help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
-    parser.add_argument("--kl-weight", type=float, default=1e-5)
+    parser.add_argument("--kl-weight", type=float, default=1e-4)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for eval only (defaults to --batch-size).",
+    )
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=64)
-    parser.add_argument("--latent-channels", type=int, default=8)
-    parser.add_argument("--sample-rate", type=int, default=AUDIO_SAMPLE_RATE)
-    parser.add_argument("--n-fft", type=int, default=AUDIO_N_FFT)
-    parser.add_argument("--hop-length", type=int, default=AUDIO_HOP_LENGTH)
-    parser.add_argument("--n-mels", type=int, default=AUDIO_N_MELS)
-    parser.add_argument("--fmin", type=float, default=AUDIO_FMIN)
-    parser.add_argument("--fmax", type=float, default=AUDIO_FMAX)
+    parser.add_argument("--latent-channels", type=int, default=64)
+    parser.add_argument("--patch-size", type=int, default=4,
+                        help="Encoder patchify size (decoder uses learned upsampling).")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--tf16", action="store_true", help="Enable TF16 matmul precision")
+    parser.add_argument(
+        "--onehot-dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float32", "float16", "bfloat16"],
+        help="Dtype for one-hot input tensors (reduces memory vs float32 when using float16/bfloat16).",
+    )
+    parser.add_argument(
+        "--autocast",
+        action="store_true",
+        help="Enable CUDA autocast for model forward paths.",
+    )
+    parser.add_argument(
+        "--autocast-dtype",
+        type=str,
+        default="bfloat16",
+        choices=["float16", "bfloat16"],
+        help="Compute dtype for --autocast.",
+    )
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--focal-gamma", type=float, default=1.0,
+                        help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
+    parser.add_argument(
+        "--use-class-weights",
+        action="store_true",
+        help="Enable class-weighted reconstruction loss using distribution JSON from --data-dir.",
+    )
+    parser.add_argument(
+        "--class-weights-file",
+        type=str,
+        default="palette_distribution.json",
+        help="Distribution JSON filename in --data-dir containing class counts/probabilities.",
+    )
+    parser.add_argument(
+        "--class-weight-soften",
+        type=float,
+        default=0.2,
+        help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
+    )
     parser.add_argument(
         "--use-gan",
         action="store_true",
-        help="Enable adversarial training with a compact 2D mel-spectrogram discriminator.",
+        help="Enable adversarial training with a compact 3D discriminator.",
     )
     parser.add_argument(
         "--gan-weight",
@@ -160,13 +192,51 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume-from", type=str, default=None)
     args = parser.parse_args()
-
     if args.context_frames < 0:
-        parser.error("--context-frames must be non-negative")
-    if args.context_frames >= args.clip_frames:
-        parser.error("--context-frames must be smaller than --clip-frames")
-
+        parser.error("--context-frames must be >= 0")
+    if args.clip_frames <= 0:
+        parser.error("--clip-frames must be > 0")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be > 0")
     return args
+
+
+def load_class_weights(
+    data_dir: str,
+    *,
+    num_classes: int,
+    filename: str,
+    soften: float,
+    device: torch.device,
+) -> torch.Tensor:
+    dist_path = Path(data_dir) / filename
+    if not dist_path.is_file():
+        raise FileNotFoundError(
+            f"Class weight distribution file not found: {dist_path}. "
+            "Run scripts/normalize.py first or disable --use-class-weights."
+        )
+
+    with dist_path.open() as handle:
+        dist = json.load(handle)
+
+    counts_data = dist.get("counts")
+    probs_data = dist.get("probabilities")
+    if counts_data is not None:
+        counts = torch.tensor(counts_data, dtype=torch.float32)
+    elif probs_data is not None:
+        counts = torch.tensor(probs_data, dtype=torch.float32)
+    else:
+        raise ValueError(
+            f"{dist_path} must contain either 'counts' or 'probabilities'"
+        )
+
+    if counts.ndim != 1 or counts.numel() != num_classes:
+        raise ValueError(
+            f"{dist_path} has {counts.numel()} classes but model expects {num_classes}"
+        )
+
+    weights = softened_inverse_frequency_weights(counts, soften=soften)
+    return weights.to(device)
 
 
 def seed_everything(seed: int) -> None:
@@ -182,183 +252,27 @@ def make_output_dir(args: argparse.Namespace) -> Path:
         return Path(args.output_dir)
     if args.resume_from is not None:
         return Path(args.resume_from).resolve().parent
-    run_name = args.run_name or datetime.now().strftime("ltx_audio_vae_%Y%m%d_%H%M%S")
+    run_name = args.run_name or datetime.now().strftime("video_vae_%Y%m%d_%H%M%S")
     return PROJECT_ROOT / "checkpoints" / run_name
-
-
-def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    if mask is None:
-        return F.l1_loss(prediction, target)
-    diff = (prediction - target).abs() * mask
-    denom = mask.sum().clamp_min(1.0)
-    return diff.sum() / denom
-
-
-def build_mel_mask(
-    waveform_lengths: torch.Tensor,
-    *,
-    max_time_steps: int,
-    n_fft: int,
-    hop_length: int,
-    context_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if context_lengths is not None and context_lengths.shape != waveform_lengths.shape:
-        raise ValueError(
-            "context_lengths must have same shape as waveform_lengths: "
-            f"got {tuple(context_lengths.shape)} vs {tuple(waveform_lengths.shape)}"
-        )
-
-    mask = torch.zeros((waveform_lengths.shape[0], 1, max_time_steps, 1), dtype=torch.float32, device=waveform_lengths.device)
-    context_iter = context_lengths.tolist() if context_lengths is not None else [0] * waveform_lengths.shape[0]
-    for batch_idx, (length, context_length) in enumerate(zip(waveform_lengths.tolist(), context_iter, strict=True)):
-        valid_steps, _ = mel_time_frequency_shape(int(length), n_fft=n_fft, hop_length=hop_length, center=False)
-        context_steps = 0
-        if context_length > 0:
-            context_steps, _ = mel_time_frequency_shape(int(context_length), n_fft=n_fft, hop_length=hop_length, center=False)
-
-        start_step = min(context_steps, max_time_steps)
-        end_step = min(valid_steps, max_time_steps)
-        if end_step > start_step:
-            mask[batch_idx, :, start_step:end_step] = 1.0
-
-    return mask
-
-
-def context_waveform_lengths(audio_lengths: torch.Tensor, *, context_frames: int) -> torch.Tensor:
-    if audio_lengths.ndim != 2:
-        raise ValueError(f"Expected audio_lengths with shape (B, T), got {tuple(audio_lengths.shape)}")
-    if context_frames <= 0:
-        return torch.zeros(audio_lengths.shape[0], dtype=torch.int64, device=audio_lengths.device)
-
-    capped_context = min(context_frames, audio_lengths.shape[1])
-    return audio_lengths[:, :capped_context].to(dtype=torch.int64).sum(dim=1)
-
-
-def save_mel_preview(path: Path, mel: torch.Tensor, reconstruction: torch.Tensor, *, title_prefix: str = "") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mel_np = mel[0, 0].detach().cpu().numpy().T
-    recon_np = reconstruction[0, 0].detach().cpu().numpy().T
-
-    shared_min = min(mel_np.min(), recon_np.min())
-    shared_max = max(mel_np.max(), recon_np.max())
-    if shared_max - shared_min < 1e-6:
-        shared_max = shared_min + 1.0
-
-    target_title = f"{title_prefix}Target log-mel" if title_prefix else "Target log-mel"
-    recon_title = f"{title_prefix}Reconstructed log-mel" if title_prefix else "Reconstructed log-mel"
-
-    figure, axes = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
-    im0 = axes[0].imshow(mel_np, origin="lower", aspect="auto", cmap="magma", vmin=shared_min, vmax=shared_max)
-    axes[0].set_title(target_title)
-    figure.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.01)
-    im1 = axes[1].imshow(recon_np, origin="lower", aspect="auto", cmap="magma", vmin=shared_min, vmax=shared_max)
-    axes[1].set_title(recon_title)
-    figure.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.01)
-    for axis in axes:
-        axis.set_xlabel("Time")
-        axis.set_ylabel("Mel bin")
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-
-
-def evaluate(
-    model: LTXAudioVAE,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    mel_extractor: LogMelSpectrogram,
-    n_fft: int,
-    hop_length: int,
-    kl_weight: float,
-    context_frames: int = 0,
-) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
-    model.eval()
-    recon_losses: list[float] = []
-    kl_losses: list[float] = []
-    preview: tuple[torch.Tensor, torch.Tensor] | None = None
-    preview_energy = -1.0
-    with torch.no_grad():
-        for batch in loader:
-            audio = batch["audio"].to(device, non_blocking=True).float() / 32768.0
-            audio_lengths = batch["audio_lengths"]
-            all_full_length = bool(torch.all(audio_lengths == audio.shape[-1]))
-
-            if all_full_length:
-                waveform = audio.reshape(audio.shape[0], -1)
-            else:
-                waveform = frame_audio_to_waveform(audio, audio_lengths)
-
-            waveform_lengths = audio_lengths.sum(dim=1).to(device)
-            context_lengths = context_waveform_lengths(
-                audio_lengths,
-                context_frames=context_frames,
-            ).to(device)
-
-            mel = mel_extractor(waveform)
-            valid_mask = None
-            if not all_full_length:
-                valid_mask = build_mel_mask(
-                    waveform_lengths,
-                    max_time_steps=mel.shape[2],
-                    n_fft=n_fft,
-                    hop_length=hop_length,
-                )
-
-            recon_mask = valid_mask
-            if context_frames > 0:
-                recon_mask = build_mel_mask(
-                    waveform_lengths,
-                    max_time_steps=mel.shape[2],
-                    n_fft=n_fft,
-                    hop_length=hop_length,
-                    context_lengths=context_lengths,
-                )
-
-            outputs = model(mel)
-            recon_loss = masked_l1_loss(
-                outputs.reconstruction,
-                mel,
-                None if recon_mask is None else recon_mask.expand_as(mel),
-            )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
-            recon_losses.append(recon_loss.item())
-            kl_losses.append(kl_loss.item())
-            energy = float(mel[0].mean())
-            if energy > preview_energy:
-                preview_energy = energy
-                preview_out = model(mel[:1], sample_posterior=False)
-                preview = (mel[:1].detach().cpu(), preview_out.reconstruction.detach().cpu())
-                del preview_out
-    model.train()
-
-    if not recon_losses:
-        return {"recon_loss": 0.0, "kl_loss": 0.0, "loss": 0.0}, preview
-
-    mean_recon = float(np.mean(recon_losses))
-    mean_kl = float(np.mean(kl_losses))
-    return {
-        "recon_loss": mean_recon,
-        "kl_loss": mean_kl,
-        "loss": mean_recon + kl_weight * mean_kl,
-    }, preview
 
 
 def save_training_state(
     path: Path,
     *,
     model: torch.nn.Module,
-    optimizer: AdamW,
+    optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
     accelerator: Accelerator | None = None,
     discriminator: torch.nn.Module | None = None,
-    discriminator_optimizer: AdamW | None = None,
+    discriminator_optimizer: torch.optim.Optimizer | None = None,
     lecam_ema: LeCAMEMA | None = None,
 ) -> None:
+    model_state = get_model_state_dict(model, accelerator=accelerator)
     state = {
-        "model": get_model_state_dict(model, accelerator=accelerator),
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
@@ -406,7 +320,15 @@ def main() -> None:
     output_dir = make_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
+    mixed_precision = "no"
+    if args.autocast and torch.cuda.is_available():
+        mixed_precision = "bf16" if args.autocast_dtype == "bfloat16" else "fp16"
+        if mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
+            mixed_precision = "fp16"
+    runtime = create_accelerator_runtime(
+        output_dir=output_dir,
+        mixed_precision=mixed_precision,
+    )
     accelerator = runtime.accelerator
     device = runtime.device
     is_main_process = runtime.is_main_process
@@ -414,48 +336,62 @@ def main() -> None:
     if is_main_process:
         console.print(f"Using device: {device}")
     if torch.cuda.is_available():
+        if args.tf16:
+            torch.set_float32_matmul_precision("medium")
+            if is_main_process:
+                console.print("[tf16] TF16 matmul precision enabled")
+        else:
+            torch.set_float32_matmul_precision("high")
+            if is_main_process:
+                console.print("[tf32] TF32 matmul precision enabled")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        if is_main_process:
-            console.print("[tf32] TF32 matmul precision enabled")
+
+    onehot_dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    onehot_dtype = onehot_dtype_map[args.onehot_dtype]
+    if args.autocast and device.type != "cuda" and is_main_process:
+        console.print("[autocast] Requested but CUDA is unavailable; disabling autocast.")
+    if (
+        args.autocast
+        and args.autocast_dtype == "bfloat16"
+        and torch.cuda.is_available()
+        and not torch.cuda.is_bf16_supported()
+        and is_main_process
+    ):
+        console.print("[autocast] bfloat16 unsupported on this GPU; falling back to float16.")
+    if mixed_precision != "no" and is_main_process:
+        label = "bf16" if mixed_precision == "bf16" else "fp16"
+        console.print(f"[autocast] Enabled ({label})")
 
     system_info = collect_system_info()
     if is_main_process:
         print_system_info(system_info)
+
+    total_clip_frames = args.clip_frames + args.context_frames
 
     if is_main_process:
         console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
     with accelerator.main_process_first():
         dataset = NormalizedSequenceDataset(
             data_dir=args.data_dir,
-            clip_frames=args.clip_frames,
-            include_frames=False,
-            include_audio=True,
+            clip_frames=total_clip_frames,
             num_workers=args.num_workers,
             system_info=system_info,
         )
     if is_main_process:
         console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
-        raise RuntimeError("No audio training samples were found.")
-
-    target_frames = args.clip_frames - args.context_frames
+        raise RuntimeError("No training samples were found.")
     if is_main_process:
-        if args.context_frames > 0:
-            console.print(
-                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-                f"({args.context_frames} context + {target_frames} target, "
-                f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
-            )
-            console.print(
-                f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
-            )
-        else:
-            console.print(
-                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-                f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
-            )
+        console.print(
+            f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
+            f"({args.context_frames} context + {args.clip_frames} target)."
+        )
         console.print(
             f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
             f"{_format_bytes(dataset.dataset_bytes)} on disk."
@@ -475,25 +411,39 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
+
+    eval_batch_size = args.eval_batch_size or args.batch_size
     eval_loader = build_eval_loader(
         eval_dataset,
-        batch_size=args.batch_size,
+        batch_size=eval_batch_size,
         num_workers=0,
         pin_memory=False,
     )
 
-    mel_extractor = LogMelSpectrogram(
-        sample_rate=args.sample_rate,
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        n_mels=args.n_mels,
-        fmin=args.fmin,
-        fmax=args.fmax,
-        center=False,
-    ).to(device)
-    model = LTXAudioVAE(
-        in_channels=1,
-        n_mels=args.n_mels,
+    palette_path = Path(args.data_dir) / "palette.json"
+    palette = load_palette_tensor(args.data_dir)
+    num_colors = palette.shape[0]
+    if is_main_process:
+        console.print(f"[palette] Loaded {num_colors} colours from {palette_path}")
+    class_weight = None
+    if args.use_class_weights:
+        class_weight = load_class_weights(
+            args.data_dir,
+            num_classes=num_colors,
+            filename=args.class_weights_file,
+            soften=args.class_weight_soften,
+            device=device,
+        )
+        if is_main_process:
+            console.print(
+                "[class-weights] Enabled from "
+                f"{Path(args.data_dir) / args.class_weights_file} "
+                f"(soften={args.class_weight_soften:.2f}, "
+                f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
+            )
+    model = VideoVAE(
+        num_colors=num_colors,
+        patch_size=args.patch_size,
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
     ).to(device)
@@ -502,12 +452,11 @@ def main() -> None:
     lecam_ema = None
     discriminator_num_parameters = 0
     if args.use_gan:
-        discriminator = build_mel_discriminator(
-            in_channels=1,
+        discriminator = build_palette_discriminator(
+            num_colors,
             target_size=args.gan_target_size,
         ).to(device)
         discriminator_num_parameters = count_trainable_parameters(discriminator)
-        discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
         if args.use_lecam:
             lecam_ema = LeCAMEMA(decay=args.lecam_decay)
         if is_main_process:
@@ -530,7 +479,11 @@ def main() -> None:
         if is_main_process:
             console.print("[compile] Compilation complete.")
 
+    num_parameters = int(sum(parameter.numel() for parameter in model.parameters()))
+
     optimizer = AdamW(model.parameters(), lr=args.lr)
+    if discriminator is not None:
+        discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
     warmup_steps = max(int(args.warmup_steps), 0)
 
     def lr_lambda(step: int) -> float:
@@ -541,12 +494,12 @@ def main() -> None:
         progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
         progress = min(max(progress, 0.0), 1.0)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 0.1 + 0.9 * cosine
+        return 0.25 + 0.75 * cosine
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     if warmup_steps > 0:
         if is_main_process:
-            console.print(f"[lr] Warmup: {warmup_steps} steps -> cosine decay to 10% of peak")
+            console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")
     else:
         if is_main_process:
             console.print("[lr] Cosine decay (no warmup)")
@@ -564,13 +517,15 @@ def main() -> None:
             if "discriminator" in checkpoint and "discriminator_optimizer" in checkpoint:
                 discriminator.load_state_dict(checkpoint["discriminator"])
                 discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
-            elif is_main_process:
-                console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
+            else:
+                if is_main_process:
+                    console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
             if args.use_lecam and lecam_ema is not None:
                 if "lecam_ema" in checkpoint:
                     lecam_ema.load_state_dict(checkpoint["lecam_ema"])
-                elif is_main_process:
-                    console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
+                else:
+                    if is_main_process:
+                        console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"]) + 1
         best_eval = float(checkpoint.get("best_eval", float("inf")))
@@ -601,11 +556,12 @@ def main() -> None:
     config = vars(args).copy()
     config.update(
         {
-            "audio_frame_size": int(dataset.audio_frame_size or 0),
-            "num_parameters": int(sum(parameter.numel() for parameter in model.parameters())),
+            "model_name": "video_vae",
+            "num_colors": int(num_colors),
+            "num_parameters": num_parameters,
             "discriminator_parameters": int(discriminator_num_parameters),
             "device": str(device),
-            "mixed_precision": "no",
+            "mixed_precision": mixed_precision,
             "num_processes": int(accelerator.num_processes),
             "timestamp": datetime.now().isoformat(),
         }
@@ -615,7 +571,7 @@ def main() -> None:
         console.print(f"Config saved to {output_dir / 'config.json'}")
         console.print(json.dumps(config, indent=2))
 
-        console.print(f"Training LTX audio VAE on {len(train_dataset)} samples")
+        console.print(f"Training Video VAE on {len(train_dataset)} samples")
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
         console.print(f"Model parameters: {config['num_parameters']:,}")
@@ -627,98 +583,71 @@ def main() -> None:
 
     start_time = time.time()
     throughput_tracker = ThroughputTracker(window_steps=20)
+    bytes_per_sample = None
     use_live_progress = sys.stdout.isatty() and is_main_process
 
     total_train_steps = max(args.max_steps - start_step, 0)
     with build_progress(use_live=use_live_progress) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
+        onehot_buffer: torch.Tensor | None = None
         for step in range(start_step, args.max_steps):
             batch = next(train_iter)
-            audio = batch["audio"].to(device, non_blocking=True).float() / 32768.0
-            audio_lengths = batch["audio_lengths"]
-            all_full_length = bool(torch.all(audio_lengths == audio.shape[-1]))
-            context_lengths = context_waveform_lengths(
-                audio_lengths,
-                context_frames=args.context_frames,
-            ).to(device)
+            frames = batch["frames"].to(device, non_blocking=True).long()
+            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+            onehot_buffer = inputs
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
             gan_real_logit_value = 0.0
             gan_fake_logit_value = 0.0
             gan_lecam_reg_value = 0.0
-
-            if all_full_length:
-                waveform = audio.reshape(audio.shape[0], -1)
-            else:
-                waveform = frame_audio_to_waveform(audio, audio_lengths)
-
-            waveform_lengths = audio_lengths.sum(dim=1).to(device)
-            mel = mel_extractor(waveform)
-
-            valid_mask = None
-            if not all_full_length:
-                valid_mask = build_mel_mask(
-                    waveform_lengths,
-                    max_time_steps=mel.shape[2],
-                    n_fft=args.n_fft,
-                    hop_length=args.hop_length,
-                )
-
-            recon_mask = valid_mask
-            if args.context_frames > 0:
-                recon_mask = build_mel_mask(
-                    waveform_lengths,
-                    max_time_steps=mel.shape[2],
-                    n_fft=args.n_fft,
-                    hop_length=args.hop_length,
-                    context_lengths=context_lengths,
-                )
-
-            mel_for_discriminator = mel
-            if valid_mask is not None:
-                mel_for_discriminator = (
-                    mel_for_discriminator
-                    * valid_mask.to(dtype=mel_for_discriminator.dtype).expand_as(mel_for_discriminator)
+            if bytes_per_sample is None:
+                _, time_steps, height, width = frames.shape
+                bytes_per_sample = (
+                    num_colors
+                    * time_steps
+                    * height
+                    * width
+                    * torch.tensor([], dtype=onehot_dtype).element_size()
                 )
 
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
-                outputs = model(mel)
-            recon_loss = masked_l1_loss(
-                outputs.reconstruction,
-                mel,
-                None if recon_mask is None else recon_mask.expand_as(mel),
+                outputs = model(inputs)
+            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, args.context_frames)
+            recon_loss = focal_cross_entropy(
+                recon_logits,
+                recon_targets,
+                gamma=args.focal_gamma,
+                class_weight=class_weight,
             )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
 
-            fake_mel_detached = None
+            fake_video_detached = None
             if gan_active and discriminator is not None:
-                fake_mel = outputs.reconstruction
-                if valid_mask is not None:
-                    fake_mel = fake_mel * valid_mask.to(dtype=fake_mel.dtype).expand_as(fake_mel)
-                fake_mel_detached = fake_mel.detach()
-
                 set_requires_grad(discriminator, False)
                 with accelerator.autocast():
-                    gen_adv_loss = hinge_generator_loss(discriminator(fake_mel))
+                    fake_video = outputs.logits.softmax(dim=1)
+                    gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
+                fake_video_detached = fake_video.detach()
                 gan_gen_loss_value = gen_adv_loss.item()
                 loss = loss + args.gan_weight * gen_adv_loss
-                del fake_mel, gen_adv_loss
+                del fake_video, gen_adv_loss
 
             accelerator.backward(loss)
             grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             optimizer.step()
             scheduler.step()
+            del outputs, recon_logits, recon_targets
 
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
                 with accelerator.autocast():
-                    real_scores = discriminator(mel_for_discriminator)
-                    fake_scores = discriminator(fake_mel_detached)
+                    real_scores = discriminator(inputs)
+                    fake_scores = discriminator(fake_video_detached)
                     discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
                     if args.use_lecam and lecam_ema is not None:
                         lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
@@ -734,10 +663,10 @@ def main() -> None:
                 gan_discr_loss_value = discr_loss.item()
                 gan_real_logit_value = real_scores.mean().item()
                 gan_fake_logit_value = fake_scores.mean().item()
-                del real_scores, fake_scores, discr_loss, fake_mel_detached
+                del real_scores, fake_scores, discr_loss, fake_video_detached
 
             samples_per_second, steps_per_second = throughput_tracker.update(
-                samples=audio.shape[0] * accelerator.num_processes,
+                samples=frames.shape[0] * accelerator.num_processes,
             )
 
             if is_main_process:
@@ -754,12 +683,18 @@ def main() -> None:
                     status += f" mem={stats['gpu_mem_pct']:.0f}%"
                 if "gpu_temp_c" in stats:
                     status += f" temp={stats['gpu_temp_c']:.0f}C"
+                if bytes_per_sample is not None:
+                    status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
                 if gan_active:
                     status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
                     if args.use_lecam:
                         status += f" lecam={gan_lecam_reg_value:.4f}"
 
-                progress.update(train_task, advance=1, status=status)
+                progress.update(
+                    train_task,
+                    advance=1,
+                    status=status,
+                )
 
             if (
                 ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
@@ -800,77 +735,98 @@ def main() -> None:
                 accelerator.wait_for_everyone()
 
             eval_line: str | None = None
-            should_eval = eval_due and is_main_process
+            should_eval = (
+                eval_due
+                and is_main_process
+            )
             if should_eval:
-                eval_metrics, preview = evaluate(
-                    model,
-                    eval_loader,
-                    device=device,
-                    mel_extractor=mel_extractor,
-                    n_fft=args.n_fft,
-                    hop_length=args.hop_length,
-                    kl_weight=args.kl_weight,
-                    context_frames=args.context_frames,
-                )
-                eval_metrics["step"] = step
-                eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                eval_metrics["train_gnorm"] = grad_norm
-                metrics.append(eval_metrics)
-                save_metrics_json(output_dir / "metrics.json", metrics)
+                if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
-                eval_line = (
-                    f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
-                    f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
-                )
-
-                if preview is not None:
-                    save_mel_preview(output_dir / f"preview_step_{step:06d}.png", preview[0], preview[1])
-
-                if accelerator.num_processes == 1:
-                    with torch.no_grad():
-                        best_train_mel = None
-                        best_train_recon = None
-                        best_train_energy = -1.0
-                        for _ in range(5):
-                            train_batch = next(train_iter)
-                            train_audio = train_batch["audio"].to(device, non_blocking=True).float() / 32768.0
-                            train_audio_lengths = train_batch["audio_lengths"]
-                            if bool(torch.all(train_audio_lengths == train_audio.shape[-1])):
-                                train_waveform = train_audio.reshape(train_audio.shape[0], -1)
-                            else:
-                                train_waveform = frame_audio_to_waveform(train_audio, train_audio_lengths)
-                            train_mel = mel_extractor(train_waveform)
-                            energy = float(train_mel[0].mean())
-                            if energy > best_train_energy:
-                                best_train_energy = energy
-                                with accelerator.autocast():
-                                    train_outputs = model(train_mel, sample_posterior=False)
-                                best_train_mel = train_mel.detach().cpu()
-                                best_train_recon = train_outputs.reconstruction.detach().cpu()
-                        if best_train_mel is not None:
-                            save_mel_preview(
-                                output_dir / f"train_preview_step_{step:06d}.png",
-                                best_train_mel,
-                                best_train_recon,
-                                title_prefix="[Train] ",
-                            )
-
-                if eval_metrics["loss"] < best_eval:
-                    best_eval = eval_metrics["loss"]
-                    save_training_state(
-                        output_dir / "audio_vae_best.pt",
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        step=step,
-                        best_eval=best_eval,
-                        metrics=metrics,
+                try:
+                    eval_metrics, preview = evaluate_video_vae(
+                        model,
+                        eval_loader,
+                        device=device,
+                        num_colors=num_colors,
+                        kl_weight=args.kl_weight,
+                        context_frames=args.context_frames,
+                        onehot_dtype=onehot_dtype,
+                        focal_gamma=args.focal_gamma,
+                        class_weight=class_weight,
                         accelerator=accelerator,
-                        discriminator=discriminator,
-                        discriminator_optimizer=discriminator_optimizer,
-                        lecam_ema=lecam_ema,
                     )
-                    eval_line += f" | best={best_eval:.6f}"
+                except torch.cuda.OutOfMemoryError:
+                    log_console.print("[eval][OOM] Eval pass OOM; skipping this eval window.")
+                    if torch.cuda.is_available():
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                else:
+                    eval_metrics["step"] = step
+                    eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                    eval_metrics["train_gnorm"] = grad_norm
+                    metrics.append(eval_metrics)
+                    save_metrics_json(output_dir / "metrics.json", metrics)
+
+                    eval_line = (
+                        f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
+                        f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
+                    )
+
+                    if preview is not None:
+                        save_video_preview(
+                            output_dir / f"preview_step_{step:06d}.png",
+                            preview[0],
+                            preview[1],
+                            palette,
+                            max_frames=total_clip_frames,
+                        )
+
+                    # Avoid desynchronizing data iteration across processes during distributed training.
+                    if accelerator.num_processes == 1:
+                        with torch.no_grad():
+                            try:
+                                train_batch = next(train_iter)
+                                train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
+                                train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                                with accelerator.autocast():
+                                    train_outputs = model(train_inputs, sample_posterior=False)
+                                save_video_preview(
+                                    output_dir / f"train_preview_step_{step:06d}.png",
+                                    train_frames.detach().cpu(),
+                                    train_outputs.logits.detach().cpu(),
+                                    palette,
+                                    max_frames=total_clip_frames,
+                                )
+                                del train_outputs, train_inputs, train_frames, train_batch
+                            except torch.cuda.OutOfMemoryError:
+                                log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
+                                if torch.cuda.is_available():
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+
+                    del preview
+                    if torch.cuda.is_available():
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    if eval_metrics["loss"] < best_eval:
+                        best_eval = eval_metrics["loss"]
+                        save_training_state(
+                            output_dir / "video_vae_best.pt",
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            step=step,
+                            best_eval=best_eval,
+                            metrics=metrics,
+                            accelerator=accelerator,
+                            discriminator=discriminator,
+                            discriminator_optimizer=discriminator_optimizer,
+                            lecam_ema=lecam_ema,
+                        )
+                        eval_line += f" | best={best_eval:.6f}"
 
             if should_checkpoint and is_main_process:
                 if eval_line is not None:
@@ -878,7 +834,7 @@ def main() -> None:
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
-                    output_dir / "audio_vae_latest.pt",
+                    output_dir / "video_vae_latest.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -899,5 +855,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
     main()

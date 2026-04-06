@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from models.ltx_video_vae import (
+from models.video_vae import (
     CausalConv3d,
     ResidualBlock3D,
     SpatialPatchify,

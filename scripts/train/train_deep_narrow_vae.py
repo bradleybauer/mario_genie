@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Train the deep narrow palette video VAE.
 
-Copy of train_ltx_video_vae.py specialized for the DeepNarrowVideoVAE architecture
+Copy of train_video_vae.py specialized for the DeepNarrowVideoVAE architecture
 which uses many residual blocks per spatial level with few channels.
 """
 from __future__ import annotations

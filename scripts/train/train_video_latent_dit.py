@@ -43,7 +43,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.latent_dataset import LatentSequenceDataset
-from models.ltx_video_vae import LTXVideoVAE
+from models.video_vae import VideoVAE
 from path_utils import resolve_workspace_path
 from system_info import collect_system_info, print_system_info
 from training.training_utils import (
@@ -299,7 +299,7 @@ def load_video_vae(
     vae_num_colors = int(cfg.get("num_colors", num_colors or 0))
     if vae_num_colors <= 0:
         raise ValueError("Cannot determine VAE num_colors.")
-    vae = LTXVideoVAE(
+    vae = VideoVAE(
         num_colors=vae_num_colors,
         patch_size=patch_size,
         base_channels=base_channels,

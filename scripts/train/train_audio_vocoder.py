@@ -35,7 +35,7 @@ if str(SRC_DIR) not in sys.path:
 
 from data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
 from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
-from models.ltx_audio_vocoder import LTXAudioVocoder
+from models.audio_vocoder import AudioVocoder
 from data.normalized_dataset import NormalizedSequenceDataset
 from system_info import collect_system_info, print_system_info
 from training.training_utils import (
@@ -83,7 +83,7 @@ def parse_resblock_dilation_sizes(value: str) -> tuple[tuple[int, ...], ...]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the LTX-style compact audio vocoder.")
+    parser = argparse.ArgumentParser(description="Train the compact audio vocoder.")
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -177,7 +177,7 @@ def make_output_dir(args: argparse.Namespace) -> Path:
         return Path(args.output_dir)
     if args.resume_from is not None:
         return Path(args.resume_from).resolve().parent
-    run_name = args.run_name or datetime.now().strftime("ltx_audio_vocoder_%Y%m%d_%H%M%S")
+    run_name = args.run_name or datetime.now().strftime("audio_vocoder_%Y%m%d_%H%M%S")
     return PROJECT_ROOT / "checkpoints" / run_name
 
 
@@ -429,7 +429,7 @@ def gpu_stats(device: torch.device) -> dict[str, float]:
 
 
 def evaluate(
-    model: LTXAudioVocoder,
+    model: AudioVocoder,
     loader: DataLoader,
     *,
     device: torch.device,
@@ -647,7 +647,7 @@ def main() -> None:
         center=False,
     ).to(device)
 
-    model = LTXAudioVocoder(
+    model = AudioVocoder(
         in_channels=1,
         n_mels=args.n_mels,
         out_channels=1,
@@ -749,7 +749,7 @@ def main() -> None:
         console.print(f"Config saved to {output_dir / 'config.json'}")
         console.print(json.dumps(config, indent=2))
 
-        console.print(f"Training LTX audio vocoder on {len(train_dataset)} samples")
+        console.print(f"Training audio vocoder on {len(train_dataset)} samples")
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
         console.print(f"Model parameters: {num_parameters:,}")

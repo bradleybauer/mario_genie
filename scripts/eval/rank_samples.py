@@ -2,7 +2,7 @@
 """Rank normalized video clips by reconstruction quality.
 
 This script currently supports checkpoints produced by
-`scripts/train_ltx_video_vae.py` (continuous video VAE).
+`scripts/train_video_vae.py` (continuous video VAE).
 
 It evaluates reconstruction quality for each sample and writes:
 - a JSON ranking report (best to worst), and
@@ -33,7 +33,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from models.ltx_video_vae import LTXVideoVAE
+from models.video_vae import VideoVAE
 from data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from training.palette_video_vae_training import (
     frames_to_one_hot,
@@ -133,15 +133,19 @@ def _load_run_config(checkpoint_path: Path) -> dict:
         return json.load(handle)
 
 
-def _build_model_from_config(config: dict, num_colors: int, device: torch.device) -> LTXVideoVAE:
+def _build_model_from_config(config: dict, num_colors: int, device: torch.device) -> VideoVAE:
     model_name = config.get("model_name", "")
-    if model_name and model_name != "ltx_video_vae":
+    normalized_model_name = model_name
+    if model_name.endswith("video_vae") and model_name != "video_vae" and "_" in model_name:
+        normalized_model_name = model_name.split("_", maxsplit=1)[-1]
+
+    if model_name and normalized_model_name != "video_vae":
         raise ValueError(
             "Unsupported model_name in config: "
-            f"{model_name!r}. This script currently supports only 'ltx_video_vae'."
+            f"{model_name!r}. This script currently supports only 'video_vae'."
         )
 
-    model = LTXVideoVAE(
+    model = VideoVAE(
         num_colors=num_colors,
         patch_size=int(config.get("patch_size", 4)),
         base_channels=int(config.get("base_channels", 64)),
@@ -170,7 +174,7 @@ def _build_eval_indices(total: int, fraction: float, seed: int) -> list[int] | N
 
 def _score_batch(
     *,
-    model: LTXVideoVAE,
+    model: VideoVAE,
     frames: torch.Tensor,
     num_colors: int,
     context_frames: int,
@@ -319,7 +323,7 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "step": step,
         "num_scored": len(results),
-        "model_name": "ltx_video_vae",
+        "model_name": "video_vae",
         "clip_frames": clip_frames,
         "context_frames": context_frames,
         "total_clip_frames": total_clip_frames,

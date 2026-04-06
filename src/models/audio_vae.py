@@ -85,7 +85,7 @@ class Upsample2d(nn.Module):
         return self.conv(x)
 
 
-class LTXAudioVAE(nn.Module):
+class AudioVAE(nn.Module):
     """Causal mel-spectrogram VAE with 4x temporal compression."""
 
     def __init__(

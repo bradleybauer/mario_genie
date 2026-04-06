@@ -12,7 +12,7 @@
 - [Discrete Tokenizer Variables To Explore](#discrete-tokenizer-variables-to-explore)
 - [Onehot Memory Optimizations](#onehot-memory-optimizations)
 - [Video VAE Training Updates](#video-vae-training-updates)
-- [LTX Video And Audio VAE](#ltx-video-and-audio-vae)
+- [Continuous Bottleneck Autoencoders](#continuous-bottleneck-autoencoders)
 - [Audio Data Exploration](#audio-data-exploration)
 - [Initial Video Only World Model Training](#initial-video-only-world-model-training)
 - [Video VAE Latents](#video-vae-latents)
@@ -326,7 +326,7 @@ Results look good. LeCAM regularization made the discriminator training actually
 <br>
 <br>
 
-# LTX Video And Audio VAE
+# Continuous Bottleneck Autoencoders
 
 **Context:**
 
@@ -336,17 +336,17 @@ The magvit2 tokenizer (from `magvit2-pytorch`) works but getting good reconstruc
 
 Wrote two custom VAEs from scratch:
 
-- **LTX Video VAE** (`ltx_video_vae.py`, ~19.3M params): A 3D convolutional VAE with spatial patchify/unpatchify (4×4), causal temporal convolutions, and no temporal downsampling. The encoder uses strided 3D convs for 2 levels of spatial downsampling, residual blocks, and outputs a mean/logvar pair. The decoder mirrors the encoder with nearest-neighbor upsampling. KL-regularized continuous latent space instead of LFQ discrete codes.
+- **Video VAE** (`video_vae.py`, ~19.3M params): A 3D convolutional VAE with spatial patchify/unpatchify (4×4), causal temporal convolutions, and no temporal downsampling. The encoder uses strided 3D convs for 2 levels of spatial downsampling, residual blocks, and outputs a mean/logvar pair. The decoder mirrors the encoder with nearest-neighbor upsampling. KL-regularized continuous latent space instead of LFQ discrete codes.
 
-- **LTX Audio VAE** (`ltx_audio_vae.py`, ~6.2M params): A 2D convolutional VAE operating on log-mel spectrograms (time × frequency). Same architectural pattern — causal temporal convolutions with 4× temporal compression via strided convs, residual blocks, KL-regularized latent. Outputs L1-reconstructed mel spectrograms.
+- **Audio VAE** (`audio_vae.py`, ~6.2M params): A 2D convolutional VAE operating on log-mel spectrograms (time × frequency). Same architectural pattern — causal temporal convolutions with 4× temporal compression via strided convs, residual blocks, KL-regularized latent. Outputs L1-reconstructed mel spectrograms.
 
 Both use causal convolutions (replicate-pad the first frame rather than zero-pad) so they can be applied autoregressively without information leaking from the future.
 
 **Result:**
 
-The LTX video VAE converges noticeably faster than the magvit2 baseline on a per-step basis:
+The video VAE converges noticeably faster than the magvit2 baseline on a per-step basis:
 
-| Step  | Magvit2 (13M) recon | LTX Video VAE (19.3M) recon |
+| Step  | Magvit2 (13M) recon | Video VAE (19.3M) recon |
 |-------|---------------------|-----------------------------|
 | 1k    | 0.2202              | 0.2048                      |
 | 5k    | 0.0747              | 0.0248                      |
@@ -354,7 +354,7 @@ The LTX video VAE converges noticeably faster than the magvit2 baseline on a per
 | 20k   | 0.0257              | 0.0076                      |
 | 25k   | 0.0316              | 0.0066                      |
 
-The LTX VAE reached recon loss ~0.007 at 25k steps — a level the magvit2 only hit around 60k+ steps. The LTX VAE also runs at batch size 64 vs magvit2's batch size 4, so it sees far more data per step. KL loss stays low (~2.0) and stable.
+The video VAE reached recon loss ~0.007 at 25k steps — a level the magvit2 only hit around 60k+ steps. The video VAE also runs at batch size 64 vs magvit2's batch size 4, so it sees far more data per step. KL loss stays low (~2.0) and stable.
 
 The VAE does have periodic KL spikes (e.g. step 2k, 6.6k, 10.8k) where recon loss temporarily jumps, but it recovers quickly each time. Not yet clear what causes them.
 
@@ -375,8 +375,8 @@ From there I extended the normalized dataset format to store per-frame audio chu
 
 Then I built two initial models:
 
-- **LTX Audio VAE**: a causal 2D convolutional VAE over log-mel spectrograms with two stride-2 encoder downsamples, giving `4x` temporal compression. The model reconstructs mel spectrograms and uses a KL-regularized continuous latent.
-- **LTX Audio Vocoder**: a compact BigVGAN-style mel-to-waveform decoder with `SnakeBeta` activations, dilated residual blocks, and transposed-convolution upsampling. The default upsampling schedule `(5, 5, 4)` gives an exact `100x` expansion, matching the mel hop length.
+- **Audio VAE**: a causal 2D convolutional VAE over log-mel spectrograms with two stride-2 encoder downsamples, giving `4x` temporal compression. The model reconstructs mel spectrograms and uses a KL-regularized continuous latent.
+- **Audio Vocoder**: a compact BigVGAN-style mel-to-waveform decoder with `SnakeBeta` activations, dilated residual blocks, and transposed-convolution upsampling. The default upsampling schedule `(5, 5, 4)` gives an exact `100x` expansion, matching the mel hop length.
 
 Finally, I ran baseline overfit tests on both models and listened to the reconstructions as a sanity check before doing broader hyperparameter work.
 
@@ -408,7 +408,7 @@ The vocoder successfully overfit a single sample and produced high-quality outpu
 
 **Context:**
 
-The first video-only world model experiments used pre-encoded `LTXVideoVAE` latents and trained an action-conditioned latent DiT with a continuous flow-matching objective rather than discrete next-token prediction.
+The first video-only world model experiments used pre-encoded `VideoVAE` latents and trained an action-conditioned latent DiT with a continuous flow-matching objective rather than discrete next-token prediction.
 
 The initial problem was straightforward: training in full precision was stable but slow, while `bf16` made training roughly `10x` faster but introduced severe gradient blow-ups. At that point it was hard to tell whether the bottleneck was numerical instability, model size, or the latent representation itself.
 

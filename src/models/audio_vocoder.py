@@ -61,7 +61,7 @@ class VocoderResidualBlock(nn.Module):
         return x
 
 
-class LTXAudioVocoder(nn.Module):
+class AudioVocoder(nn.Module):
     """Compact mel-to-waveform vocoder for the mario_world_model audio stack.
 
     Input mel formats:
