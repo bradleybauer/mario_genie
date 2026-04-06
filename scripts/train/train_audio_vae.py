@@ -6,7 +6,6 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -45,12 +44,16 @@ from data.normalized_dataset import NormalizedSequenceDataset
 from system_info import collect_system_info, print_system_info
 from training.audio_training_helpers import build_mel_mask, context_waveform_lengths, masked_l1_loss
 from training.trainer_common import (
+    build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
     format_bytes,
     gpu_stats,
+    is_periodic_event_due,
     make_output_dir,
+    preview_path,
     seed_everything,
+    should_log_step,
 )
 from training.training_utils import (
     ThroughputTracker,
@@ -501,17 +504,24 @@ def main() -> None:
 
     train_iter = infinite_batches(train_loader)
 
-    config = vars(args).copy()
-    config.update(
-        {
+    num_parameters = int(sum(parameter.numel() for parameter in model.parameters()))
+    config = build_trainer_config(
+        model_name="audio_vae",
+        args=args,
+        device=device,
+        mixed_precision="no",
+        num_processes=accelerator.num_processes,
+        data={
             "audio_frame_size": int(dataset.audio_frame_size or 0),
-            "num_parameters": int(sum(parameter.numel() for parameter in model.parameters())),
+            "clip_frames": int(args.clip_frames),
+            "context_frames": int(args.context_frames),
+        },
+        model={
+            "num_parameters": num_parameters,
             "discriminator_parameters": int(discriminator_num_parameters),
-            "device": str(device),
-            "mixed_precision": "no",
-            "num_processes": int(accelerator.num_processes),
-            "timestamp": datetime.now().isoformat(),
-        }
+            "base_channels": int(args.base_channels),
+            "latent_channels": int(args.latent_channels),
+        },
     )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
@@ -521,7 +531,7 @@ def main() -> None:
         console.print(f"Training audio VAE on {len(train_dataset)} samples")
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
-        console.print(f"Model parameters: {config['num_parameters']:,}")
+        console.print(f"Model parameters: {num_parameters:,}")
         if accelerator.num_processes > 1:
             console.print(
                 f"Distributed training enabled with {accelerator.num_processes} processes "
@@ -664,11 +674,39 @@ def main() -> None:
 
                 progress.update(train_task, advance=1, status=status)
 
-            if (
-                ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
-                and not use_live_progress
-                and is_main_process
-            ):
+            log_due = should_log_step(
+                step,
+                start_step=start_step,
+                log_interval=args.log_interval,
+                max_steps=args.max_steps,
+            )
+            if log_due and is_main_process:
+                train_row = {
+                    "type": "train",
+                    "step": step,
+                    "loss": loss.item(),
+                    "recon_loss": recon_loss.item(),
+                    "kl_loss": kl_loss.item(),
+                    "grad_norm": grad_norm,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                    "samples_per_sec": round(samples_per_second, 1),
+                    "steps_per_sec": round(steps_per_second, 2),
+                }
+                train_row.update(gpu_stats(device))
+                if gan_active:
+                    train_row.update(
+                        {
+                            "gan_generator_loss": gan_gen_loss_value,
+                            "gan_discriminator_loss": gan_discr_loss_value,
+                            "gan_real_logit": gan_real_logit_value,
+                            "gan_fake_logit": gan_fake_logit_value,
+                        }
+                    )
+                    if args.use_lecam:
+                        train_row["gan_lecam_reg"] = gan_lecam_reg_value
+                metrics.append(train_row)
+
+            if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
                 examples_per_second = (
                     (step - start_step + 1)
@@ -688,16 +726,15 @@ def main() -> None:
                     )
                 )
 
-            eval_due = (
-                eval_loader is not None
-                and (
-                    (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
-                    or step == args.max_steps - 1
-                )
+            eval_due = eval_loader is not None and is_periodic_event_due(
+                step,
+                interval=args.eval_interval,
+                max_steps=args.max_steps,
             )
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
+            should_checkpoint = is_periodic_event_due(
+                step,
+                interval=args.checkpoint_interval,
+                max_steps=args.max_steps,
             )
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
@@ -715,9 +752,10 @@ def main() -> None:
                     kl_weight=args.kl_weight,
                     context_frames=args.context_frames,
                 )
+                eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                eval_metrics["train_gnorm"] = grad_norm
+                eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
@@ -727,7 +765,7 @@ def main() -> None:
                 )
 
                 if preview is not None:
-                    save_mel_preview(output_dir / f"preview_step_{step:06d}.png", preview[0], preview[1])
+                    save_mel_preview(preview_path(output_dir, split="eval", step=step), preview[0], preview[1])
 
                 if accelerator.num_processes == 1:
                     with torch.no_grad():
@@ -752,7 +790,7 @@ def main() -> None:
                                 best_train_recon = train_outputs.reconstruction.detach().cpu()
                         if best_train_mel is not None:
                             save_mel_preview(
-                                output_dir / f"train_preview_step_{step:06d}.png",
+                                preview_path(output_dir, split="train", step=step),
                                 best_train_mel,
                                 best_train_recon,
                                 title_prefix="[Train] ",
@@ -761,7 +799,7 @@ def main() -> None:
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]
                     save_training_state(
-                        output_dir / "audio_vae_best.pt",
+                        output_dir / "best.pt",
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
@@ -781,7 +819,7 @@ def main() -> None:
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
-                    output_dir / "audio_vae_latest.pt",
+                    output_dir / "latest.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,

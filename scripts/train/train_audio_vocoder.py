@@ -7,7 +7,6 @@ import os
 import sys
 import time
 import wave
-from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -43,12 +42,16 @@ from training.audio_training_helpers import (
     masked_l1_loss,
 )
 from training.trainer_common import (
+    build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
     format_bytes,
     gpu_stats,
+    is_periodic_event_due,
     make_output_dir,
+    preview_path,
     seed_everything,
+    should_log_step,
 )
 from training.training_utils import (
     ThroughputTracker,
@@ -619,16 +622,25 @@ def main() -> None:
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     train_iter = infinite_batches(train_loader)
 
-    config = vars(args).copy()
-    config.update(
-        {
+    config = build_trainer_config(
+        model_name="audio_vocoder",
+        args=args,
+        device=device,
+        mixed_precision="no",
+        num_processes=accelerator.num_processes,
+        data={
             "audio_frame_size": int(dataset.audio_frame_size or 0),
+            "clip_frames": int(args.clip_frames),
+            "context_frames": int(args.context_frames),
+        },
+        model={
             "num_parameters": int(num_parameters),
-            "device": str(device),
-            "mixed_precision": "no",
-            "num_processes": int(accelerator.num_processes),
-            "timestamp": datetime.now().isoformat(),
-        }
+            "upsample_initial_channel": int(args.upsample_initial_channel),
+            "upsample_rates": list(args.upsample_rates),
+            "upsample_kernel_sizes": list(args.upsample_kernel_sizes),
+            "resblock_kernel_sizes": list(args.resblock_kernel_sizes),
+            "resblock_dilation_sizes": [list(group) for group in args.resblock_dilation_sizes],
+        },
     )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
@@ -746,11 +758,30 @@ def main() -> None:
 
                 progress.update(train_task, advance=1, status=status)
 
-            if (
-                ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
-                and not use_live_progress
-                and is_main_process
-            ):
+            log_due = should_log_step(
+                step,
+                start_step=start_step,
+                log_interval=args.log_interval,
+                max_steps=args.max_steps,
+            )
+            if log_due and is_main_process:
+                train_row = {
+                    "type": "train",
+                    "step": step,
+                    "loss": loss.item(),
+                    "wave_l1": wave_l1.item(),
+                    "mel_l1": mel_l1.item(),
+                    "stft_sc": stft_sc.item(),
+                    "stft_mag": stft_mag.item(),
+                    "grad_norm": grad_norm,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                    "samples_per_sec": round(samples_per_second, 1),
+                    "steps_per_sec": round(steps_per_second, 2),
+                }
+                train_row.update(gpu_stats(device))
+                metrics.append(train_row)
+
+            if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
                 examples_per_second = (
                     (step - start_step + 1)
@@ -764,16 +795,15 @@ def main() -> None:
                     f"lr={scheduler.get_last_lr()[0]:.2e} gnorm={grad_norm:.2f} ex/s={examples_per_second:.1f}"
                 )
 
-            eval_due = (
-                eval_loader is not None
-                and (
-                    (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
-                    or step == args.max_steps - 1
-                )
+            eval_due = eval_loader is not None and is_periodic_event_due(
+                step,
+                interval=args.eval_interval,
+                max_steps=args.max_steps,
             )
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
+            should_checkpoint = is_periodic_event_due(
+                step,
+                interval=args.checkpoint_interval,
+                max_steps=args.max_steps,
             )
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
@@ -795,9 +825,10 @@ def main() -> None:
                     stft_mag_weight=args.stft_mag_weight,
                     context_frames=args.context_frames,
                 )
+                eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                eval_metrics["train_gnorm"] = grad_norm
+                eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
@@ -809,7 +840,7 @@ def main() -> None:
 
                 if preview is not None:
                     save_vocoder_preview(
-                        output_dir / f"preview_step_{step:06d}.png",
+                        preview_path(output_dir, split="eval", step=step),
                         preview[0],
                         preview[1],
                         preview[2],
@@ -818,7 +849,7 @@ def main() -> None:
                     )
 
                 save_vocoder_preview(
-                    output_dir / f"train_preview_step_{step:06d}.png",
+                    preview_path(output_dir, split="train", step=step),
                     waveform_target.detach().cpu(),
                     prediction.detach().cpu(),
                     mel.detach().cpu(),
@@ -829,7 +860,7 @@ def main() -> None:
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]
                     save_training_state(
-                        output_dir / "audio_vocoder_best.pt",
+                        output_dir / "best.pt",
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
@@ -846,7 +877,7 @@ def main() -> None:
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
-                    output_dir / "audio_vocoder_latest.pt",
+                    output_dir / "latest.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -864,7 +895,7 @@ def main() -> None:
 
     if final_preview_payload is not None and is_main_process:
         save_vocoder_preview(
-            output_dir / "final_reconstruction.png",
+            output_dir / "previews" / "final_reconstruction.png",
             final_preview_payload[0],
             final_preview_payload[1],
             final_preview_payload[2],
@@ -872,12 +903,12 @@ def main() -> None:
             sample_rate=args.sample_rate,
         )
         save_waveform_wav(
-            output_dir / "final_target.wav",
+            output_dir / "previews" / "final_target.wav",
             final_preview_payload[0],
             sample_rate=args.sample_rate,
         )
         save_waveform_wav(
-            output_dir / "final_reconstruction.wav",
+            output_dir / "previews" / "final_reconstruction.wav",
             final_preview_payload[1],
             sample_rate=args.sample_rate,
         )

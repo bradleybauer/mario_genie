@@ -4,6 +4,7 @@ import math
 import random
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -64,6 +65,54 @@ def make_output_dir(
         return resume_path.parent if resume_parent else resume_path
     resolved_run_name = run_name or datetime.now().strftime(f"{default_prefix}_%Y%m%d_%H%M%S")
     return project_root / "checkpoints" / resolved_run_name
+
+
+def build_trainer_config(
+    *,
+    model_name: str,
+    args: Any,
+    device: torch.device,
+    mixed_precision: str,
+    num_processes: int,
+    data: dict[str, Any] | None = None,
+    model: dict[str, Any] | None = None,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    runtime_payload: dict[str, Any] = {
+        "device": str(device),
+        "mixed_precision": mixed_precision,
+        "num_processes": int(num_processes),
+        "timestamp": datetime.now().isoformat(),
+    }
+    if runtime is not None:
+        runtime_payload.update(runtime)
+    return {
+        "model_name": model_name,
+        "training": vars(args).copy(),
+        "data": data or {},
+        "model": model or {},
+        "runtime": runtime_payload,
+    }
+
+
+def is_periodic_event_due(step: int, *, interval: int, max_steps: int) -> bool:
+    if max_steps <= 0:
+        return False
+    if step == max_steps - 1:
+        return True
+    return interval > 0 and (step + 1) % interval == 0
+
+
+def should_log_step(step: int, *, start_step: int, log_interval: int, max_steps: int) -> bool:
+    if max_steps <= 0:
+        return False
+    if step == start_step or step == max_steps - 1:
+        return True
+    return log_interval > 0 and (step + 1) % log_interval == 0
+
+
+def preview_path(output_dir: Path, *, split: str, step: int, suffix: str = ".png") -> Path:
+    return output_dir / "previews" / f"{split}_step_{step:06d}{suffix}"
 
 
 def warmup_cosine_lr_lambda(

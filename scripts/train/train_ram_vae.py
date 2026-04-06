@@ -11,7 +11,6 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -37,12 +36,16 @@ from data.normalized_dataset import NormalizedSequenceDataset
 from models.ram_vae import RAMVAE
 from system_info import collect_system_info, print_system_info
 from training.trainer_common import (
+    build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
     format_bytes,
     gpu_stats,
+    is_periodic_event_due,
     make_output_dir,
+    preview_path,
     seed_everything,
+    should_log_step,
 )
 from training.training_utils import (
     ThroughputTracker,
@@ -326,16 +329,24 @@ def main() -> None:
     train_iter = infinite_batches(train_loader)
 
     num_params = sum(p.numel() for p in model.parameters())
-    config = vars(args).copy()
-    config.update(
-        {
-            "n_bytes": n_bytes,
+    config = build_trainer_config(
+        model_name="ram_vae",
+        args=args,
+        device=device,
+        mixed_precision="no",
+        num_processes=accelerator.num_processes,
+        data={
+            "n_bytes": int(n_bytes),
+            "clip_frames": int(args.clip_frames),
+        },
+        model={
             "num_parameters": int(num_params),
-            "device": str(device),
-            "mixed_precision": "no",
-            "num_processes": int(accelerator.num_processes),
-            "timestamp": datetime.now().isoformat(),
-        }
+            "hidden_dim": int(args.hidden_dim),
+            "latent_dim": int(args.latent_dim),
+            "n_fc_blocks": int(args.n_fc_blocks),
+            "n_temporal_blocks": int(args.n_temporal_blocks),
+            "temporal_kernel_size": int(args.temporal_kernel_size),
+        },
     )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
@@ -381,21 +392,28 @@ def main() -> None:
             )
 
             # --- Logging ---
-            if step % args.log_interval == 0 or step == start_step:
+            log_due = should_log_step(
+                step,
+                start_step=start_step,
+                log_interval=args.log_interval,
+                max_steps=args.max_steps,
+            )
+            if log_due:
                 lr_current = scheduler.get_last_lr()[0]
-                row = {
+                train_row = {
+                    "type": "train",
                     "step": step,
                     "loss": loss.item(),
                     "recon_loss": recon_loss.item(),
                     "kl_loss": kl_loss.item(),
                     "grad_norm": grad_norm,
-                    "lr": lr_current,
+                    "lr": float(lr_current),
                     "samples_per_sec": round(samples_per_second, 1),
                     "steps_per_sec": round(steps_per_second, 2),
                 }
                 if is_main_process:
-                    row.update(gpu_stats(device))
-                    metrics.append(row)
+                    train_row.update(gpu_stats(device))
+                    metrics.append(train_row)
 
                     status = (
                         f"loss={loss.item():.5f} recon={recon_loss.item():.5f} "
@@ -416,11 +434,20 @@ def main() -> None:
                 progress.update(train_task, advance=1, status="")
 
             # --- Eval ---
-            eval_due = eval_loader is not None and step > 0 and step % args.eval_interval == 0
-            should_checkpoint = step > 0 and step % args.checkpoint_interval == 0
+            eval_due = eval_loader is not None and is_periodic_event_due(
+                step,
+                interval=args.eval_interval,
+                max_steps=args.max_steps,
+            )
+            should_checkpoint = is_periodic_event_due(
+                step,
+                interval=args.checkpoint_interval,
+                max_steps=args.max_steps,
+            )
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
 
+            eval_line: str | None = None
             if eval_due and is_main_process:
                 eval_metrics, preview = evaluate(
                     model,
@@ -429,20 +456,22 @@ def main() -> None:
                     kl_weight=args.kl_weight,
                 )
                 eval_loss = eval_metrics["loss"]
+                eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                eval_metrics["train_gnorm"] = grad_norm
+                eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
-                log_console.print(
-                    f"[eval step {step}] loss={eval_loss:.5f} "
+
+                eval_line = (
+                    f"eval step={step:06d} loss={eval_loss:.5f} "
                     f"recon={eval_metrics['recon_loss']:.5f} "
                     f"kl={eval_metrics['kl_loss']:.3f}"
                 )
 
                 if preview is not None:
                     save_ram_preview(
-                        output_dir / "previews" / f"step_{step:06d}.png",
+                        preview_path(output_dir, split="eval", step=step),
                         preview[0],
                         preview[1],
                         title_prefix=f"Step {step} | ",
@@ -460,12 +489,14 @@ def main() -> None:
                         metrics=metrics,
                         accelerator=accelerator,
                     )
-                    log_console.print(f"[eval] New best: {best_eval:.6f}")
+                    eval_line += f" | best={best_eval:.6f}"
 
             # --- Checkpoint ---
             if should_checkpoint and is_main_process:
+                if eval_line is not None:
+                    eval_line += " | saved latest"
                 save_training_state(
-                    output_dir / f"step_{step:06d}.pt",
+                    output_dir / "latest.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -475,22 +506,13 @@ def main() -> None:
                     accelerator=accelerator,
                 )
 
+            if eval_line is not None and is_main_process:
+                log_console.print(eval_line)
+
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
 
-    # --- Final save ---
     if is_main_process:
-        save_training_state(
-            output_dir / "final.pt",
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            step=args.max_steps - 1,
-            best_eval=best_eval,
-            metrics=metrics,
-            accelerator=accelerator,
-        )
-
         save_metrics_json(output_dir / "metrics.json", metrics)
 
         console.print(f"Training complete. Best eval loss: {best_eval:.6f}")

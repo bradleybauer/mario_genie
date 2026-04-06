@@ -12,7 +12,6 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -39,12 +38,16 @@ from training.palette_video_vae_training import (
 )
 from system_info import collect_system_info, print_system_info
 from training.trainer_common import (
+    build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
     format_bytes,
     gpu_stats,
+    is_periodic_event_due,
     make_output_dir,
+    preview_path,
     seed_everything,
+    should_log_step,
 )
 from training.training_utils import (
     ThroughputTracker,
@@ -541,21 +544,28 @@ def main() -> None:
 
     train_iter = infinite_batches(train_loader)
 
-    config = vars(args).copy()
-    config.update(
-        {
-            "model_type": "DeepNarrowVideoVAE",
+    config = build_trainer_config(
+        model_name="deep_narrow_vae",
+        args=args,
+        device=device,
+        mixed_precision=mixed_precision,
+        num_processes=accelerator.num_processes,
+        data={
             "num_colors": int(num_colors),
+            "clip_frames": int(args.clip_frames),
+            "context_frames": int(args.context_frames),
+        },
+        model={
             "num_parameters": int(num_parameters),
+            "discriminator_parameters": int(discriminator_num_parameters),
+            "base_channels": int(args.base_channels),
+            "latent_channels": int(args.latent_channels),
+            "patch_size": int(args.patch_size),
+            "blocks_per_level": int(args.blocks_per_level),
+            "channels_per_level": channels,
             "num_res_blocks": int(num_res_blocks),
             "num_conv_layers": int(num_conv_layers),
-            "channels_per_level": channels,
-            "discriminator_parameters": int(discriminator_num_parameters),
-            "device": str(device),
-            "mixed_precision": mixed_precision,
-            "num_processes": int(accelerator.num_processes),
-            "timestamp": datetime.now().isoformat(),
-        }
+        },
     )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
@@ -687,11 +697,41 @@ def main() -> None:
                     status=status,
                 )
 
-            if (
-                ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
-                and not use_live_progress
-                and is_main_process
-            ):
+            log_due = should_log_step(
+                step,
+                start_step=start_step,
+                log_interval=args.log_interval,
+                max_steps=args.max_steps,
+            )
+            if log_due and is_main_process:
+                train_row = {
+                    "type": "train",
+                    "step": step,
+                    "loss": loss.item(),
+                    "recon_loss": recon_loss.item(),
+                    "kl_loss": kl_loss.item(),
+                    "grad_norm": grad_norm,
+                    "lr": float(scheduler.get_last_lr()[0]),
+                    "samples_per_sec": round(samples_per_second, 1),
+                    "steps_per_sec": round(steps_per_second, 2),
+                }
+                train_row.update(gpu_stats(device))
+                if bytes_per_sample is not None:
+                    train_row["throughput_mb_per_sec"] = round((samples_per_second * bytes_per_sample) / 2**20, 1)
+                if gan_active:
+                    train_row.update(
+                        {
+                            "gan_generator_loss": gan_gen_loss_value,
+                            "gan_discriminator_loss": gan_discr_loss_value,
+                            "gan_real_logit": gan_real_logit_value,
+                            "gan_fake_logit": gan_fake_logit_value,
+                        }
+                    )
+                    if args.use_lecam:
+                        train_row["gan_lecam_reg"] = gan_lecam_reg_value
+                metrics.append(train_row)
+
+            if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
                 examples_per_second = (
                     (step - start_step + 1)
@@ -711,16 +751,15 @@ def main() -> None:
                     )
                 )
 
-            eval_due = (
-                eval_loader is not None
-                and (
-                    (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
-                    or step == args.max_steps - 1
-                )
+            eval_due = eval_loader is not None and is_periodic_event_due(
+                step,
+                interval=args.eval_interval,
+                max_steps=args.max_steps,
             )
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
+            should_checkpoint = is_periodic_event_due(
+                step,
+                interval=args.checkpoint_interval,
+                max_steps=args.max_steps,
             )
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
@@ -751,9 +790,10 @@ def main() -> None:
                         gc.collect()
                         torch.cuda.empty_cache()
                 else:
+                    eval_metrics["type"] = "eval"
                     eval_metrics["step"] = step
                     eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                    eval_metrics["train_gnorm"] = grad_norm
+                    eval_metrics["train_grad_norm"] = grad_norm
                     metrics.append(eval_metrics)
                     save_metrics_json(output_dir / "metrics.json", metrics)
 
@@ -764,7 +804,7 @@ def main() -> None:
 
                     if preview is not None:
                         save_video_preview(
-                            output_dir / f"preview_step_{step:06d}.png",
+                            preview_path(output_dir, split="eval", step=step),
                             preview[0],
                             preview[1],
                             palette,
@@ -780,7 +820,7 @@ def main() -> None:
                                 with accelerator.autocast():
                                     train_outputs = model(train_inputs, sample_posterior=False)
                                 save_video_preview(
-                                    output_dir / f"train_preview_step_{step:06d}.png",
+                                    preview_path(output_dir, split="train", step=step),
                                     train_frames.detach().cpu(),
                                     train_outputs.logits.detach().cpu(),
                                     palette,
@@ -801,7 +841,7 @@ def main() -> None:
                     if eval_metrics["loss"] < best_eval:
                         best_eval = eval_metrics["loss"]
                         save_training_state(
-                            output_dir / "deep_narrow_vae_best.pt",
+                            output_dir / "best.pt",
                             model=model,
                             optimizer=optimizer,
                             scheduler=scheduler,
@@ -821,7 +861,7 @@ def main() -> None:
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
                 save_training_state(
-                    output_dir / "deep_narrow_vae_latest.pt",
+                    output_dir / "latest.pt",
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,

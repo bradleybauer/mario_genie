@@ -46,9 +46,13 @@ from models.video_vae import VideoVAE
 from path_utils import resolve_workspace_path
 from system_info import collect_system_info, print_system_info
 from training.trainer_common import (
+    build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
+    is_periodic_event_due,
     make_output_dir,
+    preview_path,
+    should_log_step,
 )
 from training.training_utils import (
     ThroughputTracker,
@@ -750,12 +754,7 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Accelerator prepare
     # ------------------------------------------------------------------
-    if eval_loader is not None:
-        model, optimizer, train_loader, eval_loader = accelerator.prepare(
-            model, optimizer, train_loader, eval_loader
-        )
-    else:
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
     # ------------------------------------------------------------------
     # Resume
@@ -790,6 +789,13 @@ def main() -> None:
             else:
                 console.print(f"[resume] Found metadata only; resuming from step {start_step}")
 
+        if args.max_steps > 0 and start_step >= args.max_steps:
+            if accelerator.is_main_process:
+                console.print(
+                    f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
+                )
+            return
+
     # ------------------------------------------------------------------
     # Timestep sampler
     # ------------------------------------------------------------------
@@ -804,13 +810,26 @@ def main() -> None:
     if accelerator.is_main_process:
         save_json(
             output_dir / "config.json",
-            {
-                "model_config": model_config,
-                "training": vars(args),
-                "mixed_precision": args.mixed_precision,
-                "model_backend": "diffusers",
-                "diffusers_version": diffusers_version,
-            },
+            build_trainer_config(
+                model_name="video_latent_dit",
+                args=args,
+                device=device,
+                mixed_precision=args.mixed_precision,
+                num_processes=accelerator.num_processes,
+                data={
+                    "latent_channels": int(latent_channels),
+                    "num_actions": int(num_actions),
+                    "clip_frames": int(args.clip_frames),
+                    "context_frames": int(args.context_frames),
+                    "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
+                },
+                model={
+                    "num_parameters": int(num_params),
+                    "config": model_config,
+                    "backend": "diffusers",
+                    "diffusers_version": diffusers_version,
+                },
+            ),
             indent=2,
         )
 
@@ -906,7 +925,13 @@ def main() -> None:
 
             accelerator.backward(loss)
 
-            should_log = accelerator.is_main_process and args.log_interval > 0 and step % args.log_interval == 0
+            log_due = should_log_step(
+                step,
+                start_step=start_step,
+                log_interval=args.log_interval,
+                max_steps=args.max_steps,
+            )
+            should_log = accelerator.is_main_process and log_due
             if should_log:
                 raw = accelerator.unwrap_model(model)
                 cgnorms = _component_gnorms(raw)
@@ -918,7 +943,7 @@ def main() -> None:
                 error_buffer.add_batch(eps - v_pred - future)
             loss_window.append(loss.item())
 
-            samples_per_second, _ = throughput_tracker.update(
+            samples_per_second, steps_per_second = throughput_tracker.update(
                 samples=latents.shape[0] * accelerator.num_processes,
             )
 
@@ -938,15 +963,17 @@ def main() -> None:
                     "step": step,
                     "loss": loss.item(),
                     "loss_smooth": float(np.mean(loss_window)) if loss_window else loss.item(),
-                    "gnorm": grad_norm,
-                    **{f"gnorm_{k}": v for k, v in cgnorms.items()},
+                    "grad_norm": grad_norm,
+                    **{f"grad_norm_{k}": v for k, v in cgnorms.items()},
                     "lr": float(lr_scheduler.get_last_lr()[0]),
                     "t_mean": float(t.mean().item()),
                     "t_std": float(t.std().item()),
                     "v_pred_norm": v_pred_norm,
                     "v_target_norm": v_target_norm,
                     "samples_per_sec": samples_per_second,
+                    "steps_per_sec": steps_per_second,
                 }
+                metrics.append(train_entry)
                 with train_log_path.open("a") as fh:
                     fh.write(json.dumps(train_entry) + "\n")
                 if not use_live:
@@ -960,12 +987,21 @@ def main() -> None:
             # ------------------------------------------------------------------
             # Evaluation
             # ------------------------------------------------------------------
-            should_eval = (
-                eval_loader is not None
-                and accelerator.is_main_process
-                and args.eval_interval > 0
-                and ((step + 1) % args.eval_interval == 0 or step == args.max_steps - 1)
+            eval_due = eval_loader is not None and is_periodic_event_due(
+                step,
+                interval=args.eval_interval,
+                max_steps=args.max_steps,
             )
+            should_checkpoint = is_periodic_event_due(
+                step,
+                interval=args.checkpoint_interval,
+                max_steps=args.max_steps,
+            )
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
+
+            should_eval = eval_due and accelerator.is_main_process
+            eval_line: str | None = None
             if should_eval:
                 gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -985,7 +1021,7 @@ def main() -> None:
                 eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(lr_scheduler.get_last_lr()[0])
-                eval_metrics["train_gnorm"] = grad_norm
+                eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
 
                 eval_line = (
@@ -1030,7 +1066,7 @@ def main() -> None:
                                 video_vae, maybe_denorm(prev_latents), accelerator=accelerator
                             )
                             save_preview_image(
-                                output_dir / f"preview_step_{step:06d}.png",
+                                preview_path(output_dir, split="eval", step=step),
                                 frames_gt=gt_frames[0],
                                 frames_sample=sampled_frames[0],
                                 palette=palette,
@@ -1054,7 +1090,6 @@ def main() -> None:
                     eval_line += f" | best={best_eval:.6f}"
 
                 save_metrics_json(output_dir / "metrics.json", metrics)
-                log_console.print(eval_line)
 
                 gc.collect()
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -1062,22 +1097,36 @@ def main() -> None:
             # ------------------------------------------------------------------
             # Periodic checkpoint
             # ------------------------------------------------------------------
-            should_ckpt = (
-                accelerator.is_main_process
-                and args.checkpoint_interval > 0
-                and ((step + 1) % args.checkpoint_interval == 0 or step == args.max_steps - 1)
-            )
-            if should_ckpt:
-                ckpt_dir = output_dir / f"checkpoint_{step:06d}"
+            if should_checkpoint and accelerator.is_main_process:
+                latest_dir = output_dir / "latest"
                 save_model_checkpoint(
-                    ckpt_dir,
+                    latest_dir,
                     model=model,
                     model_config=model_config,
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,
                 )
-                accelerator.save_state(str(ckpt_dir / "training_state"))
+                accelerator.save_state(str(latest_dir / "training_state"))
+
+                step_dir = output_dir / f"step_{step:06d}"
+                save_model_checkpoint(
+                    step_dir,
+                    model=model,
+                    model_config=model_config,
+                    step=step,
+                    best_eval=best_eval,
+                    metrics=metrics,
+                )
+                accelerator.save_state(str(step_dir / "training_state"))
+                if eval_line is not None:
+                    eval_line += " | saved latest"
+
+            if eval_line is not None and accelerator.is_main_process:
+                log_console.print(eval_line)
+
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         console.print(f"Training complete. Best eval flow_loss={best_eval:.6f}")
