@@ -11,7 +11,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.latent_dataset import LatentSequenceDataset
+from data.latent_dataset import LatentSequenceDataset
 
 
 def test_latent_dataset_returns_temporal_windows(tmp_path: Path) -> None:

@@ -240,11 +240,11 @@ Those causal conv filters will have to be "dual purpose" to account for being ap
 
 **Approach:**
 
-Prepend extra context frames during both training and inference. The dataset returns `seq_len + N_CTX` frames, and the loss is computed only on the final `seq_len` frames, discarding the context prefix from the output. This gives early frames real temporal context instead of zero-padding.
+Instead of zero-padding the causal temporal convolutions at the start of a sample, feed the first few real frames into the left padding region of the conv. This keeps the sequence length unchanged and only changes what the temporal filters see near the beginning of the clip.
 
 **Result:**
 
-Prepending context frames works great to reduce reconstruction error on frames early in the sample. Unsurprisingly, reconstruction of the context frames is not very good.
+Using real data in place of zero padding made a noticeable improvement in reconstruction quality for the earliest frames.
 
 <br>
 <br>
@@ -260,13 +260,14 @@ Additionally I want to test a version of the video autoencoder with more context
 
 **Approach:**
 
-Train more models
+Train more models. One of these variants prepends actual extra context frames to each sample during both training and inference. The dataset returns `seq_len + N_CTX` frames, and the loss is computed only on the final `seq_len` frames, so the prepended prefix is encoded to latents and reconstructed by the decoder but masked out of the loss.
 
 **Result:**
 
-I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook.
+I trained a tiny model with an expanded bottleneck size and it immediately performed better than all previous models in the early training phase on a per-step basis. The key was using many smaller codebooks instead of using one huge codebook which allows to train a larger effective codebook with a smaller number of FLOPs.
 
-Context images idea worked quite nicely. Non-context images consistently have better reconstructions that context images (context image are delightfully glitched). Currently using 8 additional context images per sample.
+For the explicit context-frame variant, non-context images consistently have better reconstructions than context images. The context images are delightfully glitched. Currently using 8 additional context images per sample.
+
 
 <br>
 <br>

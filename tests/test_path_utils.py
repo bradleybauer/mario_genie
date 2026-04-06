@@ -8,7 +8,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.path_utils import resolve_workspace_path, serialize_project_path
+from path_utils import resolve_workspace_path, serialize_project_path
 
 
 def test_serialize_project_path_prefers_project_relative(tmp_path: Path) -> None:

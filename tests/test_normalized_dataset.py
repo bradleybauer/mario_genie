@@ -11,7 +11,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.normalized_dataset import NormalizedSequenceDataset
+from data.normalized_dataset import NormalizedSequenceDataset
 
 
 def test_audio_mode_requires_audio_arrays(tmp_path: Path) -> None:

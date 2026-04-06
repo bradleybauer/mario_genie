@@ -10,10 +10,10 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.gan_discriminator import build_mel_discriminator, build_palette_discriminator
-from mario_world_model.ltx_audio_vae import LTXAudioVAE
-from mario_world_model.ltx_audio_vocoder import LTXAudioVocoder
-from mario_world_model.ltx_video_vae import LTXVideoVAE
+from models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
+from models.ltx_audio_vae import LTXAudioVAE
+from models.ltx_audio_vocoder import LTXAudioVocoder
+from models.ltx_video_vae import LTXVideoVAE
 
 
 def test_video_vae_preserves_video_shape() -> None:
