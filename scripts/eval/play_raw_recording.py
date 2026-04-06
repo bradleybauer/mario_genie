@@ -34,15 +34,16 @@ import numpy as np
 import pygame
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.ram_viz import (
+from src.data.ram_viz import (
     RAM_CELL, RAM_COLS, RAM_ROWS,
     RAMGridRenderer, render_oam_minimap, draw_ram_region_labels,
 )
-from data.game_decoders import decode_smb1, draw_decoded_sections
+from src.data.game_decoders import decode_smb1, draw_decoded_sections
 
 
 # ---------------------------------------------------------------------------

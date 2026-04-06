@@ -34,9 +34,10 @@ from rich.progress import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
 from models.video_vae import VideoVAE
 from path_utils import serialize_project_path

@@ -7,11 +7,10 @@ import numpy as np
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+SRC_DIR = str(PROJECT_ROOT / "src")
+sys.path.insert(0, SRC_DIR)
 
-from data.normalized_dataset import NormalizedSequenceDataset
+from src.data.normalized_dataset import NormalizedSequenceDataset
 
 
 def test_audio_mode_requires_audio_arrays(tmp_path: Path) -> None:

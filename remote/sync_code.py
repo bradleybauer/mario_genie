@@ -35,9 +35,6 @@ def sync_worker(worker):
         extra_args=[
             "--exclude=__pycache__",
             "--exclude=.git",
-            "--exclude=data",
-            "--exclude=checkpoints",
-            "--exclude=results",
             "--exclude=*.pyc",
             "--quiet",
         ],

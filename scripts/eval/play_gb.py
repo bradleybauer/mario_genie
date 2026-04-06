@@ -37,12 +37,13 @@ import numpy as np
 import pygame
 from pyboy import PyBoy
 
-PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
-SRC_DIR = os.path.join(PROJECT_ROOT, "src")
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.gamepad import GamepadState
+from src.data.gamepad import GamepadState
 
 
 DEFAULT_SCALE = 4

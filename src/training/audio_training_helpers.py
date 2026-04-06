@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from data.audio_features import mel_time_frequency_shape
+from src.data.audio_features import mel_time_frequency_shape
 
 
 def masked_l1_loss(

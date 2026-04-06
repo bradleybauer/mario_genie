@@ -7,11 +7,10 @@ import numpy as np
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+SRC_DIR = str(PROJECT_ROOT / "src")
+sys.path.insert(0, SRC_DIR)
 
-from data.latent_dataset import LatentSequenceDataset
+from src.data.latent_dataset import LatentSequenceDataset
 
 
 def test_latent_dataset_returns_temporal_windows(tmp_path: Path) -> None:

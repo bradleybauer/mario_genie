@@ -38,11 +38,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.latent_dataset import LatentSequenceDataset
+from src.data.latent_dataset import LatentSequenceDataset
 from models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
 from models.video_vae import VideoVAE
 from path_utils import resolve_workspace_path
@@ -929,8 +930,7 @@ def main() -> None:
             )
 
             progress.update(task, advance=1, status=(
-                f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
-                f"gnorm={grad_norm:.2f}"
+                f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e}"
                 + f" errbuf={len(error_buffer)}"
                 + f" sps={samples_per_second:.1f}"
             ))
@@ -960,8 +960,7 @@ def main() -> None:
                 if not use_live:
                     log_console.print(
                         f"step={step:06d} loss={train_entry['loss']:.5f} smooth={train_entry['loss_smooth']:.5f} "
-                        f"lr={train_entry['lr']:.2e} gnorm={grad_norm:.2f} "
-                        + " ".join(f"{k}={v:.2f}" for k, v in cgnorms.items())
+                        f"lr={train_entry['lr']:.2e}"
                         + f" sps={samples_per_second:.1f}"
                     )
 
@@ -1003,11 +1002,15 @@ def main() -> None:
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(lr_scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
+                eval_cgnorms = _component_gnorms(accelerator.unwrap_model(model))
+                eval_metrics.update({f"grad_norm_{k}": v for k, v in eval_cgnorms.items()})
                 metrics.append(eval_metrics)
 
                 eval_line = (
                     f"eval step={step:06d} flow_loss={eval_metrics['flow_loss']:.6f} "
-                    f"x0_mse={eval_metrics['x0_mse']:.6f}"
+                    f"x0_mse={eval_metrics['x0_mse']:.6f} "
+                    f"gnorm={grad_norm:.2f} "
+                    + " ".join(f"{k}={v:.2f}" for k, v in eval_cgnorms.items())
                 )
 
                 # Preview

@@ -15,6 +15,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -55,17 +56,44 @@ def build_rgb_lut(palette: np.ndarray) -> np.ndarray:
     return lut
 
 
-def decode_avi(avi_path: Path, expected_frames: int) -> np.ndarray:
-    """Decode AVI → (N, H, W, 3) uint8 RGB via ffmpeg."""
-    cmd = [
+def decode_avi_and_audio(
+    avi_path: Path,
+    expected_frames: int,
+    sample_rate: int = AUDIO_SAMPLE_RATE,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Decode video, audio, and fps from AVI in parallel ffmpeg calls.
+
+    Returns (rgb_frames, audio_samples, fps).
+    """
+    # Quick metadata read for fps
+    fps = probe_fps(avi_path)
+
+    # Launch video and audio decodes concurrently
+    video_cmd = [
         "ffmpeg", "-i", str(avi_path),
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-v", "error", "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg error on {avi_path.name}: {proc.stderr.decode()}")
-    raw = np.frombuffer(proc.stdout, dtype=np.uint8)
+    audio_cmd = [
+        "ffmpeg", "-i", str(avi_path),
+        "-vn", "-ac", "1",
+        "-ar", str(sample_rate),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-v", "error", "-",
+    ]
+    video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    video_out, video_err = video_proc.communicate()
+    audio_out, audio_err = audio_proc.communicate()
+
+    if video_proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg video error on {avi_path.name}: {video_err.decode()}")
+    if audio_proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg audio error on {avi_path.name}: {audio_err.decode()}")
+
+    # Parse video
+    raw = np.frombuffer(video_out, dtype=np.uint8)
     frame_bytes = NES_H * NES_W * 3
     actual_frames = len(raw) // frame_bytes
     if actual_frames < expected_frames:
@@ -75,7 +103,12 @@ def decode_avi(avi_path: Path, expected_frames: int) -> np.ndarray:
     if actual_frames != expected_frames:
         print(f"    Note: AVI has {actual_frames} frames, trimming to {expected_frames}")
     raw = raw[: expected_frames * frame_bytes]
-    return raw.reshape(expected_frames, NES_H, NES_W, 3)
+    rgb = raw.reshape(expected_frames, NES_H, NES_W, 3)
+
+    # Parse audio
+    audio = np.frombuffer(audio_out, dtype=np.int16)
+
+    return rgb, audio, fps
 
 
 def center_crop(frames: np.ndarray) -> np.ndarray:
@@ -111,24 +144,6 @@ def rgb_to_palette_indices(
 
     return indices
 
-
-def decode_audio(avi_path: Path, sample_rate: int = AUDIO_SAMPLE_RATE) -> np.ndarray:
-    """Decode full audio track from AVI → (S,) int16 mono at *sample_rate* via ffmpeg."""
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg is required to extract audio from AVI files")
-    cmd = [
-        "ffmpeg", "-i", str(avi_path),
-        "-vn", "-ac", "1",
-        "-ar", str(sample_rate),
-        "-f", "s16le", "-acodec", "pcm_s16le",
-        "-v", "error", "-",
-    ]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg audio error on {avi_path.name}: {proc.stderr.decode()}"
-        )
-    return np.frombuffer(proc.stdout, dtype=np.int16)
 
 
 def frame_aligned_audio(
@@ -235,15 +250,17 @@ def main():
         print("No valid recordings remaining.", file=sys.stderr)
         sys.exit(1)
 
-    # ── Pass 1: collect unique palette/action/RAM stats (no frames kept) ──
-    print("Pass 1: scanning metadata and frames for mappings ...")
+    # ── Pass 1: decode each AVI once, collect stats, cache to temp ──
+    tmpdir = Path(tempfile.mkdtemp(prefix="normalize_"))
+    print("Pass 1: decoding and scanning (results cached to temp) ...")
     used_pal = set()
     palette_counts_full = np.zeros(len(palette), dtype=np.int64)
     used_act = set()
     ram_min = None
     ram_max = None
+    cache_meta = []  # per-recording: {pal_idx_path, audio_path, audio_lengths_path, fps}
 
-    for base in bases:
+    for i, base in enumerate(bases):
         frame_numbers = np.load(str(base) + ".frames.npy")
         actions = np.load(str(base) + ".input.npy")
         ram = np.load(str(base) + ".ram.npy")
@@ -252,11 +269,14 @@ def main():
         n = len(frame_numbers)
         avi = Path(str(base) + ".avi")
 
-        print(f"  Scanning {base.name} ({n} frames) ...")
-        rgb = decode_avi(avi, n)
+        print(f"  [{i+1}/{len(bases)}] {base.name} ({n} frames) ...")
+        rgb, raw_audio, fps = decode_avi_and_audio(avi, n)
         cropped = center_crop(rgb)
+        del rgb
         pal_idx = rgb_to_palette_indices(cropped, lut, palette)
+        del cropped
 
+        # Collect metadata stats
         palette_counts_full += np.bincount(
             pal_idx.ravel(),
             minlength=len(palette),
@@ -271,7 +291,23 @@ def main():
             ram_min = np.minimum(ram_min, ram.min(axis=0))
             ram_max = np.maximum(ram_max, ram.max(axis=0))
 
-        del rgb, cropped, pal_idx  # free memory
+        # Frame-align audio and cache everything to temp files
+        audio_out, audio_lengths = frame_aligned_audio(raw_audio, n, fps)
+        del raw_audio
+
+        pal_path = tmpdir / f"{i}_pal.npy"
+        audio_path = tmpdir / f"{i}_audio.npy"
+        audio_len_path = tmpdir / f"{i}_audio_len.npy"
+        np.save(str(pal_path), pal_idx)
+        np.save(str(audio_path), audio_out)
+        np.save(str(audio_len_path), audio_lengths)
+        cache_meta.append({
+            "pal_idx_path": pal_path,
+            "audio_path": audio_path,
+            "audio_lengths_path": audio_len_path,
+            "fps": fps,
+        })
+        del pal_idx, audio_out, audio_lengths
 
     # Build remapping tables
     used_pal_sorted = sorted(used_pal)
@@ -335,32 +371,22 @@ def main():
             json.dump(obj, f, indent=2)
         print(f"  Wrote {path}")
 
-    # ── Pass 2: re-decode, remap, and save each recording ────────────
-    print("\nPass 2: converting and saving ...")
-    for base in bases:
-        frame_numbers = np.load(str(base) + ".frames.npy")
+    # ── Pass 2: load cached data, remap, and save (no ffmpeg) ────────
+    print("\nPass 2: remapping and saving ...")
+    for i, base in enumerate(bases):
         actions = np.load(str(base) + ".input.npy")
         ram = np.load(str(base) + ".ram.npy")
+        cm = cache_meta[i]
 
-        n = len(frame_numbers)
-        avi = Path(str(base) + ".avi")
-
-        print(f"  Processing {base.name} ({n} frames) ...")
-        rgb = decode_avi(avi, n)
-        cropped = center_crop(rgb)
-        pal_idx = rgb_to_palette_indices(cropped, lut, palette)
-        del rgb, cropped
+        print(f"  [{i+1}/{len(bases)}] {base.name} ...")
+        pal_idx = np.load(str(cm["pal_idx_path"]))
+        audio_out = np.load(str(cm["audio_path"]))
+        audio_lengths = np.load(str(cm["audio_lengths_path"]))
 
         frames_out = pal_remap[pal_idx]
         del pal_idx
         actions_out = act_remap[actions]
         ram_out = ram[:, kept_cols]
-
-        # Extract frame-aligned mono audio at the target sample rate
-        fps = probe_fps(avi)
-        raw_audio = decode_audio(avi)
-        audio_out, audio_lengths = frame_aligned_audio(raw_audio, n, fps)
-        del raw_audio
 
         out_path = OUT_DIR / (base.name + ".npz")
         np.savez_compressed(
@@ -371,13 +397,18 @@ def main():
             audio=audio_out,
             audio_lengths=audio_lengths,
             audio_sample_rate=np.int32(AUDIO_SAMPLE_RATE),
-            video_fps=np.float32(fps),
+            video_fps=np.float32(cm["fps"]),
         )
-        print(f"  Saved {out_path.name}  "
-              f"frames={frames_out.shape} actions={actions_out.shape} "
+        print(f"    frames={frames_out.shape} actions={actions_out.shape} "
               f"ram={ram_out.shape} audio={audio_out.shape}")
         del frames_out, actions_out, ram_out, audio_out, audio_lengths
 
+        # Clean up temp files for this recording
+        cm["pal_idx_path"].unlink()
+        cm["audio_path"].unlink()
+        cm["audio_lengths_path"].unlink()
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"\nDone. Output in {OUT_DIR}")
 
 

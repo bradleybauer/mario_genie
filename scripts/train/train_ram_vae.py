@@ -28,11 +28,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.normalized_dataset import NormalizedSequenceDataset
+from src.data.normalized_dataset import NormalizedSequenceDataset
 from models.ram_vae import RAMVAE
 from system_info import collect_system_info, print_system_info
 from training.trainer_common import (

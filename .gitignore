@@ -1,10 +1,8 @@
-224_1t
 data
 checkpoints
 results
 *__pycache__*
 .vscode
-open-genie
 .env
 *api_key*
 *.secret

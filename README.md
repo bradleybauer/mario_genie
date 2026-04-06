@@ -436,7 +436,7 @@ The model was still trained in a causal setup: future latent frames are noised, 
 
 **Result:**
 
-`qk` RMS normalization mostly fixed the catastrophic gradient blow-ups and made `bf16` training practical.
+`qk` RMS normalization fixed the catastrophic gradient blow-ups and made `bf16` training practical.
 
 However, once the numerical instability was under control, a second issue became clearer: the loss still was not dropping as quickly as hoped on a per-step basis.
 

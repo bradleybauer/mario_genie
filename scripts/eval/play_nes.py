@@ -36,12 +36,13 @@ import stable_retro as retro
 from nes_py._rom import ROM
 from nes_py.nes_env import NESEnv
 
-PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
-SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
-if SRC_DIR not in sys.path:
-    sys.path.insert(0, SRC_DIR)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.gamepad import GamepadState
+from src.data.gamepad import GamepadState
 
 # --- Configuration ---
 ROM_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'nes')
@@ -58,7 +59,7 @@ BUTTON_BITS = {
     'UP': 4, 'DOWN': 5, 'LEFT': 6, 'RIGHT': 7,
 }
 
-from data.ram_viz import (
+from src.data.ram_viz import (
     RAM_SIZE, RAM_COLS, RAM_ROWS, RAM_CELL,
     WRAM_SIZE, WRAM_COLS, WRAM_ROWS, WRAM_CELL,
     LEVEL_COLS_PER_SCREEN,
@@ -66,7 +67,7 @@ from data.ram_viz import (
     render_oam_minimap, draw_ram_region_labels,
     render_level_tilemap,
 )
-from data.game_decoders import (
+from src.data.game_decoders import (
     get_decoder, draw_decoded_sections, WRAM_OFFSET,
 )
 

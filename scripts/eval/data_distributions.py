@@ -37,12 +37,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.npy_db import load_recordings, build_dataframe
-from data.smb1_memory_map import SMB1_RAM_LABELS
+from src.data.npy_db import load_recordings, build_dataframe
+from src.data.smb1_memory_map import SMB1_RAM_LABELS
 
 
 def parse_args() -> argparse.Namespace:

@@ -18,15 +18,16 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
 from models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from training.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from models.video_vae import VideoVAE
-from data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from training.palette_video_vae_training import (
     evaluate_video_vae,
     frames_to_one_hot,

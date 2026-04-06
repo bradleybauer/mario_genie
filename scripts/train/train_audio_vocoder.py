@@ -26,14 +26,15 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
+    import_root_str = str(import_root)
+    if import_root_str not in sys.path:
+        sys.path.insert(0, import_root_str)
 
-from data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
+from src.data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
 from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
 from models.audio_vocoder import AudioVocoder
-from data.normalized_dataset import NormalizedSequenceDataset
+from src.data.normalized_dataset import NormalizedSequenceDataset
 from system_info import collect_system_info, print_system_info
 from training.audio_training_helpers import (
     build_mel_mask,
