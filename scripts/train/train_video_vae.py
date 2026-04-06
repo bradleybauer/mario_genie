@@ -5,9 +5,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import math
 import os
-import random
 import sys
 import time
 from datetime import datetime
@@ -37,6 +35,14 @@ from training.palette_video_vae_training import (
     split_context_targets,
 )
 from system_info import collect_system_info, print_system_info
+from training.trainer_common import (
+    build_warmup_cosine_scheduler,
+    configure_cuda_runtime,
+    format_bytes,
+    gpu_stats,
+    make_output_dir,
+    seed_everything,
+)
 from training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
@@ -53,20 +59,6 @@ from training.training_utils import (
 
 
 console = Console()
-
-
-def _format_bytes(num_bytes: int) -> str:
-    num_bytes = max(int(num_bytes), 0)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(num_bytes)
-    unit = units[0]
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            break
-        value /= 1024.0
-    if unit == "B":
-        return f"{int(value)} {unit}"
-    return f"{value:.1f} {unit}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,23 +231,6 @@ def load_class_weights(
     return weights.to(device)
 
 
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def make_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
-        return Path(args.output_dir)
-    if args.resume_from is not None:
-        return Path(args.resume_from).resolve().parent
-    run_name = args.run_name or datetime.now().strftime("video_vae_%Y%m%d_%H%M%S")
-    return PROJECT_ROOT / "checkpoints" / run_name
-
-
 def save_training_state(
     path: Path,
     *,
@@ -287,28 +262,6 @@ def save_training_state(
     torch.save(state, path)
 
 
-def gpu_stats(device: torch.device) -> dict[str, float]:
-    if not torch.cuda.is_available():
-        return {}
-    index = device.index or 0
-    stats: dict[str, float] = {}
-    try:
-        mem_used = torch.cuda.memory_allocated(index) / 2**30
-        mem_total = torch.cuda.get_device_properties(index).total_memory / 2**30
-        stats["gpu_mem_pct"] = round(100.0 * mem_used / max(mem_total, 1e-9), 1)
-    except Exception:
-        pass
-    try:
-        stats["gpu_util_pct"] = float(torch.cuda.utilization(index))
-    except Exception:
-        pass
-    try:
-        stats["gpu_temp_c"] = float(torch.cuda.temperature(index))
-    except Exception:
-        pass
-    return stats
-
-
 def main() -> None:
     args = parse_args()
     if args.use_lecam and not args.use_gan:
@@ -317,7 +270,13 @@ def main() -> None:
         raise SystemExit("--lecam-decay must be in (0, 1)")
     seed_everything(args.seed)
 
-    output_dir = make_output_dir(args)
+    output_dir = make_output_dir(
+        project_root=PROJECT_ROOT,
+        output_dir=args.output_dir,
+        resume_from=args.resume_from,
+        run_name=args.run_name,
+        default_prefix="video_vae",
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mixed_precision = "no"
@@ -337,16 +296,13 @@ def main() -> None:
         console.print(f"Using device: {device}")
     if torch.cuda.is_available():
         if args.tf16:
-            torch.set_float32_matmul_precision("medium")
+            configure_cuda_runtime(matmul_precision="medium")
             if is_main_process:
                 console.print("[tf16] TF16 matmul precision enabled")
         else:
-            torch.set_float32_matmul_precision("high")
+            configure_cuda_runtime(matmul_precision="high")
             if is_main_process:
                 console.print("[tf32] TF32 matmul precision enabled")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
 
     onehot_dtype_map = {
         "float32": torch.float32,
@@ -394,7 +350,7 @@ def main() -> None:
         )
         console.print(
             f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-            f"{_format_bytes(dataset.dataset_bytes)} on disk."
+            f"{format_bytes(dataset.dataset_bytes)} on disk."
         )
 
     train_dataset, eval_dataset = split_train_eval_dataset(
@@ -485,18 +441,12 @@ def main() -> None:
     if discriminator is not None:
         discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
     warmup_steps = max(int(args.warmup_steps), 0)
-
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max(step + 1, 1) / float(warmup_steps)
-        if args.max_steps <= warmup_steps:
-            return 1.0
-        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
-        progress = min(max(progress, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 0.25 + 0.75 * cosine
-
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer,
+        max_steps=args.max_steps,
+        warmup_steps=warmup_steps,
+        min_lr_scale=0.25,
+    )
     if warmup_steps > 0:
         if is_main_process:
             console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")

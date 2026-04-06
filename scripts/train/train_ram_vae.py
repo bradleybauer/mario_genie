@@ -8,9 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import random
 import sys
 import time
 from datetime import datetime
@@ -38,6 +36,14 @@ if str(SRC_DIR) not in sys.path:
 from data.normalized_dataset import NormalizedSequenceDataset
 from models.ram_vae import RAMVAE
 from system_info import collect_system_info, print_system_info
+from training.trainer_common import (
+    build_warmup_cosine_scheduler,
+    configure_cuda_runtime,
+    format_bytes,
+    gpu_stats,
+    make_output_dir,
+    seed_everything,
+)
 from training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
@@ -53,20 +59,6 @@ from training.training_utils import (
 )
 
 console = Console()
-
-
-def _format_bytes(num_bytes: int) -> str:
-    num_bytes = max(int(num_bytes), 0)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(num_bytes)
-    unit = units[0]
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            break
-        value /= 1024.0
-    if unit == "B":
-        return f"{int(value)} {unit}"
-    return f"{value:.1f} {unit}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,45 +86,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
     return parser.parse_args()
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def make_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
-        return Path(args.output_dir)
-    if args.resume_from is not None:
-        return Path(args.resume_from).resolve().parent
-    run_name = args.run_name or datetime.now().strftime("ram_vae_%Y%m%d_%H%M%S")
-    return PROJECT_ROOT / "checkpoints" / run_name
-
-
-def gpu_stats(device: torch.device) -> dict[str, float]:
-    if not torch.cuda.is_available():
-        return {}
-    index = device.index or 0
-    stats: dict[str, float] = {}
-    try:
-        mem_used = torch.cuda.memory_allocated(index) / 2**30
-        mem_total = torch.cuda.get_device_properties(index).total_memory / 2**30
-        stats["gpu_mem_pct"] = round(100.0 * mem_used / max(mem_total, 1e-9), 1)
-    except Exception:
-        pass
-    try:
-        stats["gpu_util_pct"] = float(torch.cuda.utilization(index))
-    except Exception:
-        pass
-    try:
-        stats["gpu_temp_c"] = float(torch.cuda.temperature(index))
-    except Exception:
-        pass
-    return stats
 
 
 def save_ram_preview(
@@ -242,7 +195,13 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    output_dir = make_output_dir(args)
+    output_dir = make_output_dir(
+        project_root=PROJECT_ROOT,
+        output_dir=args.output_dir,
+        resume_from=args.resume_from,
+        run_name=args.run_name,
+        default_prefix="ram_vae",
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
@@ -253,9 +212,7 @@ def main() -> None:
     if is_main_process:
         console.print(f"Using device: {device}")
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        configure_cuda_runtime()
         if is_main_process:
             console.print("[tf32] TF32 matmul precision enabled")
 
@@ -294,7 +251,7 @@ def main() -> None:
         )
         console.print(
             f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-            f"{_format_bytes(dataset.dataset_bytes)} on disk."
+            f"{format_bytes(dataset.dataset_bytes)} on disk."
         )
 
     # --- Train/eval split ---
@@ -338,18 +295,12 @@ def main() -> None:
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
     warmup_steps = max(int(args.warmup_steps), 0)
-
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max(step + 1, 1) / float(warmup_steps)
-        if args.max_steps <= warmup_steps:
-            return 1.0
-        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
-        progress = min(max(progress, 0.0), 1.0)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return 0.1 + 0.9 * cosine
-
-    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer,
+        max_steps=args.max_steps,
+        warmup_steps=warmup_steps,
+        min_lr_scale=0.1,
+    )
 
     start_step = 0
     best_eval = float("inf")

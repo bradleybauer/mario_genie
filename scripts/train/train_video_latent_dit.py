@@ -21,7 +21,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +45,11 @@ from data.latent_dataset import LatentSequenceDataset
 from models.video_vae import VideoVAE
 from path_utils import resolve_workspace_path
 from system_info import collect_system_info, print_system_info
+from training.trainer_common import (
+    build_warmup_cosine_scheduler,
+    configure_cuda_runtime,
+    make_output_dir,
+)
 from training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
@@ -144,8 +148,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-loss", type=str, choices=["mse", "huber"], default="huber")
     parser.add_argument("--huber-delta", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=10.0)
-    parser.add_argument("--grad-norm-skip", type=float, default=0.0,
-                        help="Skip optimizer step when pre-clip grad norm exceeds this (0 disables).")
 
     parser.add_argument("--timestep-sampler", type=str, choices=["uniform", "logit_normal"],
                         default="uniform")
@@ -235,15 +237,6 @@ def _is_readable(p: Path | None) -> bool:
         return p is not None and p.is_file()
     except (PermissionError, OSError):
         return False
-
-
-def make_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
-        return Path(args.output_dir)
-    if args.resume_from is not None:
-        return Path(args.resume_from).resolve()
-    run_name = args.run_name or datetime.now().strftime("video_latent_dit_%Y%m%d_%H%M%S")
-    return PROJECT_ROOT / "checkpoints" / run_name
 
 
 def load_latent_normalization(
@@ -577,7 +570,14 @@ def main() -> None:
     set_seed(args.seed)
 
     data_dir = _resolve_data_dir(args)
-    output_dir = make_output_dir(args)
+    output_dir = make_output_dir(
+        project_root=PROJECT_ROOT,
+        output_dir=args.output_dir,
+        resume_from=args.resume_from,
+        run_name=args.run_name,
+        default_prefix="video_latent_dit",
+        resume_parent=False,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runtime = create_accelerator_runtime(
@@ -588,10 +588,7 @@ def main() -> None:
     device = accelerator.device
 
     if torch.cuda.is_available():
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        configure_cuda_runtime(matmul_precision="high")
 
     system_info = collect_system_info()
     if accelerator.is_main_process:
@@ -743,17 +740,12 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
     warmup_steps = max(args.warmup_steps, 0)
-
-    def lr_lambda(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return max(step + 1, 1) / float(warmup_steps)
-        if args.max_steps <= warmup_steps:
-            return 1.0
-        progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
-        progress = min(max(progress, 0.0), 1.0)
-        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    lr_scheduler = LambdaLR(optimizer, lr_lambda)
+    lr_scheduler = build_warmup_cosine_scheduler(
+        optimizer,
+        max_steps=args.max_steps,
+        warmup_steps=warmup_steps,
+        min_lr_scale=0.1,
+    )
 
     # ------------------------------------------------------------------
     # Accelerator prepare
@@ -920,26 +912,11 @@ def main() -> None:
                 cgnorms = _component_gnorms(raw)
 
             grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip).item()
-
-            skipped = (
-                args.grad_norm_skip > 0.0
-                and math.isfinite(grad_norm)
-                and grad_norm > args.grad_norm_skip
-            )
-            if skipped:
-                optimizer.zero_grad(set_to_none=True)
-                error_buffer.clear()
-                progress.update(task, advance=1, status=(
-                    f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
-                    f"gnorm={grad_norm:.2f} skip=gradnorm"
-                ))
-                lr_scheduler.step()
-            else:
-                optimizer.step()
-                lr_scheduler.step()
-                with torch.no_grad():
-                    error_buffer.add_batch(eps - v_pred - future)
-                loss_window.append(loss.item())
+            optimizer.step()
+            lr_scheduler.step()
+            with torch.no_grad():
+                error_buffer.add_batch(eps - v_pred - future)
+            loss_window.append(loss.item())
 
             samples_per_second, _ = throughput_tracker.update(
                 samples=latents.shape[0] * accelerator.num_processes,
@@ -948,7 +925,7 @@ def main() -> None:
             progress.update(task, advance=1, status=(
                 f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
                 f"gnorm={grad_norm:.2f}"
-                + (f" errbuf={len(error_buffer)}" if not skipped else " skip=gradnorm")
+                + f" errbuf={len(error_buffer)}"
                 + f" sps={samples_per_second:.1f}"
             ))
 
@@ -969,7 +946,6 @@ def main() -> None:
                     "v_pred_norm": v_pred_norm,
                     "v_target_norm": v_target_norm,
                     "samples_per_sec": samples_per_second,
-                    "skipped": skipped,
                 }
                 with train_log_path.open("a") as fh:
                     fh.write(json.dumps(train_entry) + "\n")

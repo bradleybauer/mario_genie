@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import random
 import sys
 import time
 import wave
@@ -38,6 +36,20 @@ from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_
 from models.audio_vocoder import AudioVocoder
 from data.normalized_dataset import NormalizedSequenceDataset
 from system_info import collect_system_info, print_system_info
+from training.audio_training_helpers import (
+    build_mel_mask,
+    build_waveform_mask,
+    context_waveform_lengths,
+    masked_l1_loss,
+)
+from training.trainer_common import (
+    build_warmup_cosine_scheduler,
+    configure_cuda_runtime,
+    format_bytes,
+    gpu_stats,
+    make_output_dir,
+    seed_everything,
+)
 from training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
@@ -54,20 +66,6 @@ from training.training_utils import (
 
 
 console = Console()
-
-
-def _format_bytes(num_bytes: int) -> str:
-    num_bytes = max(int(num_bytes), 0)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(num_bytes)
-    unit = units[0]
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            break
-        value /= 1024.0
-    if unit == "B":
-        return f"{int(value)} {unit}"
-    return f"{value:.1f} {unit}"
 
 
 def parse_resblock_dilation_sizes(value: str) -> tuple[tuple[int, ...], ...]:
@@ -162,94 +160,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-frames must be smaller than --clip-frames")
 
     return args
-
-
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def make_output_dir(args: argparse.Namespace) -> Path:
-    if args.output_dir is not None:
-        return Path(args.output_dir)
-    if args.resume_from is not None:
-        return Path(args.resume_from).resolve().parent
-    run_name = args.run_name or datetime.now().strftime("audio_vocoder_%Y%m%d_%H%M%S")
-    return PROJECT_ROOT / "checkpoints" / run_name
-
-
-def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
-    if mask is None:
-        return F.l1_loss(prediction, target)
-    diff = (prediction - target).abs() * mask
-    denom = mask.sum().clamp_min(1.0)
-    return diff.sum() / denom
-
-
-def build_mel_mask(
-    waveform_lengths: torch.Tensor,
-    *,
-    max_time_steps: int,
-    n_fft: int,
-    hop_length: int,
-    context_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if context_lengths is not None and context_lengths.shape != waveform_lengths.shape:
-        raise ValueError(
-            "context_lengths must have same shape as waveform_lengths: "
-            f"got {tuple(context_lengths.shape)} vs {tuple(waveform_lengths.shape)}"
-        )
-
-    mask = torch.zeros((waveform_lengths.shape[0], 1, max_time_steps, 1), dtype=torch.float32, device=waveform_lengths.device)
-    context_iter = context_lengths.tolist() if context_lengths is not None else [0] * waveform_lengths.shape[0]
-    for batch_idx, (length, context_length) in enumerate(zip(waveform_lengths.tolist(), context_iter, strict=True)):
-        valid_steps, _ = mel_time_frequency_shape(int(length), n_fft=n_fft, hop_length=hop_length, center=False)
-        context_steps = 0
-        if context_length > 0:
-            context_steps, _ = mel_time_frequency_shape(int(context_length), n_fft=n_fft, hop_length=hop_length, center=False)
-
-        start_step = min(context_steps, max_time_steps)
-        end_step = min(valid_steps, max_time_steps)
-        if end_step > start_step:
-            mask[batch_idx, :, start_step:end_step] = 1.0
-
-    return mask
-
-
-def build_waveform_mask(
-    lengths: torch.Tensor,
-    *,
-    max_samples: int,
-    context_lengths: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if context_lengths is not None and context_lengths.shape != lengths.shape:
-        raise ValueError(
-            "context_lengths must have same shape as lengths: "
-            f"got {tuple(context_lengths.shape)} vs {tuple(lengths.shape)}"
-        )
-
-    mask = torch.zeros((lengths.shape[0], 1, max_samples), dtype=torch.float32, device=lengths.device)
-    context_iter = context_lengths.tolist() if context_lengths is not None else [0] * lengths.shape[0]
-    for batch_idx, (length, context_length) in enumerate(zip(lengths.tolist(), context_iter, strict=True)):
-        start_sample = min(max(int(context_length), 0), max_samples)
-        end_sample = min(max(int(length), 0), max_samples)
-        if end_sample > start_sample:
-            mask[batch_idx, :, start_sample:end_sample] = 1.0
-
-    return mask
-
-
-def context_waveform_lengths(audio_lengths: torch.Tensor, *, context_frames: int) -> torch.Tensor:
-    if audio_lengths.ndim != 2:
-        raise ValueError(f"Expected audio_lengths with shape (B, T), got {tuple(audio_lengths.shape)}")
-    if context_frames <= 0:
-        return torch.zeros(audio_lengths.shape[0], dtype=torch.int64, device=audio_lengths.device)
-
-    capped_context = min(context_frames, audio_lengths.shape[1])
-    return audio_lengths[:, :capped_context].to(dtype=torch.int64).sum(dim=1)
 
 
 class MultiResolutionSTFTLoss(nn.Module):
@@ -406,28 +316,6 @@ def save_training_state(
     )
 
 
-def gpu_stats(device: torch.device) -> dict[str, float]:
-    if not torch.cuda.is_available():
-        return {}
-    index = device.index or 0
-    stats: dict[str, float] = {}
-    try:
-        mem_used = torch.cuda.memory_allocated(index) / 2**30
-        mem_total = torch.cuda.get_device_properties(index).total_memory / 2**30
-        stats["gpu_mem_pct"] = round(100.0 * mem_used / max(mem_total, 1e-9), 1)
-    except Exception:
-        pass
-    try:
-        stats["gpu_util_pct"] = float(torch.cuda.utilization(index))
-    except Exception:
-        pass
-    try:
-        stats["gpu_temp_c"] = float(torch.cuda.temperature(index))
-    except Exception:
-        pass
-    return stats
-
-
 def evaluate(
     model: AudioVocoder,
     loader: DataLoader,
@@ -545,7 +433,13 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    output_dir = make_output_dir(args)
+    output_dir = make_output_dir(
+        project_root=PROJECT_ROOT,
+        output_dir=args.output_dir,
+        resume_from=args.resume_from,
+        run_name=args.run_name,
+        default_prefix="audio_vocoder",
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
@@ -556,9 +450,7 @@ def main() -> None:
     if is_main_process:
         console.print(f"Using device: {device}")
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        configure_cuda_runtime()
         if is_main_process:
             console.print("[tf32] TF32 matmul precision enabled")
 
@@ -601,7 +493,7 @@ def main() -> None:
             )
         console.print(
             f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-            f"{_format_bytes(dataset.dataset_bytes)} on disk."
+            f"{format_bytes(dataset.dataset_bytes)} on disk."
         )
 
     if args.overfit_n > 0:
@@ -692,18 +584,12 @@ def main() -> None:
         scheduler = LambdaLR(optimizer, lr_lambda=lambda _step: 1.0)
     else:
         warmup_steps = max(int(args.warmup_steps), 0)
-
-        def lr_lambda(step: int) -> float:
-            if warmup_steps > 0 and step < warmup_steps:
-                return max(step + 1, 1) / float(warmup_steps)
-            if args.max_steps <= warmup_steps:
-                return 1.0
-            progress = (step - warmup_steps) / float(max(args.max_steps - warmup_steps, 1))
-            progress = min(max(progress, 0.0), 1.0)
-            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return 0.1 + 0.9 * cosine
-
-        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        scheduler = build_warmup_cosine_scheduler(
+            optimizer,
+            max_steps=args.max_steps,
+            warmup_steps=warmup_steps,
+            min_lr_scale=0.1,
+        )
 
     start_step = 0
     best_eval = float("inf")
