@@ -26,9 +26,11 @@ Usage
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from collections import Counter
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -43,6 +45,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+from data.npy_db import load_recordings
 
 MESEN_BIN = PROJECT_ROOT / "mesen" / "bin" / "linux-x64" / "Release" / "Mesen"
 ROM_PATH = PROJECT_ROOT / "nes" / "Super Mario Bros. (Japan, USA).nes"
@@ -122,8 +126,6 @@ def dim_labels() -> list[str]:
 
 def compute_coverage(bin_width: int) -> Counter:
     """Count frames per (world, stage, x_bin, ...) across all recordings."""
-    from data.npy_db import load_recordings
-
     counts: Counter = Counter()
     recordings = load_recordings(data_dir=RAW_DATA_DIR, verbose=False)
     total_frames = 0
@@ -177,9 +179,6 @@ def gather_save_states(bin_width: int,
     dies (or the level ends) sooner than this are skipped — they are
     bad starting positions.
     """
-    import re
-    from data.npy_db import load_recordings
-
     recordings = load_recordings(data_dir=RAW_DATA_DIR, verbose=False)
     states: list[SaveStateInfo] = []
 
@@ -262,8 +261,6 @@ def pick_best_state(
     This ensures each under-represented *bin* gets proportional attention
     regardless of how many save states happen to land in it.
     """
-    from collections import defaultdict
-
     labels = dim_labels()
 
     def state_key(s: SaveStateInfo) -> tuple:

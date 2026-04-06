@@ -24,7 +24,15 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.patches import Patch
 from scipy.ndimage import gaussian_filter1d
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from config import SEQUENCE_LENGTH
 
 
 def smooth(values: list[float], sigma: float) -> np.ndarray:
@@ -62,7 +70,6 @@ DISTINCT_COLORS = [
 ]
 LINE_STYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1)), (0, (5, 2, 1, 2, 1, 2))]
 LINE_WIDTHS = [1.8, 1.2, 2.4]
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_FONT_SCALE = 1.6
 DEFAULT_FIGURE_SCALE = 1.25
 DEFAULT_SAVE_DPI = 180
@@ -289,8 +296,6 @@ def estimate_train_sample_count(run: dict) -> int | None:
     data_dir = resolve_data_dir(run)
     if data_dir is None:
         return None
-
-    from config import SEQUENCE_LENGTH
 
     sequence_length = int(cfg.get("sequence_length", SEQUENCE_LENGTH) or SEQUENCE_LENGTH)
     total_sequences = count_dataset_sequences(str(data_dir), sequence_length)
@@ -854,7 +859,6 @@ def plot_bar(
         ax.grid(True, axis="x", alpha=0.3)
 
         if color_by and show_legend:
-            from matplotlib.patches import Patch
             legend_handles = [Patch(facecolor=prop_colors[p], label=f"{color_by}={p}") for p in unique_props]
             ax.legend(handles=legend_handles, loc="lower right")
 

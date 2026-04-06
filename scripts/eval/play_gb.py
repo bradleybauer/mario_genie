@@ -35,16 +35,12 @@ if "SDL_AUDIODRIVER" not in os.environ:
 
 import numpy as np
 import pygame
+from pyboy import PyBoy
 
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
-
-try:
-    from pyboy import PyBoy
-except ImportError:
-    PyBoy = None
 
 from data.gamepad import GamepadState
 
@@ -356,10 +352,6 @@ def resolve_path(path_arg: str) -> tuple[str, str]:
 
 def main() -> None:
     args = parse_args()
-
-    if PyBoy is None:
-        print("PyBoy is not installed. Install it with: pip install pyboy")
-        raise SystemExit(1)
 
     if args.scale < 1:
         print("--scale must be at least 1")

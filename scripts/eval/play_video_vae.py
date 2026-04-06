@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pygame
 import torch
+from nes_py.nes_env import NESEnv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -265,8 +266,6 @@ def _run_nes_py(
     fps: int,
     view: str,
 ) -> None:
-    from nes_py.nes_env import NESEnv
-
     env = NESEnv(rom_path)
     obs = env.reset()
 
@@ -336,9 +335,6 @@ def _run_retro(
     fps: int,
     view: str,
 ) -> None:
-    if nes_play.retro is None:
-        raise RuntimeError("stable-retro is not installed")
-
     game_id = nes_play.ensure_retro_game(rom_path)
     env = nes_play.retro.make(
         game_id,

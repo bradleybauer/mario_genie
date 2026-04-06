@@ -26,7 +26,11 @@ import sys
 import zipfile
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_hex
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -186,11 +190,6 @@ def print_distribution(counts: np.ndarray, palette_rgb: list[list[int]],
 
 def plot_distribution(counts: np.ndarray, palette_rgb: list[list[int]],
                       log_scale: bool = False) -> None:
-    import matplotlib
-    matplotlib.use("TkAgg")
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import to_hex
-
     num_colors = len(counts)
     total = counts.sum()
     pcts = 100.0 * counts / max(total, 1)

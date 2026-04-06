@@ -2,20 +2,18 @@
 
 import argparse
 import os
+import sys
 import textwrap
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-# Import the module under test
-import importlib.util
+REMOTE_DIR = Path(__file__).resolve().parents[1] / "remote"
+if str(REMOTE_DIR) not in sys.path:
+    sys.path.insert(0, str(REMOTE_DIR))
 
-_spec = importlib.util.spec_from_file_location(
-    "provision", Path(__file__).resolve().parents[1] / "remote" / "provision.py"
-)
-provision = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(provision)
+import provision
 
 
 # ── Fixtures ─────────────────────────────────────────────────────

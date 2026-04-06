@@ -28,9 +28,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from collections import Counter
+from collections import defaultdict
+from pathlib import Path
 
+import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -187,9 +190,6 @@ def print_value_counts(series, top: int, show_bars: bool = True,
 
 def plot_progression(df, bin_width: int = 128):
     """Plot frame density across game progression (world-stage-x_bin), colored by level."""
-    import matplotlib.pyplot as plt
-    from collections import defaultdict
-
     # Columns needed: ram_075f (world), ram_075c (stage), ram_006d (x_page), ram_0086 (x_screen)
     for col in ("ram_075f", "ram_075c", "ram_006d", "ram_0086"):
         if col not in df.columns:
@@ -424,9 +424,6 @@ def show_x_bins(df, bin_width: int = 128, top: int = 30,
 
 def sample_frames(recordings, df, mask, title: str, count: int = 9):
     """Show random frames from recordings matching a boolean mask."""
-    import cv2
-    import matplotlib.pyplot as plt
-
     matching = df.index[mask].values
 
     if len(matching) == 0:
@@ -693,8 +690,6 @@ def main():
 
     # Optional plot
     if args.plot:
-        import matplotlib.pyplot as plt
-
         fig, axes = plt.subplots(1, len(args.columns), figsize=(6 * len(args.columns), 4))
         if len(args.columns) == 1:
             axes = [axes]

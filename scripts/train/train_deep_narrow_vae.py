@@ -122,16 +122,11 @@ def parse_args() -> argparse.Namespace:
         help="Dtype for one-hot input tensors (reduces memory vs float32 when using float16/bfloat16).",
     )
     parser.add_argument(
-        "--autocast",
-        action="store_true",
-        help="Enable CUDA autocast for model forward paths.",
-    )
-    parser.add_argument(
-        "--autocast-dtype",
+        "--mixed-precision",
         type=str,
-        default="bfloat16",
-        choices=["float16", "bfloat16"],
-        help="Compute dtype for --autocast.",
+        default="bf16",
+        choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode passed to Accelerator.",
     )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--focal-gamma", type=float, default=1.0,
@@ -300,14 +295,9 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mixed_precision = "no"
-    if args.autocast and torch.cuda.is_available():
-        mixed_precision = "bf16" if args.autocast_dtype == "bfloat16" else "fp16"
-        if mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
-            mixed_precision = "fp16"
     runtime = create_accelerator_runtime(
         output_dir=output_dir,
-        mixed_precision=mixed_precision,
+        mixed_precision=args.mixed_precision,
     )
     accelerator = runtime.accelerator
     device = runtime.device
@@ -331,19 +321,8 @@ def main() -> None:
         "bfloat16": torch.bfloat16,
     }
     onehot_dtype = onehot_dtype_map[args.onehot_dtype]
-    if args.autocast and device.type != "cuda" and is_main_process:
-        console.print("[autocast] Requested but CUDA is unavailable; disabling autocast.")
-    if (
-        args.autocast
-        and args.autocast_dtype == "bfloat16"
-        and torch.cuda.is_available()
-        and not torch.cuda.is_bf16_supported()
-        and is_main_process
-    ):
-        console.print("[autocast] bfloat16 unsupported on this GPU; falling back to float16.")
-    if mixed_precision != "no" and is_main_process:
-        label = "bf16" if mixed_precision == "bf16" else "fp16"
-        console.print(f"[autocast] Enabled ({label})")
+    if args.mixed_precision != "no" and is_main_process:
+        console.print(f"[mixed-precision] Enabled ({args.mixed_precision})")
 
     system_info = collect_system_info()
     if is_main_process:
@@ -548,7 +527,7 @@ def main() -> None:
         model_name="deep_narrow_vae",
         args=args,
         device=device,
-        mixed_precision=mixed_precision,
+        mixed_precision=args.mixed_precision,
         num_processes=accelerator.num_processes,
         data={
             "num_colors": int(num_colors),

@@ -280,7 +280,7 @@ Training the palette-based video tokenizer is memory-heavy. The one-hot input te
 
 **Approach:**
 
-Two changes: (1) replaced `F.one_hot` with a `scatter_`-based `indices_to_onehot` that writes directly into a tensor of the desired dtype (float32, float16, or bfloat16 via `--onehot-dtype`), avoiding the large int64 intermediate entirely. (2) Added `--autocast` with bfloat16 to run the model forward/backward in half precision.
+Two changes: (1) replaced `F.one_hot` with a `scatter_`-based `indices_to_onehot` that writes directly into a tensor of the desired dtype (float32, float16, or bfloat16 via `--onehot-dtype`), avoiding the large int64 intermediate entirely. (2) Added Accelerator mixed precision support via `--mixed-precision bf16` to run the model forward/backward in half precision.
 
 **Result:**
 

@@ -27,9 +27,14 @@ import glob
 import hashlib
 import json
 import shutil
+import time
 
 import numpy as np
 import pygame
+import pyglet.window.key as pkey
+import stable_retro as retro
+from nes_py._rom import ROM
+from nes_py.nes_env import NESEnv
 
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
@@ -37,14 +42,6 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from data.gamepad import GamepadState
-
-try:
-    import stable_retro as retro
-except ImportError:
-    try:
-        import retro
-    except ImportError:
-        retro = None
 
 # --- Configuration ---
 ROM_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'nes')
@@ -150,7 +147,6 @@ def discover_roms():
     backend is 'nes_py' for mappers 0-3, 'retro' if stable-retro is available,
     or None if neither can handle the ROM.
     """
-    from nes_py._rom import ROM
     roms = []
     for path in sorted(glob.glob(os.path.join(ROM_DIR, '*.nes'))):
         basename = os.path.basename(path)
@@ -159,16 +155,11 @@ def discover_roms():
             r = ROM(path)
             if r.mapper in SUPPORTED_MAPPERS:
                 backend = 'nes_py'
-            elif retro is not None:
-                backend = 'retro'
             else:
-                backend = None
+                backend = 'retro'
             roms.append((name, path, r.mapper, backend))
         except Exception:
-            if retro is not None:
-                roms.append((name, path, -1, 'retro'))
-            else:
-                roms.append((name, path, -1, None))
+            roms.append((name, path, -1, 'retro'))
     return roms
 
 
@@ -330,7 +321,6 @@ def main():
 
 def _run_nes_py(name, path, show_ram=False, scale=DEFAULT_SCALE, ram_cell=RAM_CELL, decoder=None):
     """Game loop using nes_py + pygame."""
-    from nes_py.nes_env import NESEnv
     env = NESEnv(path)
     obs = env.reset()
     h, w, _ = obs.shape
@@ -637,8 +627,6 @@ def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
 
 def _run_retro(name, path, scale=DEFAULT_SCALE):
     """Game loop using stable-retro's native viewer (pyglet) at given scale."""
-    import pyglet.window.key as pkey
-
     # Pyglet key -> NES button name (same bindings as pygame KEY_MAP)
     PYGLET_KEY_MAP = {
         pkey.RIGHT: 'RIGHT', pkey.D: 'RIGHT',
@@ -687,8 +675,6 @@ def _run_retro(name, path, scale=DEFAULT_SCALE):
 
     # Gamepad via evdev / USB (does not need pygame)
     gamepad = GamepadState(extended_button_codes=True)
-
-    import time
     target_dt = 1.0 / FPS
 
     while env.viewer.isopen and not quit_requested:

@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import diffusers
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from PIL import Image
@@ -42,6 +43,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from data.latent_dataset import LatentSequenceDataset
+from models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
 from models.video_vae import VideoVAE
 from path_utils import resolve_workspace_path
 from system_info import collect_system_info, print_system_info
@@ -354,25 +356,7 @@ def compute_flow_loss(
 
 
 def build_video_latent_dit(*, model_config: dict) -> torch.nn.Module:
-    try:
-        from models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
-    except ModuleNotFoundError as exc:
-        if exc.name == "diffusers":
-            raise RuntimeError(
-                "Diffusers backend is required but the 'diffusers' package is not installed in this env. "
-                "Install it with: conda run -n mario pip install diffusers"
-            ) from exc
-        raise
     return VideoLatentDiTDiffusers(**model_config)
-
-
-def maybe_diffusers_version() -> str | None:
-    try:
-        import diffusers
-
-        return str(diffusers.__version__)
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -724,13 +708,10 @@ def main() -> None:
         max_frames=args.max_frames,
     )
     model: torch.nn.Module = build_video_latent_dit(model_config=model_config).to(device)
-    diffusers_version = maybe_diffusers_version()
+    diffusers_version = str(diffusers.__version__)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if accelerator.is_main_process:
-        backend_line = "[model] backend=diffusers"
-        if diffusers_version is not None:
-            backend_line += f" diffusers={diffusers_version}"
-        console.print(backend_line)
+        console.print(f"[model] backend=diffusers diffusers={diffusers_version}")
         console.print(f"[model] {num_params:,} trainable parameters")
 
     if args.compile:

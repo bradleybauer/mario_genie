@@ -85,6 +85,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-fc-blocks", type=int, default=2)
     parser.add_argument("--n-temporal-blocks", type=int, default=2)
     parser.add_argument("--temporal-kernel-size", type=int, default=3)
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="bf16",
+        choices=["no", "fp16", "bf16"],
+        help="Mixed precision mode passed to Accelerator.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
@@ -207,7 +214,7 @@ def main() -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
+    runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision=args.mixed_precision)
     accelerator = runtime.accelerator
     device = runtime.device
     is_main_process = runtime.is_main_process
@@ -218,6 +225,8 @@ def main() -> None:
         configure_cuda_runtime()
         if is_main_process:
             console.print("[tf32] TF32 matmul precision enabled")
+    if args.mixed_precision != "no" and is_main_process:
+        console.print(f"[mixed-precision] Enabled ({args.mixed_precision})")
 
     system_info = collect_system_info()
     if is_main_process:
@@ -333,7 +342,7 @@ def main() -> None:
         model_name="ram_vae",
         args=args,
         device=device,
-        mixed_precision="no",
+        mixed_precision=args.mixed_precision,
         num_processes=accelerator.num_processes,
         data={
             "n_bytes": int(n_bytes),

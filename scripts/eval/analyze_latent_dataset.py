@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -245,14 +246,6 @@ def build_action_row(index: int, stats: dict[str, Any], action_values: list[int]
     }
 
 
-def maybe_import_matplotlib():
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return None
-    return plt
-
-
 def build_lag_values(max_lag: int, lag_step: int) -> list[int]:
     """Return the evaluated lag values for pooled-state similarity."""
     if max_lag <= 0:
@@ -261,11 +254,6 @@ def build_lag_values(max_lag: int, lag_step: int) -> list[int]:
 
 
 def save_plots(output_dir: Path, summary: dict[str, Any], *, top_k: int) -> None:
-    plt = maybe_import_matplotlib()
-    if plt is None:
-        console.print("[yellow]matplotlib not available; skipping plots.[/yellow]")
-        return
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     channel_rows = summary["channel_rows"]
