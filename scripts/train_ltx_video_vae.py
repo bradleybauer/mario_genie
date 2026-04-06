@@ -10,26 +10,15 @@ import os
 import random
 import sys
 import time
-from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from accelerate import Accelerator
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -41,7 +30,26 @@ from mario_world_model.gan_training import LeCAMEMA, hinge_discriminator_loss, h
 from mario_world_model.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from mario_world_model.ltx_video_vae import LTXVideoVAE
 from mario_world_model.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from mario_world_model.palette_video_vae_training import (
+    evaluate_video_vae,
+    frames_to_one_hot,
+    save_video_preview,
+    split_context_targets,
+)
 from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.training_utils import (
+    ThroughputTracker,
+    build_eval_loader,
+    build_progress,
+    build_replacement_train_loader,
+    create_accelerator_runtime,
+    get_model_state_dict,
+    infinite_batches,
+    save_json,
+    save_metrics_json,
+    split_train_eval_dataset,
+    unwrap_model,
+)
 
 
 console = Console()
@@ -248,140 +256,23 @@ def make_output_dir(args: argparse.Namespace) -> Path:
     return PROJECT_ROOT / "checkpoints" / run_name
 
 
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return getattr(model, "_orig_mod", model)
-
-
-def frames_to_one_hot(
-    frames: torch.Tensor,
-    num_colors: int,
-    *,
-    dtype: torch.dtype = torch.float32,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if frames.ndim != 4:
-        raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
-
-    if frames.dtype != torch.long:
-        frames = frames.long()
-    expected_shape = (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3])
-    if (
-        out is None
-        or out.shape != expected_shape
-        or out.dtype != dtype
-        or out.device != frames.device
-    ):
-        out = torch.empty(expected_shape, dtype=dtype, device=frames.device)
-    out.zero_()
-    out.scatter_(1, frames.unsqueeze(1), 1)
-    return out
-
-
-def split_context_targets(
-    logits: torch.Tensor,
-    frames: torch.Tensor,
-    context_frames: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if context_frames <= 0:
-        return logits, frames
-    if context_frames >= frames.shape[1]:
-        raise ValueError(
-            f"context_frames ({context_frames}) must be smaller than total clip length ({frames.shape[1]})"
-        )
-    return logits[:, :, context_frames:], frames[:, context_frames:]
-
-
-def save_video_preview(path: Path, frames: torch.Tensor, logits: torch.Tensor, palette: torch.Tensor, max_frames: int = 8) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    frames = frames[0, :max_frames].detach().cpu()
-    recon = logits[0, :, :max_frames].argmax(dim=0).detach().cpu()
-    palette_u8 = (palette.detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-
-    target_rgb = palette_u8[frames.numpy()]
-    recon_rgb = palette_u8[recon.numpy()]
-    rows = [np.concatenate([target_rgb[idx], recon_rgb[idx]], axis=1) for idx in range(target_rgb.shape[0])]
-    Image.fromarray(np.concatenate(rows, axis=0)).save(path)
-
-
-def evaluate(
-    model: LTXVideoVAE,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    num_colors: int,
-    kl_weight: float,
-    context_frames: int = 0,
-    onehot_dtype: torch.dtype = torch.float32,
-    autocast_enabled: bool = False,
-    autocast_dtype: torch.dtype = torch.bfloat16,
-    focal_gamma: float = 0.0,
-    class_weight: torch.Tensor | None = None,
-) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
-    model.eval()
-    recon_losses: list[float] = []
-    kl_losses: list[float] = []
-    preview: tuple[torch.Tensor, torch.Tensor] | None = None
-    onehot_buffer: torch.Tensor | None = None
-
-    def autocast_context():
-        if not autocast_enabled:
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
-    with torch.no_grad():
-        for batch in loader:
-            frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-            onehot_buffer = inputs
-            with autocast_context():
-                outputs = model(inputs, sample_posterior=False)
-            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
-            recon_loss = focal_cross_entropy(
-                recon_logits,
-                recon_targets,
-                gamma=focal_gamma,
-                class_weight=class_weight,
-            )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
-            recon_losses.append(recon_loss.item())
-            kl_losses.append(kl_loss.item())
-            if preview is None:
-                with autocast_context():
-                    preview_out = model(inputs[:1], sample_posterior=False)
-                preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
-                del preview_out
-            del recon_logits, recon_targets, recon_loss, kl_loss, outputs, inputs, frames
-    model.train()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    if not recon_losses:
-        return {"recon_loss": 0.0, "kl_loss": 0.0, "loss": 0.0}, preview
-
-    mean_recon = float(np.mean(recon_losses))
-    mean_kl = float(np.mean(kl_losses))
-    return {
-        "recon_loss": mean_recon,
-        "kl_loss": mean_kl,
-        "loss": mean_recon + kl_weight * mean_kl,
-    }, preview
-
-
 def save_training_state(
     path: Path,
     *,
     model: torch.nn.Module,
-    optimizer: AdamW,
+    optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
+    accelerator: Accelerator | None = None,
     discriminator: torch.nn.Module | None = None,
-    discriminator_optimizer: AdamW | None = None,
+    discriminator_optimizer: torch.optim.Optimizer | None = None,
     lecam_ema: LeCAMEMA | None = None,
 ) -> None:
+    model_state = get_model_state_dict(model, accelerator=accelerator)
     state = {
-        "model": unwrap_model(model).state_dict(),
+        "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
@@ -389,7 +280,7 @@ def save_training_state(
         "metrics": metrics,
     }
     if discriminator is not None and discriminator_optimizer is not None:
-        state["discriminator"] = discriminator.state_dict()
+        state["discriminator"] = get_model_state_dict(discriminator, accelerator=accelerator)
         state["discriminator_optimizer"] = discriminator_optimizer.state_dict()
         if lecam_ema is not None:
             state["lecam_ema"] = lecam_ema.state_dict()
@@ -426,15 +317,33 @@ def main() -> None:
         raise SystemExit("--lecam-decay must be in (0, 1)")
     seed_everything(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    console.print(f"Using device: {device}")
+    output_dir = make_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    mixed_precision = "no"
+    if args.autocast and torch.cuda.is_available():
+        mixed_precision = "bf16" if args.autocast_dtype == "bfloat16" else "fp16"
+        if mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
+            mixed_precision = "fp16"
+    runtime = create_accelerator_runtime(
+        output_dir=output_dir,
+        mixed_precision=mixed_precision,
+    )
+    accelerator = runtime.accelerator
+    device = runtime.device
+    is_main_process = runtime.is_main_process
+
+    if is_main_process:
+        console.print(f"Using device: {device}")
     if torch.cuda.is_available():
         if args.tf16:
             torch.set_float32_matmul_precision("medium")
-            console.print("[tf16] TF16 matmul precision enabled")
+            if is_main_process:
+                console.print("[tf16] TF16 matmul precision enabled")
         else:
             torch.set_float32_matmul_precision("high")
-            console.print("[tf32] TF32 matmul precision enabled")
+            if is_main_process:
+                console.print("[tf32] TF32 matmul precision enabled")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -445,104 +354,77 @@ def main() -> None:
         "bfloat16": torch.bfloat16,
     }
     onehot_dtype = onehot_dtype_map[args.onehot_dtype]
-
-    autocast_dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    autocast_enabled = bool(args.autocast and device.type == "cuda")
-    autocast_dtype = autocast_dtype_map[args.autocast_dtype]
-    if args.autocast and device.type != "cuda":
+    if args.autocast and device.type != "cuda" and is_main_process:
         console.print("[autocast] Requested but CUDA is unavailable; disabling autocast.")
-    if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+    if (
+        args.autocast
+        and args.autocast_dtype == "bfloat16"
+        and torch.cuda.is_available()
+        and not torch.cuda.is_bf16_supported()
+        and is_main_process
+    ):
         console.print("[autocast] bfloat16 unsupported on this GPU; falling back to float16.")
-        autocast_dtype = torch.float16
-    if autocast_enabled:
-        label = "bf16" if autocast_dtype == torch.bfloat16 else "fp16"
+    if mixed_precision != "no" and is_main_process:
+        label = "bf16" if mixed_precision == "bf16" else "fp16"
         console.print(f"[autocast] Enabled ({label})")
 
-    grad_scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=autocast_enabled and autocast_dtype == torch.float16,
-    )
-
-    def autocast_context():
-        if not autocast_enabled:
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
     system_info = collect_system_info()
-    print_system_info(system_info)
-
-    output_dir = make_output_dir(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        print_system_info(system_info)
 
     total_clip_frames = args.clip_frames + args.context_frames
 
-    console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
-    dataset = NormalizedSequenceDataset(
-        data_dir=args.data_dir,
-        clip_frames=total_clip_frames,
-        num_workers=args.num_workers,
-        system_info=system_info,
-    )
-    console.print("[dataset] Index build complete.")
+    if is_main_process:
+        console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
+    with accelerator.main_process_first():
+        dataset = NormalizedSequenceDataset(
+            data_dir=args.data_dir,
+            clip_frames=total_clip_frames,
+            num_workers=args.num_workers,
+            system_info=system_info,
+        )
+    if is_main_process:
+        console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No training samples were found.")
-    console.print(
-        f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
-        f"({args.context_frames} context + {args.clip_frames} target)."
-    )
-    console.print(
-        f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-        f"{_format_bytes(dataset.dataset_bytes)} on disk."
-    )
+    if is_main_process:
+        console.print(
+            f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
+            f"({args.context_frames} context + {args.clip_frames} target)."
+        )
+        console.print(
+            f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
+            f"{_format_bytes(dataset.dataset_bytes)} on disk."
+        )
 
-    eval_dataset = None
-    train_dataset = dataset
-    if args.eval_samples > 0 and len(dataset) > args.eval_samples:
-        generator = torch.Generator().manual_seed(args.seed)
-        permutation = torch.randperm(len(dataset), generator=generator)
-        eval_indices = permutation[:args.eval_samples].tolist()
-        train_indices = permutation[args.eval_samples:].tolist()
-        eval_dataset = Subset(dataset, eval_indices)
-        train_dataset = Subset(dataset, train_indices)
+    train_dataset, eval_dataset = split_train_eval_dataset(
+        dataset,
+        eval_samples=args.eval_samples,
+        seed=args.seed,
+    )
+    if eval_dataset is not None and is_main_process:
         console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
 
-    num_workers = max(args.num_workers, 0)
-    train_sampler = RandomSampler(train_dataset, replacement=True, num_samples=10**7)
-    train_loader = DataLoader(
+    train_loader = build_replacement_train_loader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
     )
 
-    def batch_iter():
-        while True:
-            yield from train_loader
-
-    train_iter = batch_iter()
-
-    eval_loader = None
-    if eval_dataset is not None:
-        eval_batch_size = args.eval_batch_size or args.batch_size
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=eval_batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-        )
+    eval_batch_size = args.eval_batch_size or args.batch_size
+    eval_loader = build_eval_loader(
+        eval_dataset,
+        batch_size=eval_batch_size,
+        num_workers=0,
+        pin_memory=False,
+    )
 
     palette_path = Path(args.data_dir) / "palette.json"
     palette = load_palette_tensor(args.data_dir)
     num_colors = palette.shape[0]
-    console.print(f"[palette] Loaded {num_colors} colours from {palette_path}")
+    if is_main_process:
+        console.print(f"[palette] Loaded {num_colors} colours from {palette_path}")
     class_weight = None
     if args.use_class_weights:
         class_weight = load_class_weights(
@@ -552,12 +434,13 @@ def main() -> None:
             soften=args.class_weight_soften,
             device=device,
         )
-        console.print(
-            "[class-weights] Enabled from "
-            f"{Path(args.data_dir) / args.class_weights_file} "
-            f"(soften={args.class_weight_soften:.2f}, "
-            f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
-        )
+        if is_main_process:
+            console.print(
+                "[class-weights] Enabled from "
+                f"{Path(args.data_dir) / args.class_weights_file} "
+                f"(soften={args.class_weight_soften:.2f}, "
+                f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
+            )
     model = LTXVideoVAE(
         num_colors=num_colors,
         patch_size=args.patch_size,
@@ -576,21 +459,27 @@ def main() -> None:
         discriminator_num_parameters = count_trainable_parameters(discriminator)
         if args.use_lecam:
             lecam_ema = LeCAMEMA(decay=args.lecam_decay)
-        console.print(
-            f"[gan] Enabled discriminator {args.gan_target_size} "
-            f"({discriminator_num_parameters:,} params), "
-            f"gan_weight={args.gan_weight}, gan_lr={args.gan_lr:.2e}, "
-            f"gan_start_step={args.gan_start_step}, "
-            f"lecam={'on' if args.use_lecam else 'off'}"
-        )
+        if is_main_process:
+            console.print(
+                f"[gan] Enabled discriminator {args.gan_target_size} "
+                f"({discriminator_num_parameters:,} params), "
+                f"gan_weight={args.gan_weight}, gan_lr={args.gan_lr:.2e}, "
+                f"gan_start_step={args.gan_start_step}, "
+                f"lecam={'on' if args.use_lecam else 'off'}"
+            )
 
     if args.compile:
-        console.print("[compile] Compiling the model with torch.compile()...")
+        if is_main_process:
+            console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
         if discriminator is not None:
-            console.print("[compile] Compiling discriminator with torch.compile()...")
+            if is_main_process:
+                console.print("[compile] Compiling discriminator with torch.compile()...")
             discriminator = torch.compile(discriminator)
-        console.print("[compile] Compilation complete.")
+        if is_main_process:
+            console.print("[compile] Compilation complete.")
+
+    num_parameters = int(sum(parameter.numel() for parameter in model.parameters()))
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
     if discriminator is not None:
@@ -609,16 +498,19 @@ def main() -> None:
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     if warmup_steps > 0:
-        console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")
+        if is_main_process:
+            console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")
     else:
-        console.print("[lr] Cosine decay (no warmup)")
+        if is_main_process:
+            console.print("[lr] Cosine decay (no warmup)")
 
     start_step = 0
     best_eval = float("inf")
     metrics: list[dict[str, float]] = []
 
     if args.resume_from is not None:
-        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
+        with accelerator.main_process_first():
+            checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
         unwrap_model(model).load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
@@ -626,67 +518,76 @@ def main() -> None:
                 discriminator.load_state_dict(checkpoint["discriminator"])
                 discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
             else:
-                console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
+                if is_main_process:
+                    console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
             if args.use_lecam and lecam_ema is not None:
                 if "lecam_ema" in checkpoint:
                     lecam_ema.load_state_dict(checkpoint["lecam_ema"])
                 else:
-                    console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
+                    if is_main_process:
+                        console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"]) + 1
         best_eval = float(checkpoint.get("best_eval", float("inf")))
         metrics = list(checkpoint.get("metrics", []))
-        console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+        if is_main_process:
+            console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
 
         if args.max_steps > 0 and start_step >= args.max_steps:
-            console.print(
-                f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
-            )
+            if is_main_process:
+                console.print(
+                    f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
+                )
             return
+
+    if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
+        model, discriminator, optimizer, discriminator_optimizer, train_loader = accelerator.prepare(
+            model,
+            discriminator,
+            optimizer,
+            discriminator_optimizer,
+            train_loader,
+        )
+    else:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+    train_iter = infinite_batches(train_loader)
 
     config = vars(args).copy()
     config.update(
         {
             "model_name": "ltx_video_vae",
             "num_colors": int(num_colors),
-            "num_parameters": int(sum(parameter.numel() for parameter in model.parameters())),
+            "num_parameters": num_parameters,
             "discriminator_parameters": int(discriminator_num_parameters),
             "device": str(device),
+            "mixed_precision": mixed_precision,
+            "num_processes": int(accelerator.num_processes),
             "timestamp": datetime.now().isoformat(),
         }
     )
-    with (output_dir / "config.json").open("w") as handle:
-        json.dump(config, handle, indent=2)
-    console.print(f"Config saved to {output_dir / 'config.json'}")
-    console.print(json.dumps(config, indent=2))
+    if is_main_process:
+        save_json(output_dir / "config.json", config, indent=2)
+        console.print(f"Config saved to {output_dir / 'config.json'}")
+        console.print(json.dumps(config, indent=2))
 
-    console.print(f"Training LTX Video VAE on {len(train_dataset)} samples")
-    console.print(f"Output directory: {output_dir}")
-    console.print(f"Device: {device}")
-    console.print(f"Model parameters: {config['num_parameters']:,}")
+        console.print(f"Training LTX Video VAE on {len(train_dataset)} samples")
+        console.print(f"Output directory: {output_dir}")
+        console.print(f"Device: {device}")
+        console.print(f"Model parameters: {config['num_parameters']:,}")
+        if accelerator.num_processes > 1:
+            console.print(
+                f"Distributed training enabled with {accelerator.num_processes} processes "
+                f"(global batch={args.batch_size * accelerator.num_processes})."
+            )
 
     start_time = time.time()
-    perf_window_start = time.time()
-    perf_window_steps = 0
-    perf_window_samples = 0
-    samples_per_second = 0.0
-    steps_per_second = 0.0
-    perf_window_size = 20
+    throughput_tracker = ThroughputTracker(window_steps=20)
     bytes_per_sample = None
-    use_live_progress = sys.stdout.isatty()
+    use_live_progress = sys.stdout.isatty() and is_main_process
 
     total_train_steps = max(args.max_steps - start_step, 0)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[status]}"),
-        disable=not use_live_progress,
-        refresh_per_second=2,
-    ) as progress:
+    with build_progress(use_live=use_live_progress) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         onehot_buffer: torch.Tensor | None = None
@@ -712,7 +613,7 @@ def main() -> None:
                 )
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast_context():
+            with accelerator.autocast():
                 outputs = model(inputs)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, args.context_frames)
             recon_loss = focal_cross_entropy(
@@ -727,7 +628,7 @@ def main() -> None:
             fake_video_detached = None
             if gan_active and discriminator is not None:
                 set_requires_grad(discriminator, False)
-                with autocast_context():
+                with accelerator.autocast():
                     fake_video = outputs.logits.softmax(dim=1)
                     gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
                 fake_video_detached = fake_video.detach()
@@ -735,25 +636,16 @@ def main() -> None:
                 loss = loss + args.gan_weight * gen_adv_loss
                 del fake_video, gen_adv_loss
 
-            if grad_scaler.is_enabled():
-                grad_scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            if grad_scaler.is_enabled():
-                grad_scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
-            if grad_scaler.is_enabled():
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
-            else:
-                optimizer.step()
+            accelerator.backward(loss)
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            optimizer.step()
             scheduler.step()
             del outputs, recon_logits, recon_targets
 
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
-                with autocast_context():
+                with accelerator.autocast():
                     real_scores = discriminator(inputs)
                     fake_scores = discriminator(fake_video_detached)
                     discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
@@ -761,8 +653,8 @@ def main() -> None:
                         lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
                         gan_lecam_reg_value = lecam_reg.item()
                         discr_loss = discr_loss + args.lecam_weight * lecam_reg
-                discr_loss.backward()
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                accelerator.backward(discr_loss)
+                accelerator.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
                 discriminator_optimizer.step()
 
                 if args.use_lecam and lecam_ema is not None:
@@ -773,52 +665,49 @@ def main() -> None:
                 gan_fake_logit_value = fake_scores.mean().item()
                 del real_scores, fake_scores, discr_loss, fake_video_detached
 
-            perf_window_steps += 1
-            perf_window_samples += frames.shape[0]
-            now = time.time()
-            elapsed_window = max(now - perf_window_start, 1e-9)
-            if perf_window_steps >= perf_window_size:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-                perf_window_start = now
-                perf_window_steps = 0
-                perf_window_samples = 0
-            else:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-
-            status = (
-                f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
-                f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                f"gnorm={grad_norm:.2f} "
-                f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+            samples_per_second, steps_per_second = throughput_tracker.update(
+                samples=frames.shape[0] * accelerator.num_processes,
             )
-            stats = gpu_stats(device)
-            if "gpu_util_pct" in stats:
-                status += f" gpu={stats['gpu_util_pct']:.0f}%"
-            if "gpu_mem_pct" in stats:
-                status += f" mem={stats['gpu_mem_pct']:.0f}%"
-            if "gpu_temp_c" in stats:
-                status += f" temp={stats['gpu_temp_c']:.0f}C"
-            if bytes_per_sample is not None:
-                status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
-            if gan_active:
-                status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
-                if args.use_lecam:
-                    status += f" lecam={gan_lecam_reg_value:.4f}"
 
-            progress.update(
-                train_task,
-                advance=1,
-                status=status,
-            )
+            if is_main_process:
+                status = (
+                    f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
+                    f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                    f"gnorm={grad_norm:.2f} "
+                    f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+                )
+                stats = gpu_stats(device)
+                if "gpu_util_pct" in stats:
+                    status += f" gpu={stats['gpu_util_pct']:.0f}%"
+                if "gpu_mem_pct" in stats:
+                    status += f" mem={stats['gpu_mem_pct']:.0f}%"
+                if "gpu_temp_c" in stats:
+                    status += f" temp={stats['gpu_temp_c']:.0f}C"
+                if bytes_per_sample is not None:
+                    status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
+                if gan_active:
+                    status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
+                    if args.use_lecam:
+                        status += f" lecam={gan_lecam_reg_value:.4f}"
+
+                progress.update(
+                    train_task,
+                    advance=1,
+                    status=status,
+                )
 
             if (
                 ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
                 and not use_live_progress
+                and is_main_process
             ):
                 elapsed = time.time() - start_time
-                examples_per_second = ((step - start_step + 1) * args.batch_size) / max(elapsed, 1e-6)
+                examples_per_second = (
+                    (step - start_step + 1)
+                    * args.batch_size
+                    * accelerator.num_processes
+                    / max(elapsed, 1e-6)
+                )
                 log_console.print(
                     f"step={step:06d} loss={loss.item():.4f} recon={recon_loss.item():.4f} "
                     f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
@@ -831,12 +720,24 @@ def main() -> None:
                     )
                 )
 
-            should_eval = (
+            eval_due = (
                 eval_loader is not None
                 and (
                     (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
                     or step == args.max_steps - 1
                 )
+            )
+            should_checkpoint = (
+                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
+                or step == args.max_steps - 1
+            )
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
+
+            eval_line: str | None = None
+            should_eval = (
+                eval_due
+                and is_main_process
             )
             if should_eval:
                 if torch.cuda.is_available():
@@ -844,7 +745,7 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
                 try:
-                    eval_metrics, preview = evaluate(
+                    eval_metrics, preview = evaluate_video_vae(
                         model,
                         eval_loader,
                         device=device,
@@ -852,87 +753,82 @@ def main() -> None:
                         kl_weight=args.kl_weight,
                         context_frames=args.context_frames,
                         onehot_dtype=onehot_dtype,
-                        autocast_enabled=autocast_enabled,
-                        autocast_dtype=autocast_dtype,
                         focal_gamma=args.focal_gamma,
                         class_weight=class_weight,
+                        accelerator=accelerator,
                     )
                 except torch.cuda.OutOfMemoryError:
                     log_console.print("[eval][OOM] Eval pass OOM; skipping this eval window.")
                     if torch.cuda.is_available():
                         gc.collect()
                         torch.cuda.empty_cache()
-                    continue
+                else:
+                    eval_metrics["step"] = step
+                    eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                    metrics.append(eval_metrics)
+                    save_metrics_json(output_dir / "metrics.json", metrics)
 
-                eval_metrics["step"] = step
-                eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                metrics.append(eval_metrics)
-                with (output_dir / "metrics.json").open("w") as handle:
-                    json.dump(metrics, handle, indent=2)
-
-                eval_line = (
-                    f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
-                    f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
-                )
-
-                if preview is not None:
-                    save_video_preview(
-                        output_dir / f"preview_step_{step:06d}.png",
-                        preview[0],
-                        preview[1],
-                        palette,
-                        max_frames=total_clip_frames,
+                    eval_line = (
+                        f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
+                        f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
                     )
 
-                # Random training sample preview
-                with torch.no_grad():
-                    try:
-                        train_batch = next(train_iter)
-                        train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
-                        train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
-                        with autocast_context():
-                            train_outputs = model(train_inputs, sample_posterior=False)
+                    if preview is not None:
                         save_video_preview(
-                            output_dir / f"train_preview_step_{step:06d}.png",
-                            train_frames.detach().cpu(),
-                            train_outputs.logits.detach().cpu(),
+                            output_dir / f"preview_step_{step:06d}.png",
+                            preview[0],
+                            preview[1],
                             palette,
                             max_frames=total_clip_frames,
                         )
-                        del train_outputs, train_inputs, train_frames, train_batch
-                    except torch.cuda.OutOfMemoryError:
-                        log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
-                        if torch.cuda.is_available():
-                            gc.collect()
-                            torch.cuda.empty_cache()
 
-                del preview
-                if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    # Avoid desynchronizing data iteration across processes during distributed training.
+                    if accelerator.num_processes == 1:
+                        with torch.no_grad():
+                            try:
+                                train_batch = next(train_iter)
+                                train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
+                                train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                                with accelerator.autocast():
+                                    train_outputs = model(train_inputs, sample_posterior=False)
+                                save_video_preview(
+                                    output_dir / f"train_preview_step_{step:06d}.png",
+                                    train_frames.detach().cpu(),
+                                    train_outputs.logits.detach().cpu(),
+                                    palette,
+                                    max_frames=total_clip_frames,
+                                )
+                                del train_outputs, train_inputs, train_frames, train_batch
+                            except torch.cuda.OutOfMemoryError:
+                                log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
+                                if torch.cuda.is_available():
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
 
-                if eval_metrics["loss"] < best_eval:
-                    best_eval = eval_metrics["loss"]
-                    save_training_state(
-                        output_dir / "video_vae_best.pt",
-                        model=model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        step=step,
-                        best_eval=best_eval,
-                        metrics=metrics,
-                        discriminator=discriminator,
-                        discriminator_optimizer=discriminator_optimizer,
-                        lecam_ema=lecam_ema,
-                    )
-                    eval_line += f" | best={best_eval:.6f}"
+                    del preview
+                    if torch.cuda.is_available():
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
-            )
-            if should_checkpoint:
-                if should_eval:
+                    if eval_metrics["loss"] < best_eval:
+                        best_eval = eval_metrics["loss"]
+                        save_training_state(
+                            output_dir / "video_vae_best.pt",
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            step=step,
+                            best_eval=best_eval,
+                            metrics=metrics,
+                            accelerator=accelerator,
+                            discriminator=discriminator,
+                            discriminator_optimizer=discriminator_optimizer,
+                            lecam_ema=lecam_ema,
+                        )
+                        eval_line += f" | best={best_eval:.6f}"
+
+            if should_checkpoint and is_main_process:
+                if eval_line is not None:
                     eval_line += " | saved latest"
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
@@ -944,13 +840,17 @@ def main() -> None:
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,
+                    accelerator=accelerator,
                     discriminator=discriminator,
                     discriminator_optimizer=discriminator_optimizer,
                     lecam_ema=lecam_ema,
                 )
 
-            if should_eval:
+            if eval_line is not None and is_main_process:
                 log_console.print(eval_line)
+
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

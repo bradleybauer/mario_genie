@@ -20,20 +20,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -45,7 +34,25 @@ from mario_world_model.gan_discriminator import build_palette_discriminator, cou
 from mario_world_model.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from mario_world_model.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from mario_world_model.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from mario_world_model.palette_video_vae_training import (
+    evaluate_video_vae,
+    frames_to_one_hot,
+    save_video_preview,
+    split_context_targets,
+)
 from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.training_utils import (
+    ThroughputTracker,
+    build_eval_loader,
+    build_progress,
+    build_replacement_train_loader,
+    get_model_state_dict,
+    infinite_batches,
+    save_json,
+    save_metrics_json,
+    split_train_eval_dataset,
+    unwrap_model,
+)
 
 
 console = Console()
@@ -268,140 +275,21 @@ def make_output_dir(args: argparse.Namespace) -> Path:
     return PROJECT_ROOT / "checkpoints" / run_name
 
 
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return getattr(model, "_orig_mod", model)
-
-
-def frames_to_one_hot(
-    frames: torch.Tensor,
-    num_colors: int,
-    *,
-    dtype: torch.dtype = torch.float32,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    if frames.ndim != 4:
-        raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
-
-    if frames.dtype != torch.long:
-        frames = frames.long()
-    expected_shape = (frames.shape[0], num_colors, frames.shape[1], frames.shape[2], frames.shape[3])
-    if (
-        out is None
-        or out.shape != expected_shape
-        or out.dtype != dtype
-        or out.device != frames.device
-    ):
-        out = torch.empty(expected_shape, dtype=dtype, device=frames.device)
-    out.zero_()
-    out.scatter_(1, frames.unsqueeze(1), 1)
-    return out
-
-
-def split_context_targets(
-    logits: torch.Tensor,
-    frames: torch.Tensor,
-    context_frames: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if context_frames <= 0:
-        return logits, frames
-    if context_frames >= frames.shape[1]:
-        raise ValueError(
-            f"context_frames ({context_frames}) must be smaller than total clip length ({frames.shape[1]})"
-        )
-    return logits[:, :, context_frames:], frames[:, context_frames:]
-
-
-def save_video_preview(path: Path, frames: torch.Tensor, logits: torch.Tensor, palette: torch.Tensor, max_frames: int = 8) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    frames = frames[0, :max_frames].detach().cpu()
-    recon = logits[0, :, :max_frames].argmax(dim=0).detach().cpu()
-    palette_u8 = (palette.detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-
-    target_rgb = palette_u8[frames.numpy()]
-    recon_rgb = palette_u8[recon.numpy()]
-    rows = [np.concatenate([target_rgb[idx], recon_rgb[idx]], axis=1) for idx in range(target_rgb.shape[0])]
-    Image.fromarray(np.concatenate(rows, axis=0)).save(path)
-
-
-def evaluate(
-    model: DeepNarrowVideoVAE,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    num_colors: int,
-    kl_weight: float,
-    context_frames: int = 0,
-    onehot_dtype: torch.dtype = torch.float32,
-    autocast_enabled: bool = False,
-    autocast_dtype: torch.dtype = torch.bfloat16,
-    focal_gamma: float = 0.0,
-    class_weight: torch.Tensor | None = None,
-) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
-    model.eval()
-    recon_losses: list[float] = []
-    kl_losses: list[float] = []
-    preview: tuple[torch.Tensor, torch.Tensor] | None = None
-    onehot_buffer: torch.Tensor | None = None
-
-    def autocast_context():
-        if not autocast_enabled:
-            return nullcontext()
-        return torch.autocast(device_type="cuda", dtype=autocast_dtype)
-
-    with torch.no_grad():
-        for batch in loader:
-            frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-            onehot_buffer = inputs
-            with autocast_context():
-                outputs = model(inputs, sample_posterior=False)
-            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
-            recon_loss = focal_cross_entropy(
-                recon_logits,
-                recon_targets,
-                gamma=focal_gamma,
-                class_weight=class_weight,
-            )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
-            recon_losses.append(recon_loss.item())
-            kl_losses.append(kl_loss.item())
-            if preview is None:
-                with autocast_context():
-                    preview_out = model(inputs[:1], sample_posterior=False)
-                preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
-                del preview_out
-            del recon_logits, recon_targets, recon_loss, kl_loss, outputs, inputs, frames
-    model.train()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    if not recon_losses:
-        return {"recon_loss": 0.0, "kl_loss": 0.0, "loss": 0.0}, preview
-
-    mean_recon = float(np.mean(recon_losses))
-    mean_kl = float(np.mean(kl_losses))
-    return {
-        "recon_loss": mean_recon,
-        "kl_loss": mean_kl,
-        "loss": mean_recon + kl_weight * mean_kl,
-    }, preview
-
-
 def save_training_state(
     path: Path,
     *,
     model: torch.nn.Module,
-    optimizer: AdamW,
+    optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
     discriminator: torch.nn.Module | None = None,
-    discriminator_optimizer: AdamW | None = None,
+    discriminator_optimizer: torch.optim.Optimizer | None = None,
     lecam_ema: LeCAMEMA | None = None,
 ) -> None:
     state = {
-        "model": unwrap_model(model).state_dict(),
+        "model": get_model_state_dict(model),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
@@ -409,7 +297,7 @@ def save_training_state(
         "metrics": metrics,
     }
     if discriminator is not None and discriminator_optimizer is not None:
-        state["discriminator"] = discriminator.state_dict()
+        state["discriminator"] = get_model_state_dict(discriminator)
         state["discriminator_optimizer"] = discriminator_optimizer.state_dict()
         if lecam_ema is not None:
             state["lecam_ema"] = lecam_ema.state_dict()
@@ -423,7 +311,7 @@ def gpu_stats(device: torch.device) -> dict[str, float]:
     stats: dict[str, float] = {}
     try:
         mem_used = torch.cuda.memory_allocated(index) / 2**30
-        mem_total = torch.cuda.get_device_properties(index).total_mem / 2**30
+        mem_total = torch.cuda.get_device_properties(index).total_memory / 2**30
         stats["gpu_mem_pct"] = round(100.0 * mem_used / max(mem_total, 1e-9), 1)
     except Exception:
         pass
@@ -518,46 +406,29 @@ def main() -> None:
         f"{_format_bytes(dataset.dataset_bytes)} on disk."
     )
 
-    eval_dataset = None
-    train_dataset = dataset
-    if args.eval_samples > 0 and len(dataset) > args.eval_samples:
-        generator = torch.Generator().manual_seed(args.seed)
-        permutation = torch.randperm(len(dataset), generator=generator)
-        eval_indices = permutation[:args.eval_samples].tolist()
-        train_indices = permutation[args.eval_samples:].tolist()
-        eval_dataset = Subset(dataset, eval_indices)
-        train_dataset = Subset(dataset, train_indices)
+    train_dataset, eval_dataset = split_train_eval_dataset(
+        dataset,
+        eval_samples=args.eval_samples,
+        seed=args.seed,
+    )
+    if eval_dataset is not None:
         console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
 
-    num_workers = max(args.num_workers, 0)
-    train_sampler = RandomSampler(train_dataset, replacement=True, num_samples=10**7)
-    train_loader = DataLoader(
+    train_loader = build_replacement_train_loader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
     )
+    train_iter = infinite_batches(train_loader)
 
-    def batch_iter():
-        while True:
-            yield from train_loader
-
-    train_iter = batch_iter()
-
-    eval_loader = None
-    if eval_dataset is not None:
-        eval_batch_size = args.eval_batch_size or args.batch_size
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=eval_batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-        )
+    eval_batch_size = args.eval_batch_size or args.batch_size
+    eval_loader = build_eval_loader(
+        eval_dataset,
+        batch_size=eval_batch_size,
+        num_workers=0,
+        pin_memory=False,
+    )
 
     palette_path = Path(args.data_dir) / "palette.json"
     palette = load_palette_tensor(args.data_dir)
@@ -699,8 +570,7 @@ def main() -> None:
             "timestamp": datetime.now().isoformat(),
         }
     )
-    with (output_dir / "config.json").open("w") as handle:
-        json.dump(config, handle, indent=2)
+    save_json(output_dir / "config.json", config, indent=2)
     console.print(f"Config saved to {output_dir / 'config.json'}")
     console.print(json.dumps(config, indent=2))
 
@@ -710,27 +580,12 @@ def main() -> None:
     console.print(f"Model parameters: {num_parameters:,}")
 
     start_time = time.time()
-    perf_window_start = time.time()
-    perf_window_steps = 0
-    perf_window_samples = 0
-    samples_per_second = 0.0
-    steps_per_second = 0.0
-    perf_window_size = 20
+    throughput_tracker = ThroughputTracker(window_steps=20)
     bytes_per_sample = None
     use_live_progress = sys.stdout.isatty()
 
     total_train_steps = max(args.max_steps - start_step, 0)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[status]}"),
-        disable=not use_live_progress,
-        refresh_per_second=2,
-    ) as progress:
+    with build_progress(use_live=use_live_progress) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         onehot_buffer: torch.Tensor | None = None
@@ -817,19 +672,7 @@ def main() -> None:
                 gan_fake_logit_value = fake_scores.mean().item()
                 del real_scores, fake_scores, discr_loss, fake_video_detached
 
-            perf_window_steps += 1
-            perf_window_samples += frames.shape[0]
-            now = time.time()
-            elapsed_window = max(now - perf_window_start, 1e-9)
-            if perf_window_steps >= perf_window_size:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-                perf_window_start = now
-                perf_window_steps = 0
-                perf_window_samples = 0
-            else:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
+            samples_per_second, steps_per_second = throughput_tracker.update(samples=frames.shape[0])
 
             status = (
                 f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
@@ -888,7 +731,7 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
                 try:
-                    eval_metrics, preview = evaluate(
+                    eval_metrics, preview = evaluate_video_vae(
                         model,
                         eval_loader,
                         device=device,
@@ -911,8 +754,7 @@ def main() -> None:
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 metrics.append(eval_metrics)
-                with (output_dir / "metrics.json").open("w") as handle:
-                    json.dump(metrics, handle, indent=2)
+                save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
                     f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "

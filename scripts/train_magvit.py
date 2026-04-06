@@ -37,7 +37,6 @@ from mario_world_model.config import IMAGE_SIZE
 from mario_world_model.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from mario_world_model.model_configs import MODEL_CONFIGS, MODEL_CONFIGS_BY_NAME
 from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
-from mario_world_model.lfq import swap_tokenizer_lfq
 from mario_world_model.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
 from mario_world_model.system_info import collect_system_info, print_system_info, get_available_memory, get_effective_cpu_count
@@ -741,9 +740,6 @@ def train():
     # Drop unused discriminator (use_gan=False, but upstream still creates 52M+ params)
     tokenizer.discr = None
     tokenizer.multiscale_discrs = None
-    if args.lfq_entropy_mode != "legacy":
-        swap_tokenizer_lfq(tokenizer, entropy_mode=args.lfq_entropy_mode)
-        print(f"[lfq] Using {args.lfq_entropy_mode} entropy estimator")
 
     discriminator = None
     discriminator_optimizer = None

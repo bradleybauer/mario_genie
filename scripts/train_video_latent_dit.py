@@ -28,23 +28,14 @@ from typing import Any
 import numpy as np
 import torch
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import set_seed
 from PIL import Image
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from safetensors.torch import load_file as safetensors_load, save_file as safetensors_save
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, Subset
+from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -55,6 +46,18 @@ from mario_world_model.latent_dataset import LatentSequenceDataset
 from mario_world_model.ltx_video_vae import LTXVideoVAE
 from mario_world_model.path_utils import resolve_workspace_path
 from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.training_utils import (
+    ThroughputTracker,
+    build_eval_loader,
+    build_progress,
+    build_replacement_train_loader,
+    create_accelerator_runtime,
+    infinite_batches,
+    save_json,
+    save_metrics_json,
+    split_train_eval_dataset,
+    unwrap_model,
+)
 
 console = Console()
 
@@ -434,8 +437,7 @@ def save_model_checkpoint(
     metrics: list,
 ) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    raw = getattr(model, "_orig_mod", model)
-    raw = getattr(raw, "module", raw)
+    raw = unwrap_model(model)
     safetensors_save(raw.state_dict(), path / "model.safetensors")
 
     # Persist a native Diffusers bundle when using a ModelMixin backend.
@@ -452,13 +454,11 @@ def save_model_checkpoint(
     }
     with (path / "meta.json").open("w") as fh:
         json.dump(meta, fh, indent=2)
-    with (path / "metrics.json").open("w") as fh:
-        json.dump(metrics, fh, indent=2)
+    save_metrics_json(path / "metrics.json", metrics)
 
 
 def load_model_weights(model: torch.nn.Module, path: Path) -> None:
-    raw = getattr(model, "_orig_mod", model)
-    raw = getattr(raw, "module", raw)
+    raw = unwrap_model(model)
     raw.load_state_dict(safetensors_load(path / "model.safetensors"))
 
 
@@ -580,10 +580,11 @@ def main() -> None:
     output_dir = make_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    accelerator = Accelerator(
+    runtime = create_accelerator_runtime(
+        output_dir=output_dir,
         mixed_precision=args.mixed_precision,
-        project_config=ProjectConfiguration(project_dir=str(output_dir)),
     )
+    accelerator = runtime.accelerator
     device = accelerator.device
 
     if torch.cuda.is_available():
@@ -615,29 +616,28 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError("No training samples found.")
 
-    generator = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(dataset), generator=generator)
-    eval_dataset = Subset(dataset, perm[:args.eval_samples].tolist()) if args.eval_samples > 0 else None
-    train_dataset = Subset(dataset, perm[args.eval_samples:].tolist()) if eval_dataset else dataset
+    train_dataset, eval_dataset = split_train_eval_dataset(
+        dataset,
+        eval_samples=args.eval_samples,
+        seed=args.seed,
+    )
 
     if accelerator.is_main_process:
         console.print(f"Found {len(dataset)} segments of {args.clip_frames} frames.")
         if eval_dataset:
             console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train")
 
-    train_loader = DataLoader(
+    train_loader = build_replacement_train_loader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=RandomSampler(train_dataset, replacement=True, num_samples=10 ** 7),
-        num_workers=max(args.num_workers, 0),
+        num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None,
     )
-    eval_loader = (
-        DataLoader(eval_dataset, batch_size=args.eval_batch_size or args.batch_size, num_workers=0)
-        if eval_dataset
-        else None
+    eval_loader = build_eval_loader(
+        eval_dataset,
+        batch_size=args.eval_batch_size or args.batch_size,
+        num_workers=0,
+        pin_memory=False,
     )
 
     # ------------------------------------------------------------------
@@ -810,24 +810,23 @@ def main() -> None:
     # Save training config
     # ------------------------------------------------------------------
     if accelerator.is_main_process:
-        with (output_dir / "config.json").open("w") as fh:
-            json.dump({
+        save_json(
+            output_dir / "config.json",
+            {
                 "model_config": model_config,
                 "training": vars(args),
                 "mixed_precision": args.mixed_precision,
                 "model_backend": "diffusers",
                 "diffusers_version": diffusers_version,
-            }, fh, indent=2)
+            },
+            indent=2,
+        )
 
     error_buffer = ResidualErrorBuffer(args.error_buffer_size, clip_abs=args.error_buffer_clip)
 
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    def _batch_iter():
-        while True:
-            yield from train_loader
-
     def _component_gnorms(raw_model: torch.nn.Module) -> dict[str, float]:
         groups: dict[str, list[torch.Tensor]] = {
             "enc_attn": [
@@ -858,26 +857,16 @@ def main() -> None:
             for k, ps in groups.items() if ps
         }
 
-    train_iter = _batch_iter()
-    start_time = time.time()
+    train_iter = infinite_batches(train_loader)
     use_live = sys.stdout.isatty() and accelerator.is_main_process
+    throughput_tracker = ThroughputTracker(window_steps=20)
     loss_window: deque[float] = deque(maxlen=100)
     train_log_path = output_dir / "train_log.jsonl"
 
     if accelerator.is_main_process:
         console.print(f"Training on {len(train_dataset)} samples | output: {output_dir}")
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[status]}"),
-        disable=not use_live,
-        refresh_per_second=2,
-    ) as progress:
+    with build_progress(use_live=use_live) as progress:
         log_console = progress.console
         task = progress.add_task("Training", total=max(args.max_steps - start_step, 0), status="")
 
@@ -952,15 +941,18 @@ def main() -> None:
                     error_buffer.add_batch(eps - v_pred - future)
                 loss_window.append(loss.item())
 
+            samples_per_second, _ = throughput_tracker.update(
+                samples=latents.shape[0] * accelerator.num_processes,
+            )
+
             progress.update(task, advance=1, status=(
                 f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e} "
                 f"gnorm={grad_norm:.2f}"
                 + (f" errbuf={len(error_buffer)}" if not skipped else " skip=gradnorm")
+                + f" sps={samples_per_second:.1f}"
             ))
 
             if should_log:
-                elapsed = max(time.time() - start_time, 1e-6)
-                sps = ((step - start_step + 1) * args.batch_size) / elapsed
                 with torch.no_grad():
                     v_pred_norm = v_pred.detach().float().norm(dim=1).mean().item()
                     v_target_norm = v_target.detach().float().norm(dim=1).mean().item()
@@ -976,7 +968,7 @@ def main() -> None:
                     "t_std": float(t.std().item()),
                     "v_pred_norm": v_pred_norm,
                     "v_target_norm": v_target_norm,
-                    "samples_per_sec": sps,
+                    "samples_per_sec": samples_per_second,
                     "skipped": skipped,
                 }
                 with train_log_path.open("a") as fh:
@@ -986,7 +978,7 @@ def main() -> None:
                         f"step={step:06d} loss={train_entry['loss']:.5f} smooth={train_entry['loss_smooth']:.5f} "
                         f"lr={train_entry['lr']:.2e} gnorm={grad_norm:.2f} "
                         + " ".join(f"{k}={v:.2f}" for k, v in cgnorms.items())
-                        + f" sps={sps:.1f}"
+                        + f" sps={samples_per_second:.1f}"
                     )
 
             # ------------------------------------------------------------------
@@ -1084,8 +1076,7 @@ def main() -> None:
                     accelerator.save_state(str(output_dir / "best" / "training_state"))
                     eval_line += f" | best={best_eval:.6f}"
 
-                with (output_dir / "metrics.json").open("w") as fh:
-                    json.dump(metrics, fh, indent=2)
+                save_metrics_json(output_dir / "metrics.json", metrics)
                 log_console.print(eval_line)
 
                 gc.collect()
