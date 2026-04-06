@@ -27,9 +27,6 @@ Adding the gan actually made video vae training more stable.
 The latent space is "smoother" than pixels? interesting.
 
 
-Could actually do data aug even with NES palette pixels (set random input pixels to random palette indices). I think I'd want to be careful with perturbing to rare colors since then the network would maybe just learn to ignore them, i.e. the overwhelming majority of appearances of the rarest colors would be cases the optimzier teaches the network to ignore.... So, instead I'll sample from the index distribution!
-
-
 Pretty neat idea for vq-vae/lfq to overcome approximation error of the straight-through estimator x + (f(x) - x).detach(): https://github.com/cfifty/rotation_trick
 
 
@@ -41,5 +38,3 @@ Benchmark xformers or FlashAttention after revisiting the DiT action masking; if
 For the sake of computational cost I might have the DiT target a tick rate of 15hz. Meaning the DiT would predict chunks of 4 frames per tick since mario runs at 60hz.
 
 VS. super mario bros and super mario bros the lost levels exist
-
-dont spam norms in trainer

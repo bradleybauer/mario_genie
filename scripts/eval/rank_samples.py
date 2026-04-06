@@ -147,9 +147,9 @@ def _build_model_from_config(config: dict, num_colors: int, device: torch.device
 
     model = VideoVAE(
         num_colors=num_colors,
-        patch_size=int(config.get("patch_size", 4)),
         base_channels=int(config.get("base_channels", 64)),
         latent_channels=int(config.get("latent_channels", 64)),
+        temporal_downsample=int(config.get("temporal_downsample", 0)),
     ).to(device)
     model.eval()
     return model

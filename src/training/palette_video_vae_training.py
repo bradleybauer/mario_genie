@@ -37,6 +37,53 @@ def frames_to_one_hot(
     return out
 
 
+def apply_palette_index_augmentation(
+    frames: torch.Tensor,
+    *,
+    sample_prob: float = 1.0,
+    replacement_prob: float,
+    replacement_probs: torch.Tensor,
+) -> torch.Tensor:
+    if frames.ndim != 4:
+        raise ValueError(f"Expected frames with shape (B, T, H, W), got {tuple(frames.shape)}")
+    if not (0.0 <= sample_prob <= 1.0):
+        raise ValueError("sample_prob must be in [0, 1]")
+    if not (0.0 <= replacement_prob <= 1.0):
+        raise ValueError("replacement_prob must be in [0, 1]")
+    if sample_prob == 0.0 or replacement_prob == 0.0:
+        return frames
+    if replacement_probs.ndim != 1:
+        raise ValueError("replacement_probs must be a 1D tensor")
+
+    num_classes = int(replacement_probs.numel())
+    if num_classes <= 0:
+        raise ValueError("replacement_probs must not be empty")
+    probs = replacement_probs.to(device=frames.device, dtype=torch.float32)
+    probs_sum = probs.sum()
+    if probs_sum <= 0:
+        raise ValueError("replacement_probs must sum to a positive value")
+    probs = probs / probs_sum
+
+    if frames.dtype != torch.long:
+        frames = frames.long()
+    if int(frames.max().item()) >= num_classes or int(frames.min().item()) < 0:
+        raise ValueError("frames contain palette indices outside the augmentation distribution")
+
+    sample_mask = torch.rand((frames.shape[0], 1, 1, 1), device=frames.device) < sample_prob
+    if not bool(sample_mask.any()):
+        return frames
+
+    replace_mask = sample_mask & (torch.rand(frames.shape, device=frames.device) < replacement_prob)
+    replace_count = int(replace_mask.sum().item())
+    if replace_count == 0:
+        return frames
+
+    augmented = frames.clone()
+    sampled = torch.multinomial(probs, num_samples=replace_count, replacement=True)
+    augmented[replace_mask] = sampled.to(device=frames.device, dtype=frames.dtype)
+    return augmented
+
+
 def split_context_targets(
     logits: torch.Tensor,
     frames: torch.Tensor,

@@ -17,15 +17,32 @@ from src.models.video_vae import VideoVAE
 
 
 def test_video_vae_preserves_video_shape() -> None:
-    model = VideoVAE(num_colors=8, patch_size=4, base_channels=8, latent_channels=4)
+    model = VideoVAE(num_colors=8, base_channels=8, latent_channels=4)
     video = torch.randn(2, 8, 4, 32, 32)
 
     output = model(video, sample_posterior=False)
 
     assert output.logits.shape == video.shape
-    assert output.posterior_mean.shape == (2, 4, 4, 2, 2)
-    assert output.posterior_logvar.shape == (2, 4, 4, 2, 2)
-    assert output.latents.shape == (2, 4, 4, 2, 2)
+    assert output.posterior_mean.shape == (2, 4, 4, 1, 1)
+    assert output.posterior_logvar.shape == (2, 4, 4, 1, 1)
+    assert output.latents.shape == (2, 4, 4, 1, 1)
+
+
+def test_video_vae_temporal_downsample_preserves_output_shape() -> None:
+    model = VideoVAE(
+        num_colors=8,
+        base_channels=8,
+        latent_channels=4,
+        temporal_downsample=1,
+    )
+    video = torch.randn(2, 8, 5, 32, 32)
+
+    output = model(video, sample_posterior=False)
+
+    assert output.logits.shape == video.shape
+    assert output.posterior_mean.shape == (2, 4, 3, 1, 1)
+    assert output.posterior_logvar.shape == (2, 4, 3, 1, 1)
+    assert output.latents.shape == (2, 4, 3, 1, 1)
 
 
 def test_audio_vae_preserves_mel_shape() -> None:

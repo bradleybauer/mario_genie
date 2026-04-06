@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the Video VAE (learned-upsample decoder)."""
+"""Train the Video VAE (symmetric 7x7-latent architecture)."""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +28,7 @@ from src.training.losses import focal_cross_entropy, softened_inverse_frequency_
 from src.models.video_vae import VideoVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from src.training.palette_video_vae_training import (
+    apply_palette_index_augmentation,
     evaluate_video_vae,
     frames_to_one_hot,
     save_video_preview,
@@ -66,7 +67,7 @@ console = Console()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the Video VAE (learned-upsample decoder).")
+    parser = argparse.ArgumentParser(description="Train the Video VAE (symmetric 7x7-latent architecture).")
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -74,15 +75,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--context-frames",
         type=int,
-        default=4,
+        default=8,
         help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=1000,
-                        help="Linear warmup from 0 to --lr over this many steps (default: 1000)")
-    parser.add_argument("--kl-weight", type=float, default=1e-4)
+    parser.add_argument("--warmup-steps", type=int, default=2000,
+                        help="Linear warmup from 0 to --lr over this many steps (default: 2000)")
+    parser.add_argument("--kl-weight", type=float, default=5e-4)
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
     parser.add_argument(
@@ -92,14 +93,24 @@ def parse_args() -> argparse.Namespace:
         help="Batch size for eval only (defaults to --batch-size).",
     )
     parser.add_argument("--log-interval", type=int, default=20)
-    parser.add_argument("--eval-interval", type=int, default=200)
+    parser.add_argument("--eval-interval", type=int, default=1000)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
-    parser.add_argument("--base-channels", type=int, default=64)
-    parser.add_argument("--latent-channels", type=int, default=64)
-    parser.add_argument("--patch-size", type=int, default=4,
-                        help="Encoder patchify size (decoder uses learned upsampling).")
+    parser.add_argument("--base-channels", type=int, default=24)
+    parser.add_argument("--latent-channels", type=int, default=16)
+    parser.add_argument(
+        "--temporal-downsample",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Number of temporal downsamples in the VAE bottleneck (0 or 1).",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tf16", action="store_true", help="Enable TF16 matmul precision")
+    parser.add_argument(
+        "--tf16",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TF16 matmul precision.",
+    )
     parser.add_argument(
         "--onehot-dtype",
         type=str,
@@ -114,12 +125,18 @@ def parse_args() -> argparse.Namespace:
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode passed to Accelerator.",
     )
-    parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the Video VAE with torch.compile.",
+    )
     parser.add_argument("--focal-gamma", type=float, default=1.0,
                         help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
     parser.add_argument(
         "--use-class-weights",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Enable class-weighted reconstruction loss using distribution JSON from --data-dir.",
     )
     parser.add_argument(
@@ -133,6 +150,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.2,
         help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
+    )
+    parser.add_argument(
+        "--palette-aug-sample-prob",
+        type=float,
+        default=0.5,
+        help="Per-sample probability of applying any palette augmentation at all.",
+    )
+    parser.add_argument(
+        "--palette-aug-prob",
+        type=float,
+        default=0.2,
+        help="Per-pixel probability of replacing an encoder input palette index once a sample is selected for augmentation.",
+    )
+    parser.add_argument(
+        "--palette-aug-file",
+        type=str,
+        default="palette_distribution.json",
+        help="Distribution JSON filename in --data-dir used to sample palette replacements for input corruption.",
     )
     parser.add_argument(
         "--use-gan",
@@ -189,6 +224,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--clip-frames must be > 0")
     if args.eval_batch_size is not None and args.eval_batch_size <= 0:
         parser.error("--eval-batch-size must be > 0")
+    if not (0.0 <= args.palette_aug_sample_prob <= 1.0):
+        parser.error("--palette-aug-sample-prob must be in [0, 1]")
+    if not (0.0 <= args.palette_aug_prob <= 1.0):
+        parser.error("--palette-aug-prob must be in [0, 1]")
     return args
 
 
@@ -228,6 +267,43 @@ def load_class_weights(
 
     weights = softened_inverse_frequency_weights(counts, soften=soften)
     return weights.to(device)
+
+
+def load_palette_probabilities(
+    data_dir: str,
+    *,
+    num_classes: int,
+    filename: str,
+    device: torch.device,
+) -> torch.Tensor:
+    dist_path = Path(data_dir) / filename
+    if not dist_path.is_file():
+        raise FileNotFoundError(
+            f"Palette augmentation distribution file not found: {dist_path}. "
+            "Run scripts/normalize.py first or disable --palette-aug-prob."
+        )
+
+    with dist_path.open() as handle:
+        dist = json.load(handle)
+
+    probs_data = dist.get("probabilities")
+    counts_data = dist.get("counts")
+    if probs_data is not None:
+        probs = torch.tensor(probs_data, dtype=torch.float32)
+    elif counts_data is not None:
+        probs = torch.tensor(counts_data, dtype=torch.float32)
+    else:
+        raise ValueError(
+            f"{dist_path} must contain either 'counts' or 'probabilities'"
+        )
+
+    if probs.ndim != 1 or probs.numel() != num_classes:
+        raise ValueError(
+            f"{dist_path} has {probs.numel()} classes but model expects {num_classes}"
+        )
+
+    probs = probs / probs.sum().clamp_min(1e-12)
+    return probs.to(device)
 
 
 def save_training_state(
@@ -380,11 +456,26 @@ def main() -> None:
                 f"(soften={args.class_weight_soften:.2f}, "
                 f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
             )
+    palette_aug_probs = None
+    if args.palette_aug_sample_prob > 0.0 and args.palette_aug_prob > 0.0:
+        palette_aug_probs = load_palette_probabilities(
+            args.data_dir,
+            num_classes=num_colors,
+            filename=args.palette_aug_file,
+            device=device,
+        )
+        if is_main_process:
+            console.print(
+                "[palette-aug] Enabled input corruption from "
+                f"{Path(args.data_dir) / args.palette_aug_file} "
+                f"(sample_p={args.palette_aug_sample_prob:.3f}, pixel_p={args.palette_aug_prob:.3f}, "
+                f"min={palette_aug_probs.min().item():.4f}, max={palette_aug_probs.max().item():.4f})"
+            )
     model = VideoVAE(
         num_colors=num_colors,
-        patch_size=args.patch_size,
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
+        temporal_downsample=args.temporal_downsample,
     ).to(device)
     discriminator = None
     discriminator_optimizer = None
@@ -502,7 +593,7 @@ def main() -> None:
             "discriminator_parameters": int(discriminator_num_parameters),
             "base_channels": int(args.base_channels),
             "latent_channels": int(args.latent_channels),
-            "patch_size": int(args.patch_size),
+            "temporal_downsample": int(args.temporal_downsample),
         },
     )
     if is_main_process:
@@ -530,10 +621,19 @@ def main() -> None:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         onehot_buffer: torch.Tensor | None = None
+        clean_onehot_buffer: torch.Tensor | None = None
         for step in range(start_step, args.max_steps):
             batch = next(train_iter)
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+            input_frames = frames
+            if palette_aug_probs is not None:
+                input_frames = apply_palette_index_augmentation(
+                    frames,
+                    sample_prob=args.palette_aug_sample_prob,
+                    replacement_prob=args.palette_aug_prob,
+                    replacement_probs=palette_aug_probs,
+                )
+            inputs = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
             onehot_buffer = inputs
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
@@ -565,6 +665,15 @@ def main() -> None:
             loss = recon_loss + args.kl_weight * kl_loss
 
             fake_video_detached = None
+            discriminator_real_inputs = inputs
+            if gan_active and discriminator is not None and palette_aug_probs is not None:
+                discriminator_real_inputs = frames_to_one_hot(
+                    frames,
+                    num_colors,
+                    dtype=onehot_dtype,
+                    out=clean_onehot_buffer,
+                )
+                clean_onehot_buffer = discriminator_real_inputs
             if gan_active and discriminator is not None:
                 set_requires_grad(discriminator, False)
                 with accelerator.autocast():
@@ -585,7 +694,7 @@ def main() -> None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
                 with accelerator.autocast():
-                    real_scores = discriminator(inputs)
+                    real_scores = discriminator(discriminator_real_inputs)
                     fake_scores = discriminator(fake_video_detached)
                     discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
                     if args.use_lecam and lecam_ema is not None:

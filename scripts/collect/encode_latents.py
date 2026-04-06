@@ -100,9 +100,9 @@ def load_video_vae(
     device: torch.device,
 ) -> tuple[torch.nn.Module, dict]:
     cfg = load_json(config_path)
-    patch_size = int(cfg.get("patch_size", 4))
     base_channels = int(cfg.get("base_channels", 64))
     latent_channels = int(cfg.get("latent_channels", 64))
+    temporal_downsample = int(cfg.get("temporal_downsample", 0))
     vae_num_colors = int(cfg.get("num_colors", num_colors))
 
     if vae_num_colors != num_colors:
@@ -112,9 +112,9 @@ def load_video_vae(
 
     vae = VideoVAE(
         num_colors=vae_num_colors,
-        patch_size=patch_size,
         base_channels=base_channels,
         latent_channels=latent_channels,
+        temporal_downsample=temporal_downsample,
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
@@ -125,12 +125,24 @@ def load_video_vae(
         p.requires_grad_(False)
 
     summary = {
-        "patch_size": patch_size,
         "base_channels": base_channels,
         "latent_channels": latent_channels,
+        "temporal_downsample": temporal_downsample,
         "num_colors": vae_num_colors,
     }
     return vae, summary
+
+
+def downsample_actions(actions_np: np.ndarray, *, temporal_downsample: int) -> np.ndarray:
+    if temporal_downsample == 0:
+        return actions_np
+    if temporal_downsample != 1:
+        raise ValueError("temporal_downsample must be 0 or 1")
+    if actions_np.shape[0] == 0:
+        return actions_np
+    indices = np.arange(0, actions_np.shape[0], 2, dtype=np.int64) + 1
+    indices = np.clip(indices, 0, actions_np.shape[0] - 1)
+    return actions_np[indices]
 
 
 def frames_to_one_hot(
@@ -352,7 +364,12 @@ def main() -> None:
     vae_checkpoint = Path(args.video_vae_checkpoint).resolve()
     vae_config = infer_vae_config_path(args)
     vae, vae_summary = load_video_vae(vae_checkpoint, vae_config, num_colors, device)
-    console.print(f"[vae] latent_channels={vae_summary['latent_channels']}")
+    console.print(
+        f"[vae] latent_channels={vae_summary['latent_channels']} "
+        f"temporal_downsample={vae_summary['temporal_downsample']}"
+    )
+    if vae_summary["temporal_downsample"] > 0 and args.batch_frames % 2 != 0:
+        raise ValueError("--batch-frames must be even when the VAE uses temporal downsampling")
 
     # Copy metadata files
     for meta_name in ["palette.json", "palette_distribution.json", "actions.json", "ram_addresses.json"]:
@@ -370,6 +387,9 @@ def main() -> None:
         "video_vae_config_path": serialize_project_path(vae_config, project_root=PROJECT_ROOT),
         "video_vae_config": vae_config_full,
         "num_colors": num_colors,
+        "temporal_downsample": int(vae_summary["temporal_downsample"]),
+        "latent_temporal_stride": int(2 ** vae_summary["temporal_downsample"]),
+        "action_downsample": "last_of_pair" if vae_summary["temporal_downsample"] > 0 else "none",
     }
     with latent_config_path.open("w") as f:
         json.dump(latent_meta, f, indent=2)
@@ -426,12 +446,16 @@ def main() -> None:
                     device=device,
                     autocast_ctx=make_autocast_ctx(),
                 )
+                latent_actions = downsample_actions(
+                    actions,
+                    temporal_downsample=vae_summary["temporal_downsample"],
+                )
 
                 out_path = output_dir / npz_path.name
                 np.savez_compressed(
                     out_path,
                     latents=latents,
-                    actions=actions,
+                    actions=latent_actions,
                 )
 
                 total_frames_encoded += num_frames

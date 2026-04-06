@@ -67,8 +67,6 @@ def parse_args() -> argparse.Namespace:
                         help="Override model base channels (defaults to config.json or 64)")
     parser.add_argument("--latent-channels", type=int, default=None,
                         help="Override model latent channels (defaults to config.json or 64)")
-    parser.add_argument("--patch-size", type=int, default=None,
-                        help="Override patch size (defaults to config.json or 4)")
     parser.add_argument("--onehot-dtype", type=str, default=None,
                         choices=["float32", "float16", "bfloat16"],
                         help="Input one-hot dtype (defaults to config.json or float32)")
@@ -423,7 +421,7 @@ def main() -> None:
 
     base_channels = args.base_channels or int(config.get("base_channels", 64))
     latent_channels = args.latent_channels or int(config.get("latent_channels", 64))
-    patch_size = args.patch_size or int(config.get("patch_size", 4))
+    temporal_downsample = int(config.get("temporal_downsample", 0))
 
     onehot_name = args.onehot_dtype or str(config.get("onehot_dtype", "float32"))
     onehot_dtype = _dtype_from_name(onehot_name)
@@ -435,9 +433,9 @@ def main() -> None:
 
     model = VideoVAE(
         num_colors=int(palette_rgb.shape[0]),
-        patch_size=patch_size,
         base_channels=base_channels,
         latent_channels=latent_channels,
+        temporal_downsample=temporal_downsample,
     ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -469,7 +467,7 @@ def main() -> None:
     print(f"Using device: {device}")
     print(
         f"Model: base_channels={base_channels}, latent_channels={latent_channels}, "
-        f"patch_size={patch_size}, onehot_dtype={onehot_name}"
+        f"temporal_downsample={temporal_downsample}, onehot_dtype={onehot_name}"
     )
     print(f"Loading {name} (backend: {backend})")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")

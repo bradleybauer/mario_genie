@@ -293,24 +293,28 @@ def load_video_vae(
     *, checkpoint_path: Path, config_path: Path, num_colors: int | None, device: torch.device
 ) -> tuple[torch.nn.Module, dict]:
     cfg = _load_json(config_path)
-    patch_size = int(cfg.get("patch_size", 4))
     base_channels = int(cfg.get("base_channels", 64))
     latent_channels = int(cfg.get("latent_channels", 64))
+    temporal_downsample = int(cfg.get("temporal_downsample", 0))
     vae_num_colors = int(cfg.get("num_colors", num_colors or 0))
     if vae_num_colors <= 0:
         raise ValueError("Cannot determine VAE num_colors.")
     vae = VideoVAE(
         num_colors=vae_num_colors,
-        patch_size=patch_size,
         base_channels=base_channels,
         latent_channels=latent_channels,
+        temporal_downsample=temporal_downsample,
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     vae.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
     vae.to(device).eval()
     for p in vae.parameters():
         p.requires_grad_(False)
-    return vae, {"latent_channels": latent_channels, "num_colors": vae_num_colors}
+    return vae, {
+        "latent_channels": latent_channels,
+        "num_colors": vae_num_colors,
+        "temporal_downsample": temporal_downsample,
+    }
 
 
 def shift_actions_causal(actions: torch.Tensor, *, default_action_index: int) -> torch.Tensor:
