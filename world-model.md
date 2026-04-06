@@ -27,7 +27,7 @@ Important current-state detail:
 - The vocoder is currently trained from mel features extracted from ground-truth waveform, not from audio-VAE latents directly.
 
 **3) What you are replacing from Genie/MagViT**
-- Genie/MagViT video tokenizer path is implemented in train_magvit.py, palette_tokenizer.py, and model_configs.py.
+- Genie/MagViT video tokenizer path was built around the now-removed palette tokenizer stack.
 - That path is discrete-token centric (LFQ/codebook behavior), with optional GAN discriminator support in gan_discriminator.py.
 - Your own motivation in README.md is exactly the shift: avoid giant discrete vocab prediction pressure in the downstream dynamics model by using continuous KL latents instead.
 

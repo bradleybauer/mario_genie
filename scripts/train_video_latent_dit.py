@@ -1009,6 +1009,7 @@ def main() -> None:
                 eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
                 eval_metrics["lr"] = float(lr_scheduler.get_last_lr()[0])
+                eval_metrics["train_gnorm"] = grad_norm
                 metrics.append(eval_metrics)
 
                 eval_line = (

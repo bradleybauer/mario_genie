@@ -60,6 +60,7 @@ def _index_normalized_file(
     stride: int,
     include_audio: bool,
     include_actions: bool,
+    include_ram: bool,
     load_arrays: bool,
 ) -> tuple[
     int,
@@ -75,19 +76,20 @@ def _index_normalized_file(
     np.ndarray | None,
     np.ndarray | None,
     np.ndarray | None,
+    np.ndarray | None,
 ]:
     try:
         mmap_mode = None if load_arrays else "r"
         with np.load(path, mmap_mode=mmap_mode) as npz:
             if "frames" not in npz.files:
-                return file_idx, 0, [], None, None, None, None, f"{path.name} is missing the 'frames' array", None, None, None, None, None
+                return file_idx, 0, [], None, None, None, None, f"{path.name} is missing the 'frames' array", None, None, None, None, None, None
             frames_arr = np.asarray(npz["frames"]) if load_arrays else npz["frames"]
             frame_count = int(frames_arr.shape[0])
             frame_shape = tuple(int(dim) for dim in frames_arr.shape[1:])
             loaded_frames = np.asarray(frames_arr) if load_arrays else None
 
             if include_actions and "actions" not in npz.files:
-                return file_idx, 0, [], None, None, None, None, f"{path.name} is missing the 'actions' array", frame_shape, loaded_frames, None, None, None
+                return file_idx, 0, [], None, None, None, None, f"{path.name} is missing the 'actions' array", frame_shape, loaded_frames, None, None, None, None
 
             audio_width: int | None = None
             audio_sample_rate: int | None = None
@@ -95,13 +97,17 @@ def _index_normalized_file(
             loaded_actions: np.ndarray | None = None
             loaded_audio: np.ndarray | None = None
             loaded_audio_lengths: np.ndarray | None = None
+            loaded_ram: np.ndarray | None = None
 
             if include_actions and load_arrays:
                 loaded_actions = np.asarray(npz["actions"])
 
+            if include_ram and load_arrays and "ram" in npz.files:
+                loaded_ram = np.asarray(npz["ram"])
+
             if include_audio:
                 if "audio" not in npz.files:
-                    return file_idx, 0, [], None, None, None, path.name, None, frame_shape, loaded_frames, loaded_actions, None, None
+                    return file_idx, 0, [], None, None, None, path.name, None, frame_shape, loaded_frames, loaded_actions, None, None, loaded_ram
                 audio = np.asarray(npz["audio"]) if load_arrays else npz["audio"]
                 if audio.shape[0] != frame_count:
                     return (
@@ -118,6 +124,7 @@ def _index_normalized_file(
                         loaded_actions,
                         None,
                         None,
+                        loaded_ram,
                     )
                 audio_width = int(audio.shape[1])
                 if "audio_sample_rate" in npz.files:
@@ -146,6 +153,7 @@ def _index_normalized_file(
                     loaded_actions,
                     loaded_audio,
                     loaded_audio_lengths,
+                    loaded_ram,
                 )
 
             samples = [(file_idx, start_idx) for start_idx in range(0, frame_count - clip_frames + 1, stride)]
@@ -163,9 +171,10 @@ def _index_normalized_file(
                 loaded_actions,
                 loaded_audio,
                 loaded_audio_lengths,
+                loaded_ram,
             )
     except Exception as exc:
-        return file_idx, 0, [], None, None, None, None, f"{path.name}: {exc}", None, None, None, None, None
+        return file_idx, 0, [], None, None, None, None, f"{path.name}: {exc}", None, None, None, None, None, None
 
 
 class NormalizedSequenceDataset(Dataset):
@@ -177,6 +186,7 @@ class NormalizedSequenceDataset(Dataset):
         include_frames: bool = True,
         include_audio: bool = False,
         include_actions: bool = False,
+        include_ram: bool = False,
         stride: int = 1,
         subset_n: int = 0,
         seed: int = 42,
@@ -198,6 +208,7 @@ class NormalizedSequenceDataset(Dataset):
         self.include_frames = include_frames
         self.include_audio = include_audio
         self.include_actions = include_actions
+        self.include_ram = include_ram
         self.stride = stride
         self.data_files = sorted(self.data_dir.glob("*.npz"))
         self.samples: list[tuple[int, int]] = []
@@ -206,6 +217,8 @@ class NormalizedSequenceDataset(Dataset):
         self.actions_by_file: list[np.ndarray] | None = None
         self.audio_by_file: list[np.ndarray] | None = None
         self.audio_lengths_by_file: list[np.ndarray] | None = None
+        self.ram_by_file: list[np.ndarray] | None = None
+        self.ram_n_bytes: int | None = None
         self.audio_frame_size: int | None = None
         self.audio_sample_rate = AUDIO_SAMPLE_RATE
         self.audio_sample_rate_by_file: list[int | None] = []
@@ -240,6 +253,8 @@ class NormalizedSequenceDataset(Dataset):
             if self.include_audio:
                 self.audio_by_file = [None] * self.num_files
                 self.audio_lengths_by_file = [None] * self.num_files
+            if self.include_ram:
+                self.ram_by_file = [None] * self.num_files
 
         _log(f"[dataset] Indexing {self.num_files:,} data files (stride={self.stride})...")
         index_start = time.time()
@@ -256,6 +271,7 @@ class NormalizedSequenceDataset(Dataset):
                     stride=self.stride,
                     include_audio=self.include_audio,
                     include_actions=self.include_actions,
+                    include_ram=self.include_ram,
                     load_arrays=load_during_index,
                 ): file_idx
                 for file_idx, path in enumerate(self.data_files)
@@ -288,6 +304,7 @@ class NormalizedSequenceDataset(Dataset):
                             loaded_actions,
                             loaded_audio,
                             loaded_audio_lengths,
+                            loaded_ram,
                         ) = future.result()
                         if missing_audio_name is not None:
                             missing_audio.append(missing_audio_name)
@@ -308,6 +325,8 @@ class NormalizedSequenceDataset(Dataset):
                                 if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
                                     self.audio_by_file[file_idx] = loaded_audio
                                     self.audio_lengths_by_file[file_idx] = loaded_audio_lengths
+                                if self.include_ram and self.ram_by_file is not None:
+                                    self.ram_by_file[file_idx] = loaded_ram
 
                         completed_index += 1
                         elapsed = max(time.time() - index_start, 1e-9)
@@ -328,6 +347,7 @@ class NormalizedSequenceDataset(Dataset):
                         loaded_actions,
                         loaded_audio,
                         loaded_audio_lengths,
+                        loaded_ram,
                     ) = future.result()
                     if missing_audio_name is not None:
                         missing_audio.append(missing_audio_name)
@@ -348,6 +368,8 @@ class NormalizedSequenceDataset(Dataset):
                             if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
                                 self.audio_by_file[file_idx] = loaded_audio
                                 self.audio_lengths_by_file[file_idx] = loaded_audio_lengths
+                            if self.include_ram and self.ram_by_file is not None:
+                                self.ram_by_file[file_idx] = loaded_ram
 
                     completed_index += 1
                     now = time.time()
@@ -391,6 +413,8 @@ class NormalizedSequenceDataset(Dataset):
                 self.audio_by_file = [self.audio_by_file[i] for i in valid_files]
             if self.audio_lengths_by_file is not None:
                 self.audio_lengths_by_file = [self.audio_lengths_by_file[i] for i in valid_files]
+            if self.ram_by_file is not None:
+                self.ram_by_file = [self.ram_by_file[i] for i in valid_files]
             self.num_files = len(self.data_files)
 
         _log(f"Indexing complete. Collected {len(self.samples):,} windows before filtering/sort.")
@@ -469,11 +493,25 @@ class NormalizedSequenceDataset(Dataset):
                             probe_lengths = probe_npz["audio_lengths"]
                             total_bytes += self.total_frames * int(np.asarray(probe_lengths[0]).nbytes)
 
+            if self.include_ram:
+                if self.ram_by_file is not None:
+                    first_ram = next((arr for arr in self.ram_by_file if arr is not None), None)
+                    if first_ram is not None:
+                        self.ram_n_bytes = first_ram.shape[1]
+                        total_bytes += self.total_frames * int(np.asarray(first_ram[0]).nbytes)
+                else:
+                    with np.load(self.data_files[0], mmap_mode="r") as probe_npz:
+                        if "ram" in probe_npz.files:
+                            probe_ram = probe_npz["ram"]
+                            self.ram_n_bytes = probe_ram.shape[1]
+                            total_bytes += self.total_frames * int(math.prod(probe_ram.shape[1:]) * probe_ram.dtype.itemsize)
+
             if available > 0 and total_bytes < available - headroom:
                 if load_during_index and (
                     (not self.include_frames or self.frames_by_file is not None)
                     and (not self.include_actions or self.actions_by_file is not None)
                     and (not self.include_audio or (self.audio_by_file is not None and self.audio_lengths_by_file is not None))
+                    and (not self.include_ram or self.ram_by_file is not None)
                 ):
                     loaded_bytes = 0
                     if self.frames_by_file is not None:
@@ -483,6 +521,8 @@ class NormalizedSequenceDataset(Dataset):
                     if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
                         loaded_bytes += int(sum(audio.nbytes for audio in self.audio_by_file if audio is not None))
                         loaded_bytes += int(sum(lengths.nbytes for lengths in self.audio_lengths_by_file if lengths is not None))
+                    if self.include_ram and self.ram_by_file is not None:
+                        loaded_bytes += int(sum(ram.nbytes for ram in self.ram_by_file if ram is not None))
                     _log(f"Loaded {loaded_bytes / 2**30:.1f} GB into RAM during indexing (single pass)")
                     return
 
@@ -498,12 +538,15 @@ class NormalizedSequenceDataset(Dataset):
                 if self.include_audio:
                     self.audio_by_file = [None] * self.num_files
                     self.audio_lengths_by_file = [None] * self.num_files
+                if self.include_ram:
+                    self.ram_by_file = [None] * self.num_files
 
                 def _load_file(file_idx: int):
                     with np.load(self.data_files[file_idx]) as npz:
                         frames = np.asarray(npz["frames"]) if self.include_frames else None
                         actions = np.asarray(npz["actions"]) if self.include_actions else None
                         audio = np.asarray(npz["audio"]) if self.include_audio else None
+                        ram = np.asarray(npz["ram"]) if self.include_ram and "ram" in npz.files else None
                         lengths = None
                         sample_rate = None
                         video_fps = None
@@ -517,7 +560,7 @@ class NormalizedSequenceDataset(Dataset):
                                 sample_rate = int(np.asarray(npz["audio_sample_rate"]).item())
                             if "video_fps" in npz.files:
                                 video_fps = float(np.asarray(npz["video_fps"]).item())
-                    return file_idx, frames, actions, audio, lengths, sample_rate, video_fps
+                    return file_idx, frames, actions, audio, lengths, sample_rate, video_fps, ram
 
                 load_start = time.time()
                 last_load_report = load_start
@@ -538,7 +581,7 @@ class NormalizedSequenceDataset(Dataset):
                         ) as progress:
                             load_task = progress.add_task("Loading files into RAM", total=self.num_files, rate=0.0)
                             for future in concurrent.futures.as_completed(futures):
-                                file_idx, frames, actions, audio, lengths, sample_rate, video_fps = future.result()
+                                file_idx, frames, actions, audio, lengths, sample_rate, video_fps, ram = future.result()
                                 if self.include_frames and self.frames_by_file is not None:
                                     self.frames_by_file[file_idx] = frames
                                 if self.include_actions and self.actions_by_file is not None:
@@ -550,6 +593,8 @@ class NormalizedSequenceDataset(Dataset):
                                         self.audio_sample_rate_by_file[file_idx] = sample_rate
                                     if video_fps is not None:
                                         self.video_fps_by_file[file_idx] = video_fps
+                                if self.include_ram and self.ram_by_file is not None:
+                                    self.ram_by_file[file_idx] = ram
 
                                 completed_load += 1
                                 elapsed = max(time.time() - load_start, 1e-9)
@@ -588,6 +633,8 @@ class NormalizedSequenceDataset(Dataset):
                 if self.include_audio and self.audio_by_file is not None and self.audio_lengths_by_file is not None:
                     loaded_bytes += int(sum(audio.nbytes for audio in self.audio_by_file if audio is not None))
                     loaded_bytes += int(sum(lengths.nbytes for lengths in self.audio_lengths_by_file if lengths is not None))
+                if self.include_ram and self.ram_by_file is not None:
+                    loaded_bytes += int(sum(ram.nbytes for ram in self.ram_by_file if ram is not None))
                 _log(f"Loaded {loaded_bytes / 2**30:.1f} GB into RAM")
             else:
                 if load_during_index:
@@ -595,6 +642,7 @@ class NormalizedSequenceDataset(Dataset):
                     self.actions_by_file = None
                     self.audio_by_file = None
                     self.audio_lengths_by_file = None
+                    self.ram_by_file = None
                 _log(
                     f"Dataset too large for RAM ({total_bytes / 2**30:.1f} GB, "
                     f"{available / 2**30:.1f} GB available). Using mmap."
@@ -672,5 +720,14 @@ class NormalizedSequenceDataset(Dataset):
             sample["audio_sample_rate"] = int(sample_rate)
             if video_fps is not None:
                 sample["video_fps"] = float(video_fps)
+
+        if self.include_ram:
+            if self.ram_by_file is not None:
+                ram = self.ram_by_file[file_idx][start_idx:end_idx]
+            else:
+                if npz is None:
+                    npz = self._get_npz(file_idx)
+                ram = np.asarray(npz["ram"][start_idx:end_idx])
+            sample["ram"] = torch.from_numpy(np.asarray(ram).copy())
 
         return sample

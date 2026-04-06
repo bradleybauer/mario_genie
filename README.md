@@ -5,17 +5,17 @@
 - [Mesen-Based Data Collection](#mesen-based-data-collection)
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
-- [Dataset Refactor Number 32515123](#dataset-refactor-number-32515123)
 - [Disentangling Hidden State From RAM](#disentangling-hidden-state-from-ram)
 - [SMB3 x Super Mario Land 2](#smb3-x-super-mario-land-2)
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
-- [Tokenizer Variables To Explore](#tokenizer-variables-to-explore)
-- [Memory Optimizations](#memory-optimizations)
+- [Discrete Tokenizer Variables To Explore](#discrete-tokenizer-variables-to-explore)
+- [Onehot Memory Optimizations](#onehot-memory-optimizations)
 - [Video VAE Training Updates](#video-vae-training-updates)
-- [Training Recipe](#training-recipe)
 - [LTX Video And Audio VAE](#ltx-video-and-audio-vae)
-- [First Audio Experiments](#first-audio-experiments)
+- [Audio Data Exploration](#audio-data-exploration)
+- [Initial Video Only World Model Training](#initial-video-only-world-model-training)
+- [Video VAE Latents](#video-vae-latents)
 
 <br>
 
@@ -249,7 +249,7 @@ Prepending context frames works great to reduce reconstruction error on frames e
 <br>
 <br>
 
-# Tokenizer Variables To Explore
+# Discrete Tokenizer Variables To Explore
 
 **Context:**
 
@@ -271,7 +271,7 @@ Context images idea worked quite nicely. Non-context images consistently have be
 <br>
 <br>
 
-# Memory Optimizations
+# Onehot Memory Optimizations
 
 **Context:**
 
@@ -361,7 +361,7 @@ The VAE does have periodic KL spikes (e.g. step 2k, 6.6k, 10.8k) where recon los
 <br>
 <br>
 
-# First Audio Experiments
+# Audio Data Exploration
 
 **Context:**
 I wanted to explore and do some engineering around the audio data.
@@ -403,7 +403,7 @@ The vocoder successfully overfit a single sample and produced high-quality outpu
 <br>
 <br>
 
-# Initial Video Only World Model Tests
+# Initial Video Only World Model Training
 
 **Context:**
 

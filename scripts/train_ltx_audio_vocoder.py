@@ -21,20 +21,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, Subset
+from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -46,6 +38,19 @@ from mario_world_model.config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, A
 from mario_world_model.ltx_audio_vocoder import LTXAudioVocoder
 from mario_world_model.normalized_dataset import NormalizedSequenceDataset
 from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.training_utils import (
+    ThroughputTracker,
+    build_eval_loader,
+    build_progress,
+    build_replacement_train_loader,
+    create_accelerator_runtime,
+    get_model_state_dict,
+    infinite_batches,
+    save_json,
+    save_metrics_json,
+    split_train_eval_dataset,
+    unwrap_model,
+)
 
 
 console = Console()
@@ -174,10 +179,6 @@ def make_output_dir(args: argparse.Namespace) -> Path:
         return Path(args.resume_from).resolve().parent
     run_name = args.run_name or datetime.now().strftime("ltx_audio_vocoder_%Y%m%d_%H%M%S")
     return PROJECT_ROOT / "checkpoints" / run_name
-
-
-def unwrap_model(model: nn.Module) -> nn.Module:
-    return getattr(model, "_orig_mod", model)
 
 
 def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -390,10 +391,11 @@ def save_training_state(
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
+    accelerator: Accelerator | None = None,
 ) -> None:
     torch.save(
         {
-            "model": unwrap_model(model).state_dict(),
+            "model": get_model_state_dict(model, accelerator=accelerator),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "step": step,
@@ -543,99 +545,97 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    console.print(f"Using device: {device}")
+    output_dir = make_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
+    accelerator = runtime.accelerator
+    device = runtime.device
+    is_main_process = runtime.is_main_process
+
+    if is_main_process:
+        console.print(f"Using device: {device}")
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        console.print("[tf32] TF32 matmul precision enabled")
+        if is_main_process:
+            console.print("[tf32] TF32 matmul precision enabled")
 
     system_info = collect_system_info()
-    print_system_info(system_info)
+    if is_main_process:
+        print_system_info(system_info)
 
-    output_dir = make_output_dir(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
-    dataset = NormalizedSequenceDataset(
-        data_dir=args.data_dir,
-        clip_frames=args.clip_frames,
-        include_frames=False,
-        include_audio=True,
-        subset_n=args.overfit_n,
-        seed=args.seed,
-        num_workers=args.num_workers,
-        system_info=system_info,
-    )
-    console.print("[dataset] Index build complete.")
+    if is_main_process:
+        console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
+    with accelerator.main_process_first():
+        dataset = NormalizedSequenceDataset(
+            data_dir=args.data_dir,
+            clip_frames=args.clip_frames,
+            include_frames=False,
+            include_audio=True,
+            subset_n=args.overfit_n,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            system_info=system_info,
+        )
+    if is_main_process:
+        console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No audio training samples were found.")
     target_frames = args.clip_frames - args.context_frames
-    if args.context_frames > 0:
+    if is_main_process:
+        if args.context_frames > 0:
+            console.print(
+                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+                f"({args.context_frames} context + {target_frames} target, "
+                f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
+            )
+            console.print(
+                f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
+            )
+        else:
+            console.print(
+                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+                f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
+            )
         console.print(
-            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-            f"({args.context_frames} context + {target_frames} target, "
-            f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
+            f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
+            f"{_format_bytes(dataset.dataset_bytes)} on disk."
         )
-        console.print(
-            f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
-        )
-    else:
-        console.print(
-            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-            f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
-        )
-    console.print(
-        f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-        f"{_format_bytes(dataset.dataset_bytes)} on disk."
-    )
 
-    eval_dataset = None
-    train_dataset = dataset
     if args.overfit_n > 0:
-        console.print(f"[overfit] Enabled on {len(dataset)} sample(s)")
-    elif args.eval_samples > 0 and len(dataset) > args.eval_samples:
-        generator = torch.Generator().manual_seed(args.seed)
-        permutation = torch.randperm(len(dataset), generator=generator)
-        eval_indices = permutation[:args.eval_samples].tolist()
-        train_indices = permutation[args.eval_samples:].tolist()
-        eval_dataset = Subset(dataset, eval_indices)
-        train_dataset = Subset(dataset, train_indices)
-        console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
+        train_dataset = dataset
+        eval_dataset = None
+        if is_main_process:
+            console.print(f"[overfit] Enabled on {len(dataset)} sample(s)")
+    else:
+        train_dataset, eval_dataset = split_train_eval_dataset(
+            dataset,
+            eval_samples=args.eval_samples,
+            seed=args.seed,
+        )
+        if eval_dataset is not None and is_main_process:
+            console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
 
     if len(train_dataset) > 0 and args.batch_size > len(train_dataset):
-        console.print(f"[batch-size] Capping batch_size {args.batch_size} -> {len(train_dataset)}")
+        if is_main_process:
+            console.print(f"[batch-size] Capping batch_size {args.batch_size} -> {len(train_dataset)}")
         args.batch_size = len(train_dataset)
 
-    num_workers = max(args.num_workers, 0)
-    train_sampler = RandomSampler(train_dataset, replacement=True, num_samples=10**7)
-    train_loader = DataLoader(
+    train_loader = build_replacement_train_loader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
     )
 
-    def batch_iter():
-        while True:
-            yield from train_loader
-
-    train_iter = batch_iter()
-
-    eval_loader = None
-    if eval_dataset is not None:
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=torch.cuda.is_available(),
-        )
+    eval_loader = build_eval_loader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=False,
+    )
 
     mel_extractor = LogMelSpectrogram(
         sample_rate=args.sample_rate,
@@ -662,20 +662,24 @@ def main() -> None:
 
     num_parameters = model.num_parameters
     if num_parameters > args.target_max_params:
-        console.print(
-            "[warning] Model size exceeds target budget: "
-            f"{num_parameters:,} > {args.target_max_params:,} parameters"
-        )
+        if is_main_process:
+            console.print(
+                "[warning] Model size exceeds target budget: "
+                f"{num_parameters:,} > {args.target_max_params:,} parameters"
+            )
     else:
-        console.print(
-            "[model] Parameter budget check passed: "
-            f"{num_parameters:,} <= {args.target_max_params:,}"
-        )
+        if is_main_process:
+            console.print(
+                "[model] Parameter budget check passed: "
+                f"{num_parameters:,} <= {args.target_max_params:,}"
+            )
 
     if args.compile:
-        console.print("[compile] Compiling the model with torch.compile()...")
+        if is_main_process:
+            console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
-        console.print("[compile] Compilation complete.")
+        if is_main_process:
+            console.print("[compile] Compilation complete.")
 
     stft_loss = MultiResolutionSTFTLoss(
         fft_sizes=args.stft_fft_sizes,
@@ -706,21 +710,28 @@ def main() -> None:
     metrics: list[dict[str, float]] = []
 
     if args.resume_from is not None:
-        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
+        with accelerator.main_process_first():
+            checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
         unwrap_model(model).load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         try:
             scheduler.load_state_dict(checkpoint["scheduler"])
         except Exception:
-            console.print("[resume] Scheduler state was incompatible; continuing with the current scheduler")
+            if is_main_process:
+                console.print("[resume] Scheduler state was incompatible; continuing with the current scheduler")
         start_step = int(checkpoint["step"]) + 1
         best_eval = float(checkpoint.get("best_eval", float("inf")))
         metrics = list(checkpoint.get("metrics", []))
-        console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+        if is_main_process:
+            console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
 
         if args.max_steps > 0 and start_step >= args.max_steps:
-            console.print(f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do.")
+            if is_main_process:
+                console.print(f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do.")
             return
+
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    train_iter = infinite_batches(train_loader)
 
     config = vars(args).copy()
     config.update(
@@ -728,42 +739,34 @@ def main() -> None:
             "audio_frame_size": int(dataset.audio_frame_size or 0),
             "num_parameters": int(num_parameters),
             "device": str(device),
+            "mixed_precision": "no",
+            "num_processes": int(accelerator.num_processes),
             "timestamp": datetime.now().isoformat(),
         }
     )
-    with (output_dir / "config.json").open("w") as handle:
-        json.dump(config, handle, indent=2)
-    console.print(f"Config saved to {output_dir / 'config.json'}")
-    console.print(json.dumps(config, indent=2))
+    if is_main_process:
+        save_json(output_dir / "config.json", config, indent=2)
+        console.print(f"Config saved to {output_dir / 'config.json'}")
+        console.print(json.dumps(config, indent=2))
 
-    console.print(f"Training LTX audio vocoder on {len(train_dataset)} samples")
-    console.print(f"Output directory: {output_dir}")
-    console.print(f"Device: {device}")
-    console.print(f"Model parameters: {num_parameters:,}")
+        console.print(f"Training LTX audio vocoder on {len(train_dataset)} samples")
+        console.print(f"Output directory: {output_dir}")
+        console.print(f"Device: {device}")
+        console.print(f"Model parameters: {num_parameters:,}")
+        if accelerator.num_processes > 1:
+            console.print(
+                f"Distributed training enabled with {accelerator.num_processes} processes "
+                f"(global batch={args.batch_size * accelerator.num_processes})."
+            )
 
     start_time = time.time()
-    perf_window_start = time.time()
-    perf_window_steps = 0
-    perf_window_samples = 0
-    samples_per_second = 0.0
-    steps_per_second = 0.0
-    perf_window_size = 20
+    throughput_tracker = ThroughputTracker(window_steps=20)
     bytes_per_sample = None
-    use_live_progress = sys.stdout.isatty()
+    use_live_progress = sys.stdout.isatty() and is_main_process
     final_preview_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     total_train_steps = max(args.max_steps - start_step, 0)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[status]}"),
-        disable=not use_live_progress,
-        refresh_per_second=2,
-    ) as progress:
+    with build_progress(use_live=use_live_progress) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         for step in range(start_step, args.max_steps):
@@ -799,7 +802,8 @@ def main() -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(mel, output_length=target_length)
+            with accelerator.autocast():
+                prediction = model(mel, output_length=target_length)
             pred_mel = mel_extractor(prediction.squeeze(1))
             final_preview_payload = (
                 waveform_target.detach().cpu(),
@@ -824,66 +828,72 @@ def main() -> None:
                 + args.stft_mag_weight * stft_mag
             )
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            accelerator.backward(loss)
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             optimizer.step()
             scheduler.step()
 
             if bytes_per_sample is None:
                 bytes_per_sample = prediction.shape[1] * prediction.shape[-1] * 4
 
-            perf_window_steps += 1
-            perf_window_samples += audio.shape[0]
-            now = time.time()
-            elapsed_window = max(now - perf_window_start, 1e-9)
-            if perf_window_steps >= perf_window_size:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-                perf_window_start = now
-                perf_window_steps = 0
-                perf_window_samples = 0
-            else:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-
-            status = (
-                f"loss={loss.item():.4f} wave={wave_l1.item():.4f} "
-                f"mel={mel_l1.item():.4f} sc={stft_sc.item():.4f} mag={stft_mag.item():.4f} "
-                f"lr={scheduler.get_last_lr()[0]:.2e} "
-                f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+            samples_per_second, steps_per_second = throughput_tracker.update(
+                samples=audio.shape[0] * accelerator.num_processes,
             )
 
-            stats = gpu_stats(device)
-            if "gpu_util_pct" in stats:
-                status += f" gpu={stats['gpu_util_pct']:.0f}%"
-            if "gpu_mem_pct" in stats:
-                status += f" mem={stats['gpu_mem_pct']:.0f}%"
-            if "gpu_temp_c" in stats:
-                status += f" temp={stats['gpu_temp_c']:.0f}C"
-            if bytes_per_sample is not None:
-                status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
+            if is_main_process:
+                status = (
+                    f"loss={loss.item():.4f} wave={wave_l1.item():.4f} "
+                    f"mel={mel_l1.item():.4f} sc={stft_sc.item():.4f} mag={stft_mag.item():.4f} "
+                    f"lr={scheduler.get_last_lr()[0]:.2e} gnorm={grad_norm:.2f} "
+                    f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+                )
 
-            progress.update(train_task, advance=1, status=status)
+                stats = gpu_stats(device)
+                if "gpu_util_pct" in stats:
+                    status += f" gpu={stats['gpu_util_pct']:.0f}%"
+                if "gpu_mem_pct" in stats:
+                    status += f" mem={stats['gpu_mem_pct']:.0f}%"
+                if "gpu_temp_c" in stats:
+                    status += f" temp={stats['gpu_temp_c']:.0f}C"
+                if bytes_per_sample is not None:
+                    status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
+
+                progress.update(train_task, advance=1, status=status)
 
             if (
                 ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
                 and not use_live_progress
+                and is_main_process
             ):
                 elapsed = time.time() - start_time
-                examples_per_second = ((step - start_step + 1) * args.batch_size) / max(elapsed, 1e-6)
+                examples_per_second = (
+                    (step - start_step + 1)
+                    * args.batch_size
+                    * accelerator.num_processes
+                    / max(elapsed, 1e-6)
+                )
                 log_console.print(
                     f"step={step:06d} loss={loss.item():.4f} wave={wave_l1.item():.4f} "
                     f"mel={mel_l1.item():.4f} sc={stft_sc.item():.4f} mag={stft_mag.item():.4f} "
-                    f"lr={scheduler.get_last_lr()[0]:.2e} ex/s={examples_per_second:.1f}"
+                    f"lr={scheduler.get_last_lr()[0]:.2e} gnorm={grad_norm:.2f} ex/s={examples_per_second:.1f}"
                 )
 
-            should_eval = (
+            eval_due = (
                 eval_loader is not None
                 and (
                     (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
                     or step == args.max_steps - 1
                 )
             )
+            should_checkpoint = (
+                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
+                or step == args.max_steps - 1
+            )
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
+
+            eval_line: str | None = None
+            should_eval = eval_due and is_main_process
             if should_eval:
                 eval_metrics, preview = evaluate(
                     model,
@@ -900,9 +910,10 @@ def main() -> None:
                     context_frames=args.context_frames,
                 )
                 eval_metrics["step"] = step
+                eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                eval_metrics["train_gnorm"] = grad_norm
                 metrics.append(eval_metrics)
-                with (output_dir / "metrics.json").open("w") as handle:
-                    json.dump(metrics, handle, indent=2)
+                save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
                     f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
@@ -939,15 +950,12 @@ def main() -> None:
                         step=step,
                         best_eval=best_eval,
                         metrics=metrics,
+                        accelerator=accelerator,
                     )
                     eval_line += f" | best={best_eval:.6f}"
 
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
-            )
-            if should_checkpoint:
-                if should_eval:
+            if should_checkpoint and is_main_process:
+                if eval_line is not None:
                     eval_line += " | saved latest"
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
@@ -959,12 +967,16 @@ def main() -> None:
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,
+                    accelerator=accelerator,
                 )
 
-            if should_eval:
+            if eval_line is not None and is_main_process:
                 log_console.print(eval_line)
 
-    if final_preview_payload is not None:
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
+
+    if final_preview_payload is not None and is_main_process:
         save_vocoder_preview(
             output_dir / "final_reconstruction.png",
             final_preview_payload[0],

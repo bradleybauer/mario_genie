@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Rank all dataset samples by reconstruction loss (best → worst).
+"""Rank normalized video clips by reconstruction quality.
 
-Loads a trained checkpoint, runs inference on every sample in the dataset,
-and writes a JSON report + optional worst/best reconstruction PNGs.
+This script currently supports checkpoints produced by
+`scripts/train_ltx_video_vae.py` (continuous video VAE).
+
+It evaluates reconstruction quality for each sample and writes:
+- a JSON ranking report (best to worst), and
+- optional best/worst preview PNGs.
 
 Usage:
-    python scripts/rank_samples.py checkpoints/magvit2/training_state_latest.pt
-    python scripts/rank_samples.py checkpoints/magvit2/training_state_latest.pt --data-dir data/ --top-k 20
-    python scripts/rank_samples.py checkpoints/magvit2/training_state_latest.pt --save-images 10
+    python scripts/rank_samples.py checkpoints/video_vae_run/video_vae_latest.pt
+    python scripts/rank_samples.py checkpoints/video_vae_run/video_vae_latest.pt --sample-fraction 0.1 --top-k 20
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torchvision.utils import save_image
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,261 +33,341 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from mario_world_model.config import IMAGE_SIZE, SEQUENCE_LENGTH
-from mario_world_model.model_configs import MODEL_CONFIGS_BY_NAME
-from mario_world_model.tokenizer_compat import resolve_video_contains_first_frame
-from mario_world_model.palette_tokenizer import PaletteVideoTokenizer
+from mario_world_model.ltx_video_vae import LTXVideoVAE
+from mario_world_model.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from mario_world_model.palette_video_vae_training import (
+    frames_to_one_hot,
+    save_video_preview,
+    split_context_targets,
+)
 
-# Re-use dataset and crop constants from the training script
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
-from train_magvit import MarioVideoDataset, OVERSCAN_CROP_SIZE, CROP_224_SIZE, _crop_chunk
+
+@dataclass
+class SampleResult:
+    dataset_idx: int
+    loss: float
+    pixel_accuracy: float
+    file: str
+    t_start: int
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Rank dataset samples by reconstruction loss")
-    parser.add_argument("checkpoint", type=str,
-                        help="Path to training_state*.pt or magvit2*.pt file")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Data directory (default: read from config.json next to checkpoint)")
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output JSON path (default: sample_rankings.json next to checkpoint)")
-    parser.add_argument("--save-images", type=int, default=10,
-                        help="Save reconstruction PNGs for the N best and N worst samples (0 to disable)")
-    parser.add_argument("--top-k", type=int, default=50,
-                        help="Print the top-K best and worst samples to stdout")
+    parser = argparse.ArgumentParser(description="Rank dataset samples by reconstruction quality")
+    parser.add_argument(
+        "checkpoint",
+        type=str,
+        help="Path to a video_vae_*.pt checkpoint",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Data directory (default: read from config.json next to checkpoint)",
+    )
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--sample-fraction", type=float, default=1.0,
-                        help="Evaluate a random fraction of the dataset (e.g. 0.1 for 10%%)")
-    return parser.parse_args()
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output JSON path (default: sample_rankings.json next to checkpoint)",
+    )
+    parser.add_argument(
+        "--save-images",
+        type=int,
+        default=10,
+        help="Save previews for N best and N worst samples (0 to disable)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=50,
+        help="Print top-K best and worst samples",
+    )
+    parser.add_argument(
+        "--sample-fraction",
+        type=float,
+        default=1.0,
+        help="Evaluate a random fraction of the dataset (0 < f <= 1)",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--onehot-dtype",
+        type=str,
+        default=None,
+        choices=["float32", "float16", "bfloat16"],
+        help="Override one-hot dtype (default: config onehot_dtype or float32)",
+    )
+    args = parser.parse_args()
+
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be > 0")
+    if args.num_workers < 0:
+        parser.error("--num-workers must be >= 0")
+    if not (0.0 < args.sample_fraction <= 1.0):
+        parser.error("--sample-fraction must be in (0, 1]")
+    if args.save_images < 0:
+        parser.error("--save-images must be >= 0")
+    if args.top_k <= 0:
+        parser.error("--top-k must be > 0")
+
+    return args
 
 
-def main():
+def _resolve_dtype(dtype_name: str) -> torch.dtype:
+    mapping = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if dtype_name not in mapping:
+        raise ValueError(f"Unsupported dtype {dtype_name!r}")
+    return mapping[dtype_name]
+
+
+def _load_run_config(checkpoint_path: Path) -> dict:
+    config_path = checkpoint_path.resolve().parent / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.json found at {config_path}")
+    with config_path.open() as handle:
+        return json.load(handle)
+
+
+def _build_model_from_config(config: dict, num_colors: int, device: torch.device) -> LTXVideoVAE:
+    model_name = config.get("model_name", "")
+    if model_name and model_name != "ltx_video_vae":
+        raise ValueError(
+            "Unsupported model_name in config: "
+            f"{model_name!r}. This script currently supports only 'ltx_video_vae'."
+        )
+
+    model = LTXVideoVAE(
+        num_colors=num_colors,
+        patch_size=int(config.get("patch_size", 4)),
+        base_channels=int(config.get("base_channels", 64)),
+        latent_channels=int(config.get("latent_channels", 64)),
+    ).to(device)
+    model.eval()
+    return model
+
+
+def _extract_model_state(raw_checkpoint: object) -> tuple[dict[str, torch.Tensor], int | str]:
+    if isinstance(raw_checkpoint, dict) and "model" in raw_checkpoint:
+        step = raw_checkpoint.get("step", "?")
+        return raw_checkpoint["model"], step
+    if isinstance(raw_checkpoint, dict):
+        return raw_checkpoint, "?"
+    raise TypeError("Checkpoint format is not a state-dict dictionary")
+
+
+def _build_eval_indices(total: int, fraction: float, seed: int) -> list[int] | None:
+    if fraction >= 1.0:
+        return None
+    count = max(1, int(total * fraction))
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randperm(total, generator=generator)[:count].tolist()
+
+
+def _score_batch(
+    *,
+    model: LTXVideoVAE,
+    frames: torch.Tensor,
+    num_colors: int,
+    context_frames: int,
+    onehot_dtype: torch.dtype,
+    onehot_buffer: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    inputs = frames_to_one_hot(frames, num_colors=num_colors, dtype=onehot_dtype, out=onehot_buffer)
+    outputs = model(inputs, sample_posterior=False)
+    logits, targets = split_context_targets(outputs.logits, frames, context_frames)
+
+    per_elem_loss = F.cross_entropy(logits.float(), targets, reduction="none")
+    sample_loss = per_elem_loss.mean(dim=(1, 2, 3))
+
+    predictions = logits.argmax(dim=1)
+    sample_acc = (predictions == targets).float().mean(dim=(1, 2, 3))
+
+    return sample_loss, sample_acc, inputs
+
+
+def main() -> None:
     args = parse_args()
 
+    checkpoint_path = Path(args.checkpoint).resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+    config = _load_run_config(checkpoint_path)
+    data_dir = Path(args.data_dir or config.get("data_dir", "data/normalized")).resolve()
 
-    # ── Load config ──────────────────────────────────────────────────
-    config_path = os.path.join(ckpt_dir, "config.json")
-    if not os.path.exists(config_path):
-        raise SystemExit(f"No config.json found at {config_path}")
-    with open(config_path) as f:
-        config = json.load(f)
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
 
-    model_name = config["model"]
-    mc = MODEL_CONFIGS_BY_NAME[model_name]
-    image_size = config.get("image_size", IMAGE_SIZE)
-    seq_len = config.get("sequence_length", SEQUENCE_LENGTH)
+    palette = load_palette_tensor(data_dir).to(device)
+    num_colors = int(palette.shape[0])
 
-    crop_size = None
-    if config.get("crop_240"):
-        crop_size = OVERSCAN_CROP_SIZE
-    elif config.get("crop_224"):
-        crop_size = CROP_224_SIZE
+    model = _build_model_from_config(config, num_colors=num_colors, device=device)
+    raw_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict, step = _extract_model_state(raw_checkpoint)
+    model.load_state_dict(state_dict)
+    del raw_checkpoint, state_dict
 
-    data_dir = args.data_dir or config.get("data_dir", "data")
+    clip_frames = int(config.get("clip_frames", 16))
+    context_frames = int(config.get("context_frames", 0))
+    total_clip_frames = clip_frames + context_frames
 
-    # ── Load weights ─────────────────────────────────────────────────
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    # training_state has a 'model' key; raw .pt is the state_dict directly
-    state_dict = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
-    step = ckpt.get("global_step", "?") if isinstance(ckpt, dict) else "?"
-    del ckpt
+    onehot_dtype_name = args.onehot_dtype or str(config.get("onehot_dtype", "float32"))
+    onehot_dtype = _resolve_dtype(onehot_dtype_name)
 
-    # Infer palette size from checkpoint (conv_out.conv.bias has num_palette_colors elements)
-    num_palette_colors = state_dict["conv_out.conv.bias"].shape[0]
-
-    # ── Load palette ─────────────────────────────────────────────────
-    palette_path = os.path.join(data_dir, "palette.json")
-    if not os.path.isfile(palette_path):
-        raise FileNotFoundError(f"No palette.json found at {palette_path}")
-    with open(palette_path) as f:
-        palette_rgb = json.load(f)
-    palette = torch.tensor(palette_rgb[:num_palette_colors], dtype=torch.float32).to(device) / 255.0
-
-    # ── Build tokenizer layers ───────────────────────────────────────
-    tokenizer_layers = tuple(
-        (name, int(val)) if ":" in tok else tok
-        for tok in mc.layers.split(",")
-        for name, _, val in [tok.partition(":")]
-    )
-
-    # ── Create model ─────────────────────────────────────────────────
-    tokenizer = PaletteVideoTokenizer(
-        num_palette_colors=num_palette_colors,
-        image_size=image_size,
-        init_dim=mc.init_dim,
-        codebook_size=mc.codebook_size,
-        layers=tokenizer_layers,
-    ).to(device)
-    tokenizer.discr = None
-    tokenizer.multiscale_discrs = None
-
-    tokenizer.load_state_dict(state_dict)
-    print(f"Loaded checkpoint from step {step} (palette size: {num_palette_colors})")
-    del state_dict
-
-    video_contains_first_frame = resolve_video_contains_first_frame(tokenizer, seq_len)
-
-    # ── Load dataset ─────────────────────────────────────────────────
-    dataset = MarioVideoDataset(
-        data_dir,
-        seq_len=seq_len,
-        crop_size=crop_size,
+    dataset = NormalizedSequenceDataset(
+        data_dir=data_dir,
+        clip_frames=total_clip_frames,
         num_workers=args.num_workers,
     )
-    print(f"Dataset: {len(dataset)} samples")
-
-    if args.sample_fraction < 1.0:
-        n_total = len(dataset)
-        n_subset = max(1, int(n_total * args.sample_fraction))
-        generator = torch.Generator().manual_seed(42)
-        indices = torch.randperm(n_total, generator=generator)[:n_subset].tolist()
-        subset = torch.utils.data.Subset(dataset, indices)
-        print(f"Sampling {n_subset}/{n_total} ({args.sample_fraction:.0%})")
-    else:
-        subset = dataset
-        indices = None
+    eval_indices = _build_eval_indices(len(dataset), args.sample_fraction, args.seed)
+    eval_dataset = Subset(dataset, eval_indices) if eval_indices is not None else dataset
 
     loader = DataLoader(
-        subset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
+        eval_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
 
-    # ── Run inference on all samples ─────────────────────────────────
-    tokenizer.eval()
-    all_results = []
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Step: {step}")
+    print(f"Device: {device}")
+    print(f"Dataset size: {len(dataset)} clips")
+    if eval_indices is None:
+        print("Scoring all clips")
+    else:
+        print(f"Scoring {len(eval_indices)} clips ({args.sample_fraction:.1%} sample)")
+
+    results: list[SampleResult] = []
+    onehot_buffer: torch.Tensor | None = None
     sample_offset = 0
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Evaluating"):
-            batch = batch.to(device, non_blocking=True)
-            bs = batch.shape[0]
-            targets = batch.long().clamp(max=num_palette_colors - 1)
-            inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
+        for batch in tqdm(loader, desc="Scoring"):
+            frames = batch["frames"].to(device, non_blocking=True).long()
+            file_idx = batch["file_idx"].tolist()
+            start_idx = batch["start_idx"].tolist()
 
-            codes = tokenizer(inp, return_codes=True,
-                              video_contains_first_frame=video_contains_first_frame)
-            recon_video = tokenizer.decode_from_code_indices(
-                codes, video_contains_first_frame=video_contains_first_frame,
+            sample_loss, sample_acc, onehot_buffer = _score_batch(
+                model=model,
+                frames=frames,
+                num_colors=num_colors,
+                context_frames=context_frames,
+                onehot_dtype=onehot_dtype,
+                onehot_buffer=onehot_buffer,
             )
 
-            # Per-sample cross-entropy loss
-            for i in range(bs):
-                sample_loss = F.cross_entropy(
-                    recon_video[i:i+1], targets[i:i+1]
-                ).item()
-                recon_idx = recon_video[i].argmax(dim=0)  # (T, H, W)
-                correct = (recon_idx == targets[i]).sum().item()
-                total = targets[i].numel()
-                pixel_acc = correct / total
-
-                if indices is not None:
-                    global_idx = indices[sample_offset + i]
-                else:
-                    global_idx = sample_offset + i
-                file_idx, t_start = dataset.samples[global_idx]
-                file_path = dataset.data_files[file_idx]
-
-                all_results.append({
-                    "sample_idx": global_idx,
-                    "loss": round(sample_loss, 6),
-                    "pixel_accuracy": round(pixel_acc, 6),
-                    "file": file_path,
-                    "t_start": t_start,
-                })
-
-            sample_offset += bs
-
-    # ── Sort by loss ─────────────────────────────────────────────────
-    all_results.sort(key=lambda r: r["loss"])
-
-    losses = [r["loss"] for r in all_results]
-    accs = [r["pixel_accuracy"] for r in all_results]
-    print(f"\n{'='*60}")
-    print(f"Total samples evaluated: {len(all_results)}")
-    print(f"Loss  — mean: {np.mean(losses):.6f}  median: {np.median(losses):.6f}  "
-          f"std: {np.std(losses):.6f}")
-    print(f"Pixel acc — mean: {np.mean(accs):.4f}  median: {np.median(accs):.4f}")
-    print(f"{'='*60}")
-
-    k = min(args.top_k, len(all_results))
-    print(f"\n--- TOP {k} BEST (lowest loss) ---")
-    for r in all_results[:k]:
-        print(f"  loss={r['loss']:.6f}  acc={r['pixel_accuracy']:.4f}  "
-              f"file={os.path.basename(r['file'])}  t={r['t_start']}")
-
-    print(f"\n--- TOP {k} WORST (highest loss) ---")
-    for r in all_results[-k:][::-1]:
-        print(f"  loss={r['loss']:.6f}  acc={r['pixel_accuracy']:.4f}  "
-              f"file={os.path.basename(r['file'])}  t={r['t_start']}")
-
-    # ── Save JSON ────────────────────────────────────────────────────
-    output_path = args.output or os.path.join(ckpt_dir, "sample_rankings.json")
-    with open(output_path, "w") as f:
-        json.dump({
-            "checkpoint": args.checkpoint,
-            "step": step,
-            "num_samples": len(all_results),
-            "mean_loss": round(float(np.mean(losses)), 6),
-            "median_loss": round(float(np.median(losses)), 6),
-            "mean_pixel_accuracy": round(float(np.mean(accs)), 6),
-            "samples": all_results,
-        }, f, indent=2)
-    print(f"\nFull rankings saved to {output_path}")
-
-    # ── Save reconstruction images for best/worst ────────────────────
-    if args.save_images > 0:
-        img_dir = os.path.join(ckpt_dir, "sample_analysis")
-        os.makedirs(img_dir, exist_ok=True)
-        n_save = min(args.save_images, len(all_results))
-
-        file_idx_lookup = {f: i for i, f in enumerate(dataset.data_files)}
-
-        def save_sample_reconstruction(sample_info, label):
-            fi = file_idx_lookup[sample_info["file"]]
-            t = sample_info["t_start"]
-
-            if dataset.frames_by_file is not None:
-                frames = dataset.frames_by_file[fi]
-            else:
-                frames = dataset._get_frames_mmap(fi)
-
-            chunk = frames[t:t + seq_len, 0]  # (T, H, W) uint8
-            if crop_size is not None:
-                chunk = _crop_chunk(chunk, crop_size)
-
-            sample = torch.from_numpy(chunk.copy()).unsqueeze(0).to(device)  # (1, T, H, W)
-            targets = sample.long().clamp(max=num_palette_colors - 1)
-            inp = PaletteVideoTokenizer.indices_to_onehot(targets, num_palette_colors)
-
-            with torch.no_grad():
-                codes = tokenizer(inp, return_codes=True,
-                                  video_contains_first_frame=video_contains_first_frame)
-                recon_video = tokenizer.decode_from_code_indices(
-                    codes, video_contains_first_frame=video_contains_first_frame,
+            batch_size = frames.shape[0]
+            for i in range(batch_size):
+                dataset_idx = sample_offset + i if eval_indices is None else eval_indices[sample_offset + i]
+                data_file = str(dataset.data_files[int(file_idx[i])])
+                results.append(
+                    SampleResult(
+                        dataset_idx=int(dataset_idx),
+                        loss=float(sample_loss[i].item()),
+                        pixel_accuracy=float(sample_acc[i].item()),
+                        file=data_file,
+                        t_start=int(start_idx[i]),
+                    )
                 )
+            sample_offset += batch_size
 
-            original_rgb = palette[targets[0]]           # (T, H, W, 3)
-            original_frames = original_rgb.permute(0, 3, 1, 2)  # (T, 3, H, W)
-            recon_idx = recon_video[0].argmax(dim=0)     # (T, H, W)
-            recon_rgb = palette[recon_idx]
-            recon_frames = recon_rgb.permute(0, 3, 1, 2)
-            comparison = torch.cat([original_frames, recon_frames], dim=3)
+    if not results:
+        raise RuntimeError("No samples were scored")
 
-            fname = (f"{label}_loss{sample_info['loss']:.4f}"
-                     f"_acc{sample_info['pixel_accuracy']:.4f}"
-                     f"_t{sample_info['t_start']}.png")
-            save_image(comparison, os.path.join(img_dir, fname), nrow=1, padding=0)
+    results.sort(key=lambda item: item.loss)
 
-        print(f"\nSaving {n_save} best and {n_save} worst reconstructions to {img_dir}/")
-        for i, r in enumerate(tqdm(all_results[:n_save], desc="Saving best")):
-            save_sample_reconstruction(r, f"best_{i:03d}")
-        for i, r in enumerate(tqdm(all_results[-n_save:][::-1], desc="Saving worst")):
-            save_sample_reconstruction(r, f"worst_{i:03d}")
+    losses = np.array([item.loss for item in results], dtype=np.float64)
+    accuracies = np.array([item.pixel_accuracy for item in results], dtype=np.float64)
 
-        print(f"Images saved to {img_dir}/")
+    print("\n" + "=" * 72)
+    print(f"Scored clips: {len(results)}")
+    print(
+        "Loss  - "
+        f"mean: {losses.mean():.6f}  median: {np.median(losses):.6f}  std: {losses.std():.6f}"
+    )
+    print(
+        "Acc   - "
+        f"mean: {accuracies.mean():.4f}  median: {np.median(accuracies):.4f}"
+    )
+    print("=" * 72)
+
+    k = min(args.top_k, len(results))
+    print(f"\nTop {k} best (lowest loss):")
+    for item in results[:k]:
+        print(
+            f"  loss={item.loss:.6f}  acc={item.pixel_accuracy:.4f}  "
+            f"file={os.path.basename(item.file)}  t={item.t_start}"
+        )
+
+    print(f"\nTop {k} worst (highest loss):")
+    for item in results[-k:][::-1]:
+        print(
+            f"  loss={item.loss:.6f}  acc={item.pixel_accuracy:.4f}  "
+            f"file={os.path.basename(item.file)}  t={item.t_start}"
+        )
+
+    output_path = Path(args.output) if args.output else checkpoint_path.resolve().parent / "sample_rankings.json"
+    output_payload = {
+        "checkpoint": str(checkpoint_path),
+        "step": step,
+        "num_scored": len(results),
+        "model_name": "ltx_video_vae",
+        "clip_frames": clip_frames,
+        "context_frames": context_frames,
+        "total_clip_frames": total_clip_frames,
+        "data_dir": str(data_dir),
+        "mean_loss": float(losses.mean()),
+        "median_loss": float(np.median(losses)),
+        "std_loss": float(losses.std()),
+        "mean_pixel_accuracy": float(accuracies.mean()),
+        "samples": [asdict(item) for item in results],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w") as handle:
+        json.dump(output_payload, handle, indent=2)
+    print(f"\nSaved ranking JSON to {output_path}")
+
+    if args.save_images <= 0:
+        return
+
+    preview_dir = checkpoint_path.resolve().parent / "sample_analysis"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    n_save = min(args.save_images, len(results))
+
+    def save_preview(item: SampleResult, label: str) -> None:
+        sample = dataset[item.dataset_idx]
+        frames = sample["frames"].unsqueeze(0).to(device)
+        inputs = frames_to_one_hot(frames.long(), num_colors=num_colors, dtype=onehot_dtype)
+        with torch.no_grad():
+            outputs = model(inputs, sample_posterior=False)
+        logits, targets = split_context_targets(outputs.logits, frames.long(), context_frames)
+
+        filename = (
+            f"{label}_loss{item.loss:.4f}_acc{item.pixel_accuracy:.4f}_"
+            f"t{item.t_start}.png"
+        )
+        save_video_preview(
+            preview_dir / filename,
+            targets.detach().cpu(),
+            logits.detach().cpu(),
+            palette.detach().cpu(),
+            max_frames=targets.shape[1],
+        )
+
+    print(f"Saving {n_save} best and {n_save} worst previews to {preview_dir}")
+    for idx, item in enumerate(tqdm(results[:n_save], desc="Best previews")):
+        save_preview(item, f"best_{idx:03d}")
+
+    for idx, item in enumerate(tqdm(results[-n_save:][::-1], desc="Worst previews")):
+        save_preview(item, f"worst_{idx:03d}")
 
 
 if __name__ == "__main__":

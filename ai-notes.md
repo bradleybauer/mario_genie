@@ -291,8 +291,7 @@ The DiT jointly denoises both modalities using a shared diffusion timestep, with
 
 - In the current codebase, the discriminator is a training-only component:
 	- defined in `src/mario_world_model/gan_discriminator.py`
-	- used in the GAN training loops in `scripts/train_ltx_video_vae.py` and `scripts/train_magvit.py`
-	- explicitly disabled in `scripts/rank_samples.py`
+	- used in the GAN training loop in `scripts/train_ltx_video_vae.py`
 
 - So this is not implemented today, but it is technically feasible.
 

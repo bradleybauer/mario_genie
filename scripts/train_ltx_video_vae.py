@@ -765,6 +765,7 @@ def main() -> None:
                 else:
                     eval_metrics["step"] = step
                     eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                    eval_metrics["train_gnorm"] = grad_norm
                     metrics.append(eval_metrics)
                     save_metrics_json(output_dir / "metrics.json", metrics)
 

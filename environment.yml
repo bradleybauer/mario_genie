@@ -174,7 +174,6 @@ dependencies:
       - loguru==0.7.3
       - lpips==0.1.4
       - lxml==6.0.2
-      - magvit2-pytorch==0.5.1
       - markdown==3.10.2
       - markdown-it-py==4.0.0
       - markupsafe==3.0.3

@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -45,6 +46,19 @@ from mario_world_model.config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, A
 from mario_world_model.ltx_audio_vae import LTXAudioVAE
 from mario_world_model.normalized_dataset import NormalizedSequenceDataset
 from mario_world_model.system_info import collect_system_info, print_system_info
+from mario_world_model.training_utils import (
+    ThroughputTracker,
+    build_eval_loader,
+    build_progress,
+    build_replacement_train_loader,
+    create_accelerator_runtime,
+    get_model_state_dict,
+    infinite_batches,
+    save_json,
+    save_metrics_json,
+    split_train_eval_dataset,
+    unwrap_model,
+)
 
 
 console = Console()
@@ -170,10 +184,6 @@ def make_output_dir(args: argparse.Namespace) -> Path:
         return Path(args.resume_from).resolve().parent
     run_name = args.run_name or datetime.now().strftime("ltx_audio_vae_%Y%m%d_%H%M%S")
     return PROJECT_ROOT / "checkpoints" / run_name
-
-
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return getattr(model, "_orig_mod", model)
 
 
 def masked_l1_loss(prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -342,12 +352,13 @@ def save_training_state(
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
+    accelerator: Accelerator | None = None,
     discriminator: torch.nn.Module | None = None,
     discriminator_optimizer: AdamW | None = None,
     lecam_ema: LeCAMEMA | None = None,
 ) -> None:
     state = {
-        "model": unwrap_model(model).state_dict(),
+        "model": get_model_state_dict(model, accelerator=accelerator),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": step,
@@ -355,7 +366,7 @@ def save_training_state(
         "metrics": metrics,
     }
     if discriminator is not None and discriminator_optimizer is not None:
-        state["discriminator"] = discriminator.state_dict()
+        state["discriminator"] = get_model_state_dict(discriminator, accelerator=accelerator)
         state["discriminator_optimizer"] = discriminator_optimizer.state_dict()
         if lecam_ema is not None:
             state["lecam_ema"] = lecam_ema.state_dict()
@@ -392,91 +403,84 @@ def main() -> None:
         raise SystemExit("--lecam-decay must be in (0, 1)")
     seed_everything(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    console.print(f"Using device: {device}")
+    output_dir = make_output_dir(args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    runtime = create_accelerator_runtime(output_dir=output_dir, mixed_precision="no")
+    accelerator = runtime.accelerator
+    device = runtime.device
+    is_main_process = runtime.is_main_process
+
+    if is_main_process:
+        console.print(f"Using device: {device}")
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-        console.print("[tf32] TF32 matmul precision enabled")
+        if is_main_process:
+            console.print("[tf32] TF32 matmul precision enabled")
 
     system_info = collect_system_info()
-    print_system_info(system_info)
+    if is_main_process:
+        print_system_info(system_info)
 
-    output_dir = make_output_dir(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
-    dataset = NormalizedSequenceDataset(
-        data_dir=args.data_dir,
-        clip_frames=args.clip_frames,
-        include_frames=False,
-        include_audio=True,
-        num_workers=args.num_workers,
-        system_info=system_info,
-    )
-    console.print("[dataset] Index build complete.")
+    if is_main_process:
+        console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
+    with accelerator.main_process_first():
+        dataset = NormalizedSequenceDataset(
+            data_dir=args.data_dir,
+            clip_frames=args.clip_frames,
+            include_frames=False,
+            include_audio=True,
+            num_workers=args.num_workers,
+            system_info=system_info,
+        )
+    if is_main_process:
+        console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No audio training samples were found.")
-    target_frames = args.clip_frames - args.context_frames
-    if args.context_frames > 0:
-        console.print(
-            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-            f"({args.context_frames} context + {target_frames} target, "
-            f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
-        )
-        console.print(
-            f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
-        )
-    else:
-        console.print(
-            f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
-            f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
-        )
-    console.print(
-        f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-        f"{_format_bytes(dataset.dataset_bytes)} on disk."
-    )
 
-    eval_dataset = None
-    train_dataset = dataset
-    if args.eval_samples > 0 and len(dataset) > args.eval_samples:
-        generator = torch.Generator().manual_seed(args.seed)
-        permutation = torch.randperm(len(dataset), generator=generator)
-        eval_indices = permutation[:args.eval_samples].tolist()
-        train_indices = permutation[args.eval_samples:].tolist()
-        eval_dataset = Subset(dataset, eval_indices)
-        train_dataset = Subset(dataset, train_indices)
+    target_frames = args.clip_frames - args.context_frames
+    if is_main_process:
+        if args.context_frames > 0:
+            console.print(
+                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+                f"({args.context_frames} context + {target_frames} target, "
+                f"audio_frame_size={int(dataset.audio_frame_size or 0)})."
+            )
+            console.print(
+                f"[context] Reconstruction losses ignore the first {args.context_frames} frame(s) of each clip."
+            )
+        else:
+            console.print(
+                f"Found {len(dataset)} sequence segments of {args.clip_frames} frames "
+                f"(audio_frame_size={int(dataset.audio_frame_size or 0)})."
+            )
+        console.print(
+            f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
+            f"{_format_bytes(dataset.dataset_bytes)} on disk."
+        )
+
+    train_dataset, eval_dataset = split_train_eval_dataset(
+        dataset,
+        eval_samples=args.eval_samples,
+        seed=args.seed,
+    )
+    if eval_dataset is not None and is_main_process:
         console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
 
-    num_workers = max(args.num_workers, 0)
-    train_sampler = RandomSampler(train_dataset, replacement=True, num_samples=10**7)
-    train_loader = DataLoader(
+    train_loader = build_replacement_train_loader(
         train_dataset,
         batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=False,
-        num_workers=num_workers,
+        num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
     )
-
-    def batch_iter():
-        while True:
-            yield from train_loader
-
-    train_iter = batch_iter()
-
-    eval_loader = None
-    if eval_dataset is not None:
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=torch.cuda.is_available(),
-        )
+    eval_loader = build_eval_loader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=False,
+    )
 
     mel_extractor = LogMelSpectrogram(
         sample_rate=args.sample_rate,
@@ -506,21 +510,25 @@ def main() -> None:
         discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
         if args.use_lecam:
             lecam_ema = LeCAMEMA(decay=args.lecam_decay)
-        console.print(
-            f"[gan] Enabled discriminator {args.gan_target_size} "
-            f"({discriminator_num_parameters:,} params), "
-            f"gan_weight={args.gan_weight}, gan_lr={args.gan_lr:.2e}, "
-            f"gan_start_step={args.gan_start_step}, "
-            f"lecam={'on' if args.use_lecam else 'off'}"
-        )
+        if is_main_process:
+            console.print(
+                f"[gan] Enabled discriminator {args.gan_target_size} "
+                f"({discriminator_num_parameters:,} params), "
+                f"gan_weight={args.gan_weight}, gan_lr={args.gan_lr:.2e}, "
+                f"gan_start_step={args.gan_start_step}, "
+                f"lecam={'on' if args.use_lecam else 'off'}"
+            )
 
     if args.compile:
-        console.print("[compile] Compiling the model with torch.compile()...")
+        if is_main_process:
+            console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
         if discriminator is not None:
-            console.print("[compile] Compiling discriminator with torch.compile()...")
+            if is_main_process:
+                console.print("[compile] Compiling discriminator with torch.compile()...")
             discriminator = torch.compile(discriminator)
-        console.print("[compile] Compilation complete.")
+        if is_main_process:
+            console.print("[compile] Compilation complete.")
 
     optimizer = AdamW(model.parameters(), lr=args.lr)
     warmup_steps = max(int(args.warmup_steps), 0)
@@ -537,40 +545,58 @@ def main() -> None:
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     if warmup_steps > 0:
-        console.print(f"[lr] Warmup: {warmup_steps} steps \u2192 cosine decay to 10% of peak")
+        if is_main_process:
+            console.print(f"[lr] Warmup: {warmup_steps} steps -> cosine decay to 10% of peak")
     else:
-        console.print("[lr] Cosine decay (no warmup)")
+        if is_main_process:
+            console.print("[lr] Cosine decay (no warmup)")
 
     start_step = 0
     best_eval = float("inf")
     metrics: list[dict[str, float]] = []
 
     if args.resume_from is not None:
-        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
+        with accelerator.main_process_first():
+            checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
         unwrap_model(model).load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
             if "discriminator" in checkpoint and "discriminator_optimizer" in checkpoint:
                 discriminator.load_state_dict(checkpoint["discriminator"])
                 discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
-            else:
+            elif is_main_process:
                 console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")
             if args.use_lecam and lecam_ema is not None:
                 if "lecam_ema" in checkpoint:
                     lecam_ema.load_state_dict(checkpoint["lecam_ema"])
-                else:
+                elif is_main_process:
                     console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"]) + 1
         best_eval = float(checkpoint.get("best_eval", float("inf")))
         metrics = list(checkpoint.get("metrics", []))
-        console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+        if is_main_process:
+            console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
 
         if args.max_steps > 0 and start_step >= args.max_steps:
-            console.print(
-                f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
-            )
+            if is_main_process:
+                console.print(
+                    f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
+                )
             return
+
+    if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
+        model, discriminator, optimizer, discriminator_optimizer, train_loader = accelerator.prepare(
+            model,
+            discriminator,
+            optimizer,
+            discriminator_optimizer,
+            train_loader,
+        )
+    else:
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+    train_iter = infinite_batches(train_loader)
 
     config = vars(args).copy()
     config.update(
@@ -579,40 +605,32 @@ def main() -> None:
             "num_parameters": int(sum(parameter.numel() for parameter in model.parameters())),
             "discriminator_parameters": int(discriminator_num_parameters),
             "device": str(device),
+            "mixed_precision": "no",
+            "num_processes": int(accelerator.num_processes),
             "timestamp": datetime.now().isoformat(),
         }
     )
-    with (output_dir / "config.json").open("w") as handle:
-        json.dump(config, handle, indent=2)
-    console.print(f"Config saved to {output_dir / 'config.json'}")
-    console.print(json.dumps(config, indent=2))
+    if is_main_process:
+        save_json(output_dir / "config.json", config, indent=2)
+        console.print(f"Config saved to {output_dir / 'config.json'}")
+        console.print(json.dumps(config, indent=2))
 
-    console.print(f"Training LTX audio VAE on {len(train_dataset)} samples")
-    console.print(f"Output directory: {output_dir}")
-    console.print(f"Device: {device}")
-    console.print(f"Model parameters: {config['num_parameters']:,}")
+        console.print(f"Training LTX audio VAE on {len(train_dataset)} samples")
+        console.print(f"Output directory: {output_dir}")
+        console.print(f"Device: {device}")
+        console.print(f"Model parameters: {config['num_parameters']:,}")
+        if accelerator.num_processes > 1:
+            console.print(
+                f"Distributed training enabled with {accelerator.num_processes} processes "
+                f"(global batch={args.batch_size * accelerator.num_processes})."
+            )
 
     start_time = time.time()
-    perf_window_start = time.time()
-    perf_window_steps = 0
-    perf_window_samples = 0
-    samples_per_second = 0.0
-    steps_per_second = 0.0
-    perf_window_size = 20
-    use_live_progress = sys.stdout.isatty()
+    throughput_tracker = ThroughputTracker(window_steps=20)
+    use_live_progress = sys.stdout.isatty() and is_main_process
 
     total_train_steps = max(args.max_steps - start_step, 0)
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        TextColumn("{task.fields[status]}"),
-        disable=not use_live_progress,
-        refresh_per_second=2,
-    ) as progress:
+    with build_progress(use_live=use_live_progress) as progress:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         for step in range(start_step, args.max_steps):
@@ -631,14 +649,12 @@ def main() -> None:
             gan_fake_logit_value = 0.0
             gan_lecam_reg_value = 0.0
 
-            # Fast path: if all frame lengths are full-width, a reshape is enough.
             if all_full_length:
                 waveform = audio.reshape(audio.shape[0], -1)
             else:
                 waveform = frame_audio_to_waveform(audio, audio_lengths)
 
             waveform_lengths = audio_lengths.sum(dim=1).to(device)
-
             mel = mel_extractor(waveform)
 
             valid_mask = None
@@ -662,10 +678,14 @@ def main() -> None:
 
             mel_for_discriminator = mel
             if valid_mask is not None:
-                mel_for_discriminator = mel_for_discriminator * valid_mask.to(dtype=mel_for_discriminator.dtype).expand_as(mel_for_discriminator)
+                mel_for_discriminator = (
+                    mel_for_discriminator
+                    * valid_mask.to(dtype=mel_for_discriminator.dtype).expand_as(mel_for_discriminator)
+                )
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(mel)
+            with accelerator.autocast():
+                outputs = model(mel)
             recon_loss = masked_l1_loss(
                 outputs.reconstruction,
                 mel,
@@ -674,7 +694,6 @@ def main() -> None:
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
 
-            # Save detached fakes for discriminator update (before graph is freed).
             fake_mel_detached = None
             if gan_active and discriminator is not None:
                 fake_mel = outputs.reconstruction
@@ -682,32 +701,31 @@ def main() -> None:
                     fake_mel = fake_mel * valid_mask.to(dtype=fake_mel.dtype).expand_as(fake_mel)
                 fake_mel_detached = fake_mel.detach()
 
-                # --- Generator adversarial loss (live graph through discriminator) ---
                 set_requires_grad(discriminator, False)
-                gen_adv_loss = hinge_generator_loss(discriminator(fake_mel))
+                with accelerator.autocast():
+                    gen_adv_loss = hinge_generator_loss(discriminator(fake_mel))
                 gan_gen_loss_value = gen_adv_loss.item()
                 loss = loss + args.gan_weight * gen_adv_loss
                 del fake_mel, gen_adv_loss
 
-            # Generator backward (frees computation graph before discriminator update).
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            accelerator.backward(loss)
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             optimizer.step()
             scheduler.step()
 
-            # --- Discriminator update (after generator graph is freed) ---
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
-                real_scores = discriminator(mel_for_discriminator)
-                fake_scores = discriminator(fake_mel_detached)
-                discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
-                if args.use_lecam and lecam_ema is not None:
-                    lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
-                    gan_lecam_reg_value = lecam_reg.item()
-                    discr_loss = discr_loss + args.lecam_weight * lecam_reg
-                discr_loss.backward()
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                with accelerator.autocast():
+                    real_scores = discriminator(mel_for_discriminator)
+                    fake_scores = discriminator(fake_mel_detached)
+                    discr_loss = hinge_discriminator_loss(real_scores, fake_scores)
+                    if args.use_lecam and lecam_ema is not None:
+                        lecam_reg = lecam_ema.regularizer(real_scores, fake_scores)
+                        gan_lecam_reg_value = lecam_reg.item()
+                        discr_loss = discr_loss + args.lecam_weight * lecam_reg
+                accelerator.backward(discr_loss)
+                accelerator.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
                 discriminator_optimizer.step()
 
                 if args.use_lecam and lecam_ema is not None:
@@ -718,53 +736,47 @@ def main() -> None:
                 gan_fake_logit_value = fake_scores.mean().item()
                 del real_scores, fake_scores, discr_loss, fake_mel_detached
 
-            perf_window_steps += 1
-            perf_window_samples += audio.shape[0]
-            now = time.time()
-            elapsed_window = max(now - perf_window_start, 1e-9)
-            if perf_window_steps >= perf_window_size:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-                perf_window_start = now
-                perf_window_steps = 0
-                perf_window_samples = 0
-            else:
-                samples_per_second = perf_window_samples / elapsed_window
-                steps_per_second = perf_window_steps / elapsed_window
-
-            status = (
-                f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
-                f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+            samples_per_second, steps_per_second = throughput_tracker.update(
+                samples=audio.shape[0] * accelerator.num_processes,
             )
-            stats = gpu_stats(device)
-            if "gpu_util_pct" in stats:
-                status += f" gpu={stats['gpu_util_pct']:.0f}%"
-            if "gpu_mem_pct" in stats:
-                status += f" mem={stats['gpu_mem_pct']:.0f}%"
-            if "gpu_temp_c" in stats:
-                status += f" temp={stats['gpu_temp_c']:.0f}C"
-            if gan_active:
-                status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
-                if args.use_lecam:
-                    status += f" lecam={gan_lecam_reg_value:.4f}"
 
-            progress.update(
-                train_task,
-                advance=1,
-                status=status,
-            )
+            if is_main_process:
+                status = (
+                    f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
+                    f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                    f"gnorm={grad_norm:.2f} "
+                    f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
+                )
+                stats = gpu_stats(device)
+                if "gpu_util_pct" in stats:
+                    status += f" gpu={stats['gpu_util_pct']:.0f}%"
+                if "gpu_mem_pct" in stats:
+                    status += f" mem={stats['gpu_mem_pct']:.0f}%"
+                if "gpu_temp_c" in stats:
+                    status += f" temp={stats['gpu_temp_c']:.0f}C"
+                if gan_active:
+                    status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
+                    if args.use_lecam:
+                        status += f" lecam={gan_lecam_reg_value:.4f}"
+
+                progress.update(train_task, advance=1, status=status)
 
             if (
                 ((args.log_interval > 0 and step % args.log_interval == 0) or step == args.max_steps - 1)
                 and not use_live_progress
+                and is_main_process
             ):
                 elapsed = time.time() - start_time
-                examples_per_second = ((step - start_step + 1) * args.batch_size) / max(elapsed, 1e-6)
+                examples_per_second = (
+                    (step - start_step + 1)
+                    * args.batch_size
+                    * accelerator.num_processes
+                    / max(elapsed, 1e-6)
+                )
                 log_console.print(
                     f"step={step:06d} loss={loss.item():.4f} recon={recon_loss.item():.4f} "
                     f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
-                    f"ex/s={examples_per_second:.1f}"
+                    f"gnorm={grad_norm:.2f} ex/s={examples_per_second:.1f}"
                     + (
                         f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f} "
                         f"real={gan_real_logit_value:.4f} fake={gan_fake_logit_value:.4f}"
@@ -773,13 +785,22 @@ def main() -> None:
                     )
                 )
 
-            should_eval = (
+            eval_due = (
                 eval_loader is not None
                 and (
                     (args.eval_interval > 0 and (step + 1) % args.eval_interval == 0)
                     or step == args.max_steps - 1
                 )
             )
+            should_checkpoint = (
+                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
+                or step == args.max_steps - 1
+            )
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
+
+            eval_line: str | None = None
+            should_eval = eval_due and is_main_process
             if should_eval:
                 eval_metrics, preview = evaluate(
                     model,
@@ -792,9 +813,10 @@ def main() -> None:
                     context_frames=args.context_frames,
                 )
                 eval_metrics["step"] = step
+                eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                eval_metrics["train_gnorm"] = grad_norm
                 metrics.append(eval_metrics)
-                with (output_dir / "metrics.json").open("w") as handle:
-                    json.dump(metrics, handle, indent=2)
+                save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
                     f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
@@ -804,33 +826,34 @@ def main() -> None:
                 if preview is not None:
                     save_mel_preview(output_dir / f"preview_step_{step:06d}.png", preview[0], preview[1])
 
-                # Random training sample preview — pick the loudest of a few batches
-                with torch.no_grad():
-                    best_train_mel = None
-                    best_train_recon = None
-                    best_train_energy = -1.0
-                    for _ in range(5):
-                        train_batch = next(train_iter)
-                        train_audio = train_batch["audio"].to(device, non_blocking=True).float() / 32768.0
-                        train_audio_lengths = train_batch["audio_lengths"]
-                        if bool(torch.all(train_audio_lengths == train_audio.shape[-1])):
-                            train_waveform = train_audio.reshape(train_audio.shape[0], -1)
-                        else:
-                            train_waveform = frame_audio_to_waveform(train_audio, train_audio_lengths)
-                        train_mel = mel_extractor(train_waveform)
-                        energy = float(train_mel[0].mean())
-                        if energy > best_train_energy:
-                            best_train_energy = energy
-                            train_outputs = model(train_mel, sample_posterior=False)
-                            best_train_mel = train_mel.detach().cpu()
-                            best_train_recon = train_outputs.reconstruction.detach().cpu()
-                    if best_train_mel is not None:
-                        save_mel_preview(
-                            output_dir / f"train_preview_step_{step:06d}.png",
-                            best_train_mel,
-                            best_train_recon,
-                            title_prefix="[Train] ",
-                        )
+                if accelerator.num_processes == 1:
+                    with torch.no_grad():
+                        best_train_mel = None
+                        best_train_recon = None
+                        best_train_energy = -1.0
+                        for _ in range(5):
+                            train_batch = next(train_iter)
+                            train_audio = train_batch["audio"].to(device, non_blocking=True).float() / 32768.0
+                            train_audio_lengths = train_batch["audio_lengths"]
+                            if bool(torch.all(train_audio_lengths == train_audio.shape[-1])):
+                                train_waveform = train_audio.reshape(train_audio.shape[0], -1)
+                            else:
+                                train_waveform = frame_audio_to_waveform(train_audio, train_audio_lengths)
+                            train_mel = mel_extractor(train_waveform)
+                            energy = float(train_mel[0].mean())
+                            if energy > best_train_energy:
+                                best_train_energy = energy
+                                with accelerator.autocast():
+                                    train_outputs = model(train_mel, sample_posterior=False)
+                                best_train_mel = train_mel.detach().cpu()
+                                best_train_recon = train_outputs.reconstruction.detach().cpu()
+                        if best_train_mel is not None:
+                            save_mel_preview(
+                                output_dir / f"train_preview_step_{step:06d}.png",
+                                best_train_mel,
+                                best_train_recon,
+                                title_prefix="[Train] ",
+                            )
 
                 if eval_metrics["loss"] < best_eval:
                     best_eval = eval_metrics["loss"]
@@ -842,18 +865,15 @@ def main() -> None:
                         step=step,
                         best_eval=best_eval,
                         metrics=metrics,
+                        accelerator=accelerator,
                         discriminator=discriminator,
                         discriminator_optimizer=discriminator_optimizer,
                         lecam_ema=lecam_ema,
                     )
                     eval_line += f" | best={best_eval:.6f}"
 
-            should_checkpoint = (
-                (args.checkpoint_interval > 0 and (step + 1) % args.checkpoint_interval == 0)
-                or step == args.max_steps - 1
-            )
-            if should_checkpoint:
-                if should_eval:
+            if should_checkpoint and is_main_process:
+                if eval_line is not None:
                     eval_line += " | saved latest"
                 else:
                     log_console.print(f"[checkpoint] Saving latest weights at step {step}")
@@ -865,14 +885,19 @@ def main() -> None:
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,
+                    accelerator=accelerator,
                     discriminator=discriminator,
                     discriminator_optimizer=discriminator_optimizer,
                     lecam_ema=lecam_ema,
                 )
 
-            if should_eval:
+            if eval_line is not None and is_main_process:
                 log_console.print(eval_line)
+
+            if eval_due or should_checkpoint:
+                accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
+    main()
     main()
