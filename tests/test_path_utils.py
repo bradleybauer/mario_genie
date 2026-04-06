@@ -4,10 +4,11 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = str(PROJECT_ROOT / "src")
-sys.path.insert(0, SRC_DIR)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from path_utils import resolve_workspace_path, serialize_project_path
+from src.path_utils import resolve_workspace_path, serialize_project_path
 
 
 def test_serialize_project_path_prefers_project_relative(tmp_path: Path) -> None:

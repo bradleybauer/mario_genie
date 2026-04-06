@@ -9,11 +9,12 @@ from unittest import mock
 
 import pytest
 
-REMOTE_DIR = Path(__file__).resolve().parents[1] / "remote"
-if str(REMOTE_DIR) not in sys.path:
-    sys.path.insert(0, str(REMOTE_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-import provision
+from remote import provision
 
 
 # ── Fixtures ─────────────────────────────────────────────────────
@@ -499,6 +500,16 @@ class TestCmdUp:
             with pytest.raises(SystemExit, match="No instances created"):
                 provision.cmd_up(api_key, args)
 
+    @mock.patch.object(provision, "_search")
+    def test_invalid_disk_exits(self, mock_search, api_key):
+        args = argparse.Namespace(
+            disk=0, image="pytorch/pytorch", timeout=600,
+            sort="price", gpu=None,
+        )
+        with pytest.raises(SystemExit, match="Disk size must be a positive integer"):
+            provision.cmd_up(api_key, args)
+        mock_search.assert_not_called()
+
 
 # ── _wait ────────────────────────────────────────────────────────
 
@@ -573,6 +584,14 @@ class TestMain:
         args = mock_up.call_args[0][1]
         assert args.sort == "dlperf"
         assert args.gpu == "RTX_5090"
+
+    @mock.patch.object(provision, "_api_key", return_value="k")
+    @mock.patch.object(provision, "cmd_up")
+    def test_up_disk_gb_alias(self, mock_up, mock_key):
+        with mock.patch("sys.argv", ["provision.py", "up", "--disk-gb", "200"]):
+            provision.main()
+        args = mock_up.call_args[0][1]
+        assert args.disk == 200
 
     @mock.patch.object(provision, "_api_key", return_value="k")
     @mock.patch.object(provision, "cmd_down")

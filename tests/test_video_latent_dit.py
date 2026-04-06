@@ -9,10 +9,11 @@ import torch
 pytest.importorskip("diffusers")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = str(PROJECT_ROOT / "src")
-sys.path.insert(0, SRC_DIR)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
+from src.models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
 
 
 def _make_model(**kwargs) -> VideoLatentDiTDiffusers:

@@ -26,7 +26,6 @@ Usage
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 from collections import Counter
@@ -42,10 +41,9 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 from src.data.npy_db import load_recordings
 

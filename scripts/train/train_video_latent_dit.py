@@ -38,17 +38,16 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 from src.data.latent_dataset import LatentSequenceDataset
-from models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
-from models.video_vae import VideoVAE
-from path_utils import resolve_workspace_path
-from system_info import collect_system_info, print_system_info
-from training.trainer_common import (
+from src.models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
+from src.models.video_vae import VideoVAE
+from src.path_utils import resolve_workspace_path
+from src.system_info import collect_system_info, print_system_info
+from src.training.trainer_common import (
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -57,7 +56,7 @@ from training.trainer_common import (
     preview_path,
     should_log_step,
 )
-from training.training_utils import (
+from src.training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
     build_progress,

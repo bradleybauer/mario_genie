@@ -29,14 +29,13 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from models.video_vae import VideoVAE
+from src.models.video_vae import VideoVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
-from training.palette_video_vae_training import (
+from src.training.palette_video_vae_training import (
     frames_to_one_hot,
     save_video_preview,
     split_context_targets,

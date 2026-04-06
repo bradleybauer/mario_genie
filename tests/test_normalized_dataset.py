@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = str(PROJECT_ROOT / "src")
-sys.path.insert(0, SRC_DIR)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 from src.data.normalized_dataset import NormalizedSequenceDataset
 

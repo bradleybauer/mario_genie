@@ -28,12 +28,11 @@ from matplotlib.patches import Patch
 from scipy.ndimage import gaussian_filter1d
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from config import SEQUENCE_LENGTH
+from src.config import SEQUENCE_LENGTH
 
 
 def smooth(values: list[float], sigma: float) -> np.ndarray:

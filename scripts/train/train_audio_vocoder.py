@@ -26,23 +26,22 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 from src.data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
-from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
-from models.audio_vocoder import AudioVocoder
+from src.config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
+from src.models.audio_vocoder import AudioVocoder
 from src.data.normalized_dataset import NormalizedSequenceDataset
-from system_info import collect_system_info, print_system_info
-from training.audio_training_helpers import (
+from src.system_info import collect_system_info, print_system_info
+from src.training.audio_training_helpers import (
     build_mel_mask,
     build_waveform_mask,
     context_waveform_lengths,
     masked_l1_loss,
 )
-from training.trainer_common import (
+from src.training.trainer_common import (
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -54,7 +53,7 @@ from training.trainer_common import (
     seed_everything,
     should_log_step,
 )
-from training.training_utils import (
+from src.training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
     build_progress,

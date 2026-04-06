@@ -6,13 +6,14 @@ from pathlib import Path
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = str(PROJECT_ROOT / "src")
-sys.path.insert(0, SRC_DIR)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
-from models.audio_vae import AudioVAE
-from models.audio_vocoder import AudioVocoder
-from models.video_vae import VideoVAE
+from src.models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
+from src.models.audio_vae import AudioVAE
+from src.models.audio_vocoder import AudioVocoder
+from src.models.video_vae import VideoVAE
 
 
 def test_video_vae_preserves_video_shape() -> None:

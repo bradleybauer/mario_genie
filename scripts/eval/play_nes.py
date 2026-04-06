@@ -21,6 +21,7 @@ Controls:
     Gamepad also supported via evdev.
 """
 import argparse
+from pathlib import Path
 import sys
 import os
 import glob
@@ -37,10 +38,9 @@ from nes_py._rom import ROM
 from nes_py.nes_env import NESEnv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
 from src.data.gamepad import GamepadState
 

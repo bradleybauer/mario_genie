@@ -3,6 +3,7 @@
 
 Usage:
     python remote/provision.py up                  # search & provision
+    python remote/provision.py up --disk-gb 200    # request a larger root disk
     python remote/provision.py up --sort dlperf    # sort by DL perf
     python remote/provision.py up --gpu RTX_5090   # filter by GPU type
     python remote/provision.py ls                  # show running instances
@@ -145,6 +146,9 @@ def _print_table(headers: tuple, rows: list[tuple]) -> None:
 
 
 def cmd_up(api_key: str, args: argparse.Namespace) -> None:
+    if args.disk <= 0:
+        sys.exit("Disk size must be a positive integer number of GB.")
+
     gpu_msg = f", gpu: {args.gpu}" if args.gpu else ""
     cores = FILTERS.get("cpu_cores", {}).get("gte", "?")
     ram_gb = int(FILTERS.get("cpu_ram", {}).get("gte", 0) / 1000)
@@ -264,7 +268,7 @@ def cmd_up(api_key: str, args: argparse.Namespace) -> None:
         print()
         _print_table(("Name", "ID", "Status", "GPU", "VRAM", "BW", "Cores", "DLPerf", "DLP/$", "Total", "Location", "   ", "GPU%", "Temp", "CPU%", "RAM"), ls_rows)
 
-        print(f"\nDone! Next: python remote/setup_all.py")
+        print(f"\nDone! Next: python remote/setup.py all")
     else:
         sys.exit("No instances became ready.")
 
@@ -486,6 +490,7 @@ def parse_args() -> argparse.Namespace:
         epilog="""\
 examples:
   provision.py up                       Search & provision instances
+    provision.py up --disk-gb 200         Request a 200 GB root disk
   provision.py up --gpu RTX_5090        Only show RTX 5090 offers
   provision.py up --sort dlperf         Sort by DL performance
   provision.py ls                       List all running instances with stats
@@ -506,7 +511,15 @@ sort keys (comma-separated):
 
     up = sub.add_parser("up", help="Search & provision instances",
                         description="Search Vast.ai for GPU offers matching filters, display results, and provision selected instances.")
-    up.add_argument("--disk", type=int, default=50, help="Disk space in GB (default: 50)")
+    up.add_argument(
+        "--disk",
+        "--disk-gb",
+        dest="disk",
+        type=int,
+        default=50,
+        metavar="GB",
+        help="Requested root disk size in GB (default: 50)",
+    )
     up.add_argument("--image", default=IMAGE, help=f"Docker image (default: {IMAGE})")
     up.add_argument("--timeout", type=int, default=600, help="Seconds to wait for instances to become ready (default: 600)")
     up.add_argument("--sort", default="price",

@@ -9,7 +9,7 @@ from accelerate import Accelerator
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from training.losses import focal_cross_entropy
+from src.training.losses import focal_cross_entropy
 
 
 def frames_to_one_hot(

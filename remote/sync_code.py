@@ -5,10 +5,12 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from helpers import (
-    PROJECT_ROOT,
+from remote.helpers import (
     load_workers,
     report_results,
     rsync_to,

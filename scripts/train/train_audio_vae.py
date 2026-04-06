@@ -17,34 +17,24 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-from models.gan_discriminator import build_mel_discriminator, count_trainable_parameters
-from training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
+from src.models.gan_discriminator import build_mel_discriminator, count_trainable_parameters
+from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from src.data.audio_features import LogMelSpectrogram, frame_audio_to_waveform
-from config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
-from models.audio_vae import AudioVAE
+from src.config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
+from src.models.audio_vae import AudioVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset
-from system_info import collect_system_info, print_system_info
-from training.audio_training_helpers import build_mel_mask, context_waveform_lengths, masked_l1_loss
-from training.trainer_common import (
+from src.system_info import collect_system_info, print_system_info
+from src.training.audio_training_helpers import build_mel_mask, context_waveform_lengths, masked_l1_loss
+from src.training.trainer_common import (
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -56,7 +46,7 @@ from training.trainer_common import (
     seed_everything,
     should_log_step,
 )
-from training.training_utils import (
+from src.training.training_utils import (
     ThroughputTracker,
     build_eval_loader,
     build_progress,

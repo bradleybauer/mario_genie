@@ -8,17 +8,32 @@ Reads data/raw/ and produces data/normalized/:
       actions.json, ram_addresses.json).
 
 Usage:
-    python scripts/normalize.py
+    python scripts/collect/normalize_raw_dataset.py --workers 16
 """
 
+import argparse
+import os
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
@@ -36,6 +51,62 @@ NES_H = 240
 # Audio normalization parameters (derived from dataset-wide spectrum analysis)
 AUDIO_SAMPLE_RATE = 24000  # Retains 98.5% of dataset spectral energy
 AUDIO_DTYPE = np.int16
+
+CONSOLE = Console()
+
+_PASS1_PALETTE: np.ndarray | None = None
+_PASS1_LUT: np.ndarray | None = None
+_PASS1_TMPDIR: Path | None = None
+
+_PASS2_PAL_REMAP: np.ndarray | None = None
+_PASS2_ACT_REMAP: np.ndarray | None = None
+_PASS2_KEPT_COLS: np.ndarray | None = None
+_PASS2_OUT_DIR: Path | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Normalize raw Mesen recordings into data/normalized.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help=(
+            "Number of worker processes to use for per-recording work. "
+            "Default: use all logical CPUs, capped by recording count. Use 1 for sequential mode."
+        ),
+    )
+    return parser.parse_args()
+
+
+def resolve_worker_count(requested_workers: int, num_tasks: int) -> int:
+    """Choose a safe worker count for a pool-backed pass."""
+    if requested_workers < 0:
+        raise ValueError("--workers must be >= 0")
+    if num_tasks <= 0:
+        return 1
+    available = os.cpu_count() or 1
+    if requested_workers == 0:
+        # Each recording spawns two ffmpeg subprocesses and writes large temp files.
+        # A conservative default avoids exhausting ffmpeg thread/process resources.
+        desired = min(max(1, available // 2), 32)
+    else:
+        desired = requested_workers
+    return max(1, min(desired, num_tasks))
+
+
+def build_progress() -> Progress:
+    """Build a Rich progress bar matching existing repo scripts."""
+    return Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        MofNCompleteColumn(),
+        TextColumn("[cyan]{task.fields[rate]:>6.1f} rec/s"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=CONSOLE,
+        refresh_per_second=8,
+    )
 
 
 def load_palette(path: Path) -> np.ndarray:
@@ -70,12 +141,12 @@ def decode_avi_and_audio(
 
     # Launch video and audio decodes concurrently
     video_cmd = [
-        "ffmpeg", "-i", str(avi_path),
+        "ffmpeg", "-threads", "1", "-i", str(avi_path),
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-v", "error", "-",
     ]
     audio_cmd = [
-        "ffmpeg", "-i", str(avi_path),
+        "ffmpeg", "-threads", "1", "-i", str(avi_path),
         "-vn", "-ac", "1",
         "-ar", str(sample_rate),
         "-f", "s16le", "-acodec", "pcm_s16le",
@@ -106,7 +177,7 @@ def decode_avi_and_audio(
     rgb = raw.reshape(expected_frames, NES_H, NES_W, 3)
 
     # Parse audio
-    audio = np.frombuffer(audio_out, dtype=np.int16)
+    audio = np.frombuffer(audio_out, dtype=AUDIO_DTYPE)
 
     return rgb, audio, fps
 
@@ -216,200 +287,336 @@ def validate_recording_lengths(base: Path, frame_numbers: np.ndarray, actions: n
         raise ValueError(f"Mismatched frame counts for {base.name}: {details}")
 
 
+def init_pass1_worker(palette: np.ndarray, tmpdir_str: str) -> None:
+    """Initialize per-process state for the decode/statistics pass."""
+    global _PASS1_PALETTE, _PASS1_LUT, _PASS1_TMPDIR
+    _PASS1_PALETTE = palette
+    _PASS1_LUT = build_rgb_lut(palette)
+    _PASS1_TMPDIR = Path(tmpdir_str)
+
+
+def process_recording_pass1(task: tuple[int, str]) -> dict[str, Any]:
+    """Decode one recording, cache intermediate arrays, and return summary stats."""
+    if _PASS1_PALETTE is None or _PASS1_LUT is None or _PASS1_TMPDIR is None:
+        raise RuntimeError("Pass 1 worker state was not initialized")
+
+    index, base_str = task
+    base = Path(base_str)
+    frame_numbers = np.load(str(base) + ".frames.npy")
+    actions = np.load(str(base) + ".input.npy")
+    ram = np.load(str(base) + ".ram.npy")
+    validate_recording_lengths(base, frame_numbers, actions, ram)
+
+    frame_count = len(frame_numbers)
+    avi = Path(str(base) + ".avi")
+    rgb, raw_audio, fps = decode_avi_and_audio(avi, frame_count)
+    cropped = center_crop(rgb)
+    del rgb
+    pal_idx = rgb_to_palette_indices(cropped, _PASS1_LUT, _PASS1_PALETTE)
+    del cropped
+
+    palette_counts = np.bincount(pal_idx.ravel(), minlength=len(_PASS1_PALETTE))[: len(_PASS1_PALETTE)]
+    ram_min = ram.min(axis=0)
+    ram_max = ram.max(axis=0)
+    audio_out, audio_lengths = frame_aligned_audio(raw_audio, frame_count, fps)
+    del raw_audio
+
+    pal_path = _PASS1_TMPDIR / f"{index}_pal.npy"
+    audio_path = _PASS1_TMPDIR / f"{index}_audio.npy"
+    audio_len_path = _PASS1_TMPDIR / f"{index}_audio_len.npy"
+    np.save(str(pal_path), pal_idx)
+    np.save(str(audio_path), audio_out)
+    np.save(str(audio_len_path), audio_lengths)
+
+    return {
+        "index": index,
+        "name": base.name,
+        "frame_count": frame_count,
+        "fps": float(fps),
+        "palette_counts": palette_counts,
+        "used_palette": np.unique(pal_idx),
+        "used_actions": np.unique(actions),
+        "ram_min": ram_min,
+        "ram_max": ram_max,
+        "pal_idx_path": str(pal_path),
+        "audio_path": str(audio_path),
+        "audio_lengths_path": str(audio_len_path),
+    }
+
+
+def init_pass2_worker(
+    pal_remap: np.ndarray,
+    act_remap: np.ndarray,
+    kept_cols: np.ndarray,
+    out_dir_str: str,
+) -> None:
+    """Initialize per-process state for the remap/save pass."""
+    global _PASS2_PAL_REMAP, _PASS2_ACT_REMAP, _PASS2_KEPT_COLS, _PASS2_OUT_DIR
+    _PASS2_PAL_REMAP = pal_remap
+    _PASS2_ACT_REMAP = act_remap
+    _PASS2_KEPT_COLS = kept_cols
+    _PASS2_OUT_DIR = Path(out_dir_str)
+
+
+def process_recording_pass2(task: tuple[int, str, dict[str, Any]]) -> dict[str, Any]:
+    """Load cached arrays, remap them, and write a normalized .npz file."""
+    if _PASS2_PAL_REMAP is None or _PASS2_ACT_REMAP is None or _PASS2_KEPT_COLS is None or _PASS2_OUT_DIR is None:
+        raise RuntimeError("Pass 2 worker state was not initialized")
+
+    index, base_str, cache_entry = task
+    base = Path(base_str)
+    actions = np.load(str(base) + ".input.npy")
+    ram = np.load(str(base) + ".ram.npy")
+
+    pal_path = Path(cache_entry["pal_idx_path"])
+    audio_path = Path(cache_entry["audio_path"])
+    audio_lengths_path = Path(cache_entry["audio_lengths_path"])
+
+    pal_idx = np.load(str(pal_path))
+    audio_out = np.load(str(audio_path))
+    audio_lengths = np.load(str(audio_lengths_path))
+
+    frames_out = _PASS2_PAL_REMAP[pal_idx]
+    actions_out = _PASS2_ACT_REMAP[actions]
+    ram_out = ram[:, _PASS2_KEPT_COLS]
+
+    out_path = _PASS2_OUT_DIR / (base.name + ".npz")
+    np.savez_compressed(
+        str(out_path),
+        frames=frames_out,
+        actions=actions_out,
+        ram=ram_out,
+        audio=audio_out,
+        audio_lengths=audio_lengths,
+        audio_sample_rate=np.int32(AUDIO_SAMPLE_RATE),
+        video_fps=np.float32(cache_entry["fps"]),
+    )
+
+    pal_path.unlink(missing_ok=True)
+    audio_path.unlink(missing_ok=True)
+    audio_lengths_path.unlink(missing_ok=True)
+
+    return {
+        "index": index,
+        "name": base.name,
+        "frames_shape": tuple(int(v) for v in frames_out.shape),
+        "actions_shape": tuple(int(v) for v in actions_out.shape),
+        "ram_shape": tuple(int(v) for v in ram_out.shape),
+        "audio_shape": tuple(int(v) for v in audio_out.shape),
+    }
+
+
+def run_process_pool(
+    tasks: list[Any],
+    *,
+    worker_count: int,
+    description: str,
+    fn,
+    initializer=None,
+    initargs: tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    """Run tasks sequentially or in a process pool with a Rich progress bar."""
+    if not tasks:
+        return []
+
+    results: list[dict[str, Any] | None] = [None] * len(tasks)
+    start_time = time.time()
+    completed = 0
+
+    with build_progress() as progress:
+        task_id = progress.add_task(description, total=len(tasks), rate=0.0)
+
+        if worker_count == 1:
+            if initializer is not None:
+                initializer(*initargs)
+            for task in tasks:
+                result = fn(task)
+                results[result["index"]] = result
+                completed += 1
+                elapsed = max(time.time() - start_time, 1e-9)
+                progress.update(task_id, advance=1, rate=completed / elapsed)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                initializer=initializer,
+                initargs=initargs,
+            ) as pool:
+                futures = [pool.submit(fn, task) for task in tasks]
+                for future in as_completed(futures):
+                    result = future.result()
+                    results[result["index"]] = result
+                    completed += 1
+                    elapsed = max(time.time() - start_time, 1e-9)
+                    progress.update(task_id, advance=1, rate=completed / elapsed)
+
+    return [result for result in results if result is not None]
+
+
+def filter_empty_recordings(bases: list[Path]) -> list[Path]:
+    """Delete empty recordings in place and return the remaining base paths."""
+    valid_bases: list[Path] = []
+    deleted_count = 0
+    for base in bases:
+        frame_numbers = np.load(str(base) + ".frames.npy")
+        if len(frame_numbers) == 0:
+            deleted_count += 1
+            for suffix in RAW_SUFFIXES:
+                path = Path(str(base) + suffix)
+                if path.exists():
+                    path.unlink()
+            states_dir = Path(str(base) + "_states")
+            if states_dir.is_dir():
+                shutil.rmtree(states_dir)
+            continue
+        valid_bases.append(base)
+
+    if deleted_count:
+        CONSOLE.print(f"Removed {deleted_count} empty recording(s).")
+    return valid_bases
+
+
 def main():
+    args = parse_args()
     palette = load_palette(PALETTE_FILE)
-    lut = build_rgb_lut(palette)
     bases = scan_raw_recordings()
 
     if not bases:
         print("No recordings found in", RAW_DIR, file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(bases)} recording(s)\n")
-
-    # ── Remove empty recordings (0 frames) ───────────────────────────
-    valid_bases = []
-    for base in bases:
-        frame_numbers = np.load(str(base) + ".frames.npy")
-        if len(frame_numbers) == 0:
-            print(f"  Deleting empty recording: {base.name}")
-            for suffix in RAW_SUFFIXES:
-                p = Path(str(base) + suffix)
-                if p.exists():
-                    p.unlink()
-            # Also delete periodic save-state directory if present
-            states_dir = Path(str(base) + "_states")
-            if states_dir.is_dir():
-
-                shutil.rmtree(states_dir)
-        else:
-            valid_bases.append(base)
-    bases = valid_bases
+    CONSOLE.print(f"Found {len(bases)} recording(s) in {RAW_DIR}")
+    bases = filter_empty_recordings(bases)
 
     if not bases:
         print("No valid recordings remaining.", file=sys.stderr)
         sys.exit(1)
 
+    worker_count = resolve_worker_count(args.workers, len(bases))
+    CONSOLE.print(f"Using {worker_count} worker(s)")
+
     # ── Pass 1: decode each AVI once, collect stats, cache to temp ──
     tmpdir = Path(tempfile.mkdtemp(prefix="normalize_"))
-    print("Pass 1: decoding and scanning (results cached to temp) ...")
-    used_pal = set()
+    CONSOLE.print("Pass 1: decoding, cropping, palette indexing, and audio alignment ...")
+
+    used_pal: set[int] = set()
     palette_counts_full = np.zeros(len(palette), dtype=np.int64)
-    used_act = set()
-    ram_min = None
-    ram_max = None
-    cache_meta = []  # per-recording: {pal_idx_path, audio_path, audio_lengths_path, fps}
+    used_act: set[int] = set()
+    ram_min: np.ndarray | None = None
+    ram_max: np.ndarray | None = None
+    cache_meta: list[dict[str, Any]] = [dict() for _ in bases]
 
-    for i, base in enumerate(bases):
-        frame_numbers = np.load(str(base) + ".frames.npy")
-        actions = np.load(str(base) + ".input.npy")
-        ram = np.load(str(base) + ".ram.npy")
-        validate_recording_lengths(base, frame_numbers, actions, ram)
-
-        n = len(frame_numbers)
-        avi = Path(str(base) + ".avi")
-
-        print(f"  [{i+1}/{len(bases)}] {base.name} ({n} frames) ...")
-        rgb, raw_audio, fps = decode_avi_and_audio(avi, n)
-        cropped = center_crop(rgb)
-        del rgb
-        pal_idx = rgb_to_palette_indices(cropped, lut, palette)
-        del cropped
-
-        # Collect metadata stats
-        palette_counts_full += np.bincount(
-            pal_idx.ravel(),
-            minlength=len(palette),
-        )[:len(palette)]
-        used_pal.update(np.unique(pal_idx).tolist())
-        used_act.update(np.unique(actions).tolist())
-
-        if ram_min is None:
-            ram_min = ram.min(axis=0)
-            ram_max = ram.max(axis=0)
-        else:
-            ram_min = np.minimum(ram_min, ram.min(axis=0))
-            ram_max = np.maximum(ram_max, ram.max(axis=0))
-
-        # Frame-align audio and cache everything to temp files
-        audio_out, audio_lengths = frame_aligned_audio(raw_audio, n, fps)
-        del raw_audio
-
-        pal_path = tmpdir / f"{i}_pal.npy"
-        audio_path = tmpdir / f"{i}_audio.npy"
-        audio_len_path = tmpdir / f"{i}_audio_len.npy"
-        np.save(str(pal_path), pal_idx)
-        np.save(str(audio_path), audio_out)
-        np.save(str(audio_len_path), audio_lengths)
-        cache_meta.append({
-            "pal_idx_path": pal_path,
-            "audio_path": audio_path,
-            "audio_lengths_path": audio_len_path,
-            "fps": fps,
-        })
-        del pal_idx, audio_out, audio_lengths
-
-    # Build remapping tables
-    used_pal_sorted = sorted(used_pal)
-    pal_remap = np.zeros(len(palette), dtype=np.uint8)
-    for new, old in enumerate(used_pal_sorted):
-        pal_remap[old] = new
-
-    reduced_palette_counts = palette_counts_full[used_pal_sorted]
-    total_palette_pixels = int(reduced_palette_counts.sum())
-    if total_palette_pixels > 0:
-        reduced_palette_probs = reduced_palette_counts.astype(np.float64) / total_palette_pixels
-    else:
-        reduced_palette_probs = np.zeros_like(reduced_palette_counts, dtype=np.float64)
-
-    used_act_sorted = sorted(used_act)
-    act_remap = np.zeros(256, dtype=np.uint8)
-    for new, old in enumerate(used_act_sorted):
-        act_remap[old] = new
-
-    constant_mask = ram_min == ram_max
-    # Exclude Stack ($0100–$01FF) and OAM ($0200–$02FF) — noise / redundant with image
-    stack_oam_mask = np.zeros(ram_min.shape[0], dtype=bool)
-    stack_oam_mask[0x100:0x300] = True
-    kept_cols = np.where(~constant_mask & ~stack_oam_mask)[0]
-
-    print(f"\nPalette: {len(used_pal_sorted)} / {len(palette)} colors used")
-    print(f"Actions: {len(used_act_sorted)} unique values")
-    print(f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses (Stack+OAM excluded)")
-
-    # ── Write JSON mapping files ─────────────────────────────────────
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    palette_info = {
-        "num_colors": len(used_pal_sorted),
-        "reduced_to_original_index": used_pal_sorted,
-        "colors_rgb": [palette[i].tolist() for i in used_pal_sorted],
-    }
-    palette_distribution_info = {
-        "num_colors": len(used_pal_sorted),
-        "total_pixels": total_palette_pixels,
-        "counts": [int(v) for v in reduced_palette_counts.tolist()],
-        "probabilities": [float(v) for v in reduced_palette_probs.tolist()],
-    }
-    action_info = {
-        "num_actions": len(used_act_sorted),
-        "reduced_to_original_value": used_act_sorted,
-    }
-    ram_info = {
-        "num_addresses": int(len(kept_cols)),
-        "kept_addresses": kept_cols.tolist(),
-    }
-
-    for name, obj in [
-        ("palette.json", palette_info),
-        ("palette_distribution.json", palette_distribution_info),
-        ("actions.json", action_info),
-        ("ram_addresses.json", ram_info),
-    ]:
-        path = OUT_DIR / name
-        with open(path, "w") as f:
-            json.dump(obj, f, indent=2)
-        print(f"  Wrote {path}")
-
-    # ── Pass 2: load cached data, remap, and save (no ffmpeg) ────────
-    print("\nPass 2: remapping and saving ...")
-    for i, base in enumerate(bases):
-        actions = np.load(str(base) + ".input.npy")
-        ram = np.load(str(base) + ".ram.npy")
-        cm = cache_meta[i]
-
-        print(f"  [{i+1}/{len(bases)}] {base.name} ...")
-        pal_idx = np.load(str(cm["pal_idx_path"]))
-        audio_out = np.load(str(cm["audio_path"]))
-        audio_lengths = np.load(str(cm["audio_lengths_path"]))
-
-        frames_out = pal_remap[pal_idx]
-        del pal_idx
-        actions_out = act_remap[actions]
-        ram_out = ram[:, kept_cols]
-
-        out_path = OUT_DIR / (base.name + ".npz")
-        np.savez_compressed(
-            str(out_path),
-            frames=frames_out,
-            actions=actions_out,
-            ram=ram_out,
-            audio=audio_out,
-            audio_lengths=audio_lengths,
-            audio_sample_rate=np.int32(AUDIO_SAMPLE_RATE),
-            video_fps=np.float32(cm["fps"]),
+    try:
+        pass1_results = run_process_pool(
+            [(i, str(base)) for i, base in enumerate(bases)],
+            worker_count=worker_count,
+            description="Pass 1: decoding recordings",
+            fn=process_recording_pass1,
+            initializer=init_pass1_worker,
+            initargs=(palette, str(tmpdir)),
         )
-        print(f"    frames={frames_out.shape} actions={actions_out.shape} "
-              f"ram={ram_out.shape} audio={audio_out.shape}")
-        del frames_out, actions_out, ram_out, audio_out, audio_lengths
 
-        # Clean up temp files for this recording
-        cm["pal_idx_path"].unlink()
-        cm["audio_path"].unlink()
-        cm["audio_lengths_path"].unlink()
+        for result in pass1_results:
+            palette_counts_full += np.asarray(result["palette_counts"], dtype=np.int64)
+            used_pal.update(int(v) for v in np.asarray(result["used_palette"]).tolist())
+            used_act.update(int(v) for v in np.asarray(result["used_actions"]).tolist())
+            file_ram_min = np.asarray(result["ram_min"])
+            file_ram_max = np.asarray(result["ram_max"])
+            if ram_min is None:
+                ram_min = file_ram_min
+                ram_max = file_ram_max
+            else:
+                ram_min = np.minimum(ram_min, file_ram_min)
+                ram_max = np.maximum(ram_max, file_ram_max)
+            cache_meta[result["index"]] = {
+                "pal_idx_path": result["pal_idx_path"],
+                "audio_path": result["audio_path"],
+                "audio_lengths_path": result["audio_lengths_path"],
+                "fps": result["fps"],
+            }
 
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    print(f"\nDone. Output in {OUT_DIR}")
+        if ram_min is None or ram_max is None:
+            raise RuntimeError("No recording statistics were collected")
+
+        # Build remapping tables
+        used_pal_sorted = sorted(used_pal)
+        pal_remap = np.zeros(len(palette), dtype=np.uint8)
+        for new, old in enumerate(used_pal_sorted):
+            pal_remap[old] = new
+
+        reduced_palette_counts = palette_counts_full[used_pal_sorted]
+        total_palette_pixels = int(reduced_palette_counts.sum())
+        if total_palette_pixels > 0:
+            reduced_palette_probs = reduced_palette_counts.astype(np.float64) / total_palette_pixels
+        else:
+            reduced_palette_probs = np.zeros_like(reduced_palette_counts, dtype=np.float64)
+
+        used_act_sorted = sorted(used_act)
+        act_remap = np.zeros(256, dtype=np.uint8)
+        for new, old in enumerate(used_act_sorted):
+            act_remap[old] = new
+
+        constant_mask = ram_min == ram_max
+        # Exclude Stack ($0100–$01FF) and OAM ($0200–$02FF) — noise / redundant with image
+        stack_oam_mask = np.zeros(ram_min.shape[0], dtype=bool)
+        stack_oam_mask[0x100:0x300] = True
+        kept_cols = np.where(~constant_mask & ~stack_oam_mask)[0]
+
+        CONSOLE.print(f"Palette: {len(used_pal_sorted)} / {len(palette)} colors used")
+        CONSOLE.print(f"Actions: {len(used_act_sorted)} unique values")
+        CONSOLE.print(
+            f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses (Stack+OAM excluded)"
+        )
+
+        # ── Write JSON mapping files ─────────────────────────────────────
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        palette_info = {
+            "num_colors": len(used_pal_sorted),
+            "reduced_to_original_index": used_pal_sorted,
+            "colors_rgb": [palette[i].tolist() for i in used_pal_sorted],
+        }
+        palette_distribution_info = {
+            "num_colors": len(used_pal_sorted),
+            "total_pixels": total_palette_pixels,
+            "counts": [int(v) for v in reduced_palette_counts.tolist()],
+            "probabilities": [float(v) for v in reduced_palette_probs.tolist()],
+        }
+        action_info = {
+            "num_actions": len(used_act_sorted),
+            "reduced_to_original_value": used_act_sorted,
+        }
+        ram_info = {
+            "num_addresses": int(len(kept_cols)),
+            "kept_addresses": kept_cols.tolist(),
+        }
+
+        for name, obj in [
+            ("palette.json", palette_info),
+            ("palette_distribution.json", palette_distribution_info),
+            ("actions.json", action_info),
+            ("ram_addresses.json", ram_info),
+        ]:
+            path = OUT_DIR / name
+            with path.open("w") as handle:
+                json.dump(obj, handle, indent=2)
+            CONSOLE.print(f"Wrote {path}")
+
+        # ── Pass 2: load cached data, remap, and save (no ffmpeg) ────────
+        CONSOLE.print("Pass 2: remapping arrays and writing compressed .npz files ...")
+        pass2_results = run_process_pool(
+            [(i, str(base), cache_meta[i]) for i, base in enumerate(bases)],
+            worker_count=worker_count,
+            description="Pass 2: saving normalized files",
+            fn=process_recording_pass2,
+            initializer=init_pass2_worker,
+            initargs=(pal_remap, act_remap, kept_cols, str(OUT_DIR)),
+        )
+
+        total_frames = sum(int(result["frames_shape"][0]) for result in pass2_results)
+        CONSOLE.print(f"Done. Wrote {len(pass2_results)} normalized file(s), {total_frames:,} frames total.")
+        CONSOLE.print(f"Output in {OUT_DIR}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

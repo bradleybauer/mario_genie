@@ -28,19 +28,14 @@ import torch
 from nes_py.nes_env import NESEnv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-for import_root in (PROJECT_ROOT, PROJECT_ROOT / "src"):
-    import_root_str = str(import_root)
-    if import_root_str not in sys.path:
-        sys.path.insert(0, import_root_str)
+project_root_str = str(PROJECT_ROOT)
+if project_root_str not in sys.path:
+    sys.path.insert(0, project_root_str)
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from models.video_vae import VideoVAE
+from src.models.video_vae import VideoVAE
 from src.data.normalized_dataset import load_palette_info
 
-import play_nes as nes_play
+from scripts.eval import play_nes as nes_play
 
 DEFAULT_SCALE = 3
 DEFAULT_WINDOW_FRAMES = 4
