@@ -58,6 +58,7 @@ from src.training.trainer_common import (
 )
 from src.training.training_utils import (
     ThroughputTracker,
+    advance_progress,
     build_eval_loader,
     build_progress,
     build_replacement_train_loader,
@@ -901,7 +902,11 @@ def main() -> None:
             if not torch.isfinite(loss):
                 optimizer.zero_grad(set_to_none=True)
                 error_buffer.clear()
-                progress.update(task, advance=1, status=f"loss=nonfinite(skip) lr={lr_scheduler.get_last_lr()[0]:.2e}")
+                advance_progress(
+                    progress,
+                    task,
+                    status=f"loss=nonfinite(skip) lr={lr_scheduler.get_last_lr()[0]:.2e}",
+                )
                 continue
 
             accelerator.backward(loss)
@@ -928,11 +933,15 @@ def main() -> None:
                 samples=latents.shape[0] * accelerator.num_processes,
             )
 
-            progress.update(task, advance=1, status=(
-                f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e}"
-                + f" errbuf={len(error_buffer)}"
-                + f" sps={samples_per_second:.1f}"
-            ))
+            advance_progress(
+                progress,
+                task,
+                status=(
+                    f"loss={loss.item():.5f} lr={lr_scheduler.get_last_lr()[0]:.2e}"
+                    + f" errbuf={len(error_buffer)}"
+                    + f" sps={samples_per_second:.1f}"
+                ),
+            )
 
             if should_log:
                 with torch.no_grad():

@@ -14,6 +14,7 @@ from rich.progress import (
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -113,6 +114,21 @@ def build_progress(*, use_live: bool, refresh_per_second: int = 2) -> Progress:
         disable=not use_live,
         refresh_per_second=refresh_per_second,
     )
+
+
+def advance_progress(
+    progress: Progress,
+    task_id: TaskID,
+    *,
+    advance: float = 1,
+    status: str | None = None,
+) -> None:
+    update_kwargs: dict[str, Any] = {"advance": advance}
+    if status is not None:
+        task = progress.tasks[task_id]
+        previous_status = task.fields.get("status", "")
+        update_kwargs["status"] = status or previous_status
+    progress.update(task_id, **update_kwargs)
 
 
 @dataclass

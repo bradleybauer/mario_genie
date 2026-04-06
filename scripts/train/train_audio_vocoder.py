@@ -55,6 +55,7 @@ from src.training.trainer_common import (
 )
 from src.training.training_utils import (
     ThroughputTracker,
+    advance_progress,
     build_eval_loader,
     build_progress,
     build_replacement_train_loader,
@@ -765,7 +766,7 @@ def main() -> None:
                 if bytes_per_sample is not None:
                     status += f" MB/s={(samples_per_second * bytes_per_sample) / 2**20:.0f}"
 
-                progress.update(train_task, advance=1, status=status)
+                advance_progress(progress, train_task, status=status)
 
             log_due = should_log_step(
                 step,

@@ -49,6 +49,7 @@ from src.training.trainer_common import (
 )
 from src.training.training_utils import (
     ThroughputTracker,
+    advance_progress,
     build_eval_loader,
     build_progress,
     build_replacement_train_loader,
@@ -70,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000)
@@ -137,6 +138,19 @@ def save_ram_preview(
     plt.close(fig)
 
 
+def compute_ram_vae_losses(
+    model: RAMVAE,
+    outputs,
+    target_ram: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    reconstruction = outputs.reconstruction.float()
+    posterior_mean = outputs.posterior_mean.float()
+    posterior_logvar = outputs.posterior_logvar.float()
+    recon_loss = F.mse_loss(reconstruction, target_ram)
+    kl_loss = model.kl_loss(posterior_mean, posterior_logvar)
+    return recon_loss, kl_loss
+
+
 def evaluate(
     model: RAMVAE,
     loader: DataLoader,
@@ -153,14 +167,16 @@ def evaluate(
         for batch in loader:
             ram = batch["ram"].to(device, non_blocking=True).float() / 255.0
             outputs = model(ram)
-            recon_loss = F.mse_loss(outputs.reconstruction, ram)
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
+            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram)
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
 
             if preview is None:
                 preview_out = model(ram[:1], sample_posterior=False)
-                preview = (ram[:1].detach().cpu(), preview_out.reconstruction.detach().cpu())
+                preview = (
+                    ram[:1].detach().cpu(),
+                    preview_out.reconstruction.detach().float().cpu(),
+                )
                 del preview_out
 
     model.train()
@@ -387,8 +403,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
                 outputs = model(ram)
-            recon_loss = F.mse_loss(outputs.reconstruction, ram)
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
+            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram)
             loss = recon_loss + args.kl_weight * kl_loss
 
             accelerator.backward(loss)
@@ -430,7 +445,7 @@ def main() -> None:
                         f"gnorm={grad_norm:.2f} "
                         f"{samples_per_second:.0f} samp/s"
                     )
-                    progress.update(train_task, advance=1, status=status)
+                    advance_progress(progress, train_task, status=status)
 
                     if not use_live_progress:
                         elapsed = time.time() - start_time
@@ -438,9 +453,9 @@ def main() -> None:
                             f"[step {step:>6d}] {status} ({elapsed:.0f}s)"
                         )
                 else:
-                    progress.update(train_task, advance=1, status="")
+                    advance_progress(progress, train_task)
             else:
-                progress.update(train_task, advance=1, status="")
+                advance_progress(progress, train_task)
 
             # --- Eval ---
             eval_due = eval_loader is not None and is_periodic_event_due(
