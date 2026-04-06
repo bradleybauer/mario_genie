@@ -24,6 +24,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from scipy.ndimage import gaussian_filter1d
 
@@ -99,9 +100,9 @@ def scale_figsize(width: float, height: float, figure_scale: float) -> tuple[flo
 
 def legend_columns(num_series: int) -> int:
     """Choose a compact legend layout based on the number of compared runs."""
-    if num_series <= 4:
+    if num_series <= 3:
         return 1
-    if num_series <= 10:
+    if num_series <= 6:
         return 2
     return 3
 
@@ -182,14 +183,98 @@ def build_run_styles(runs: list[dict]) -> dict[str, dict[str, object]]:
 
 
 FACET_PROPERTIES = ("init_dim", "codebook_size", "model", "attention")
+RUN_TIMESTAMP_PATTERN = re.compile(r"^(?P<stem>.+?)_(?P<date>20\d{6})_(?P<time>\d{6})$")
+
+
+def _cfg_get(cfg: dict, key: str, default=None):
+    """Read a config value from either the legacy flat schema or nested sections."""
+    if key in cfg:
+        return cfg.get(key, default)
+
+    for section_name in ("training", "model", "data", "runtime"):
+        section = cfg.get(section_name)
+        if isinstance(section, dict) and key in section:
+            return section[key]
+
+    return default
+
+
+def _cfg_model_name(cfg: dict) -> str:
+    """Return a string model identifier when one exists."""
+    model_value = cfg.get("model")
+    if isinstance(model_value, str):
+        return model_value
+
+    model_name = cfg.get("model_name")
+    if isinstance(model_name, str):
+        return model_name
+
+    return ""
+
+
+def _truncate_middle(text: str, max_length: int = 30) -> str:
+    """Keep labels compact without losing both the prefix and suffix."""
+    if len(text) <= max_length:
+        return text
+
+    keep = max_length - 3
+    left = keep // 2
+    right = keep - left
+    return f"{text[:left]}...{text[-right:]}"
+
+
+def _simplify_run_label(name: str) -> tuple[str, str | None]:
+    """Turn a run directory name into a compact plot label."""
+    base_name = name.rsplit("/", 1)[-1]
+    time_suffix = None
+
+    match = RUN_TIMESTAMP_PATTERN.match(base_name)
+    if match:
+        base_name = match.group("stem")
+        time_suffix = match.group("time")
+
+    label = base_name.replace("_", " ")
+    label = re.sub(r"\bdim(\d+)\b", r"d\1", label)
+    label = re.sub(r"\bvideo latent dit\b", "latent dit", label)
+    label = re.sub(r"\bspatiotemporal\b", "spatiotemp", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    return label, time_suffix
+
+
+def build_run_labels(runs: list[dict], max_length: int = 30) -> dict[str, str]:
+    """Build readable, stable, and mostly unique labels for plots."""
+    grouped: dict[str, list[tuple[str, str | None]]] = defaultdict(list)
+    for run in runs:
+        label, time_suffix = _simplify_run_label(run["name"])
+        grouped[label].append((run["name"], time_suffix))
+
+    labels: dict[str, str] = {}
+    for label, entries in grouped.items():
+        for index, (run_name, time_suffix) in enumerate(entries, start=1):
+            unique_label = label
+            if len(entries) > 1:
+                if time_suffix:
+                    unique_label = f"{label} {time_suffix}"
+                else:
+                    unique_label = f"{label} #{index}"
+            labels[run_name] = _truncate_middle(unique_label, max_length=max_length)
+
+    return labels
 
 
 def _parse_model_dim_cb(cfg: dict) -> tuple[str, str]:
     """Extract init_dim and codebook_size from config, falling back to model name."""
-    dim = cfg.get("init_dim")
-    cb = cfg.get("codebook_size")
+    dim = _cfg_get(cfg, "init_dim")
+    cb = _cfg_get(cfg, "codebook_size")
+
+    if dim is None:
+        for dim_key in ("latent_dim", "latent_channels", "hidden_dim", "base_channels"):
+            dim = _cfg_get(cfg, dim_key)
+            if dim is not None:
+                break
+
     if dim is None or cb is None:
-        model_name = cfg.get("model", "")
+        model_name = _cfg_model_name(cfg)
         m = re.match(r"dim(\d+)_cb(\d+)", model_name)
         if m:
             dim = dim or int(m.group(1))
@@ -212,7 +297,7 @@ def extract_run_property(run: dict, prop: str) -> str:
         return "other"
     if prop == "attention":
         return "With Attention" if "attn" in name else "Without Attention"
-    return str(cfg.get(prop, "?"))
+    return str(_cfg_get(cfg, prop, "?"))
 
 
 def abbreviate_layer_component(component: str) -> str:
@@ -251,7 +336,7 @@ def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
 
 def resolve_data_dir(run: dict) -> Path | None:
     """Resolve a run's configured data directory to an existing path."""
-    data_dir = run["config"].get("data_dir")
+    data_dir = _cfg_get(run["config"], "data_dir")
     if not data_dir:
         return None
 
@@ -297,16 +382,16 @@ def estimate_train_sample_count(run: dict) -> int | None:
     if data_dir is None:
         return None
 
-    sequence_length = int(cfg.get("sequence_length", SEQUENCE_LENGTH) or SEQUENCE_LENGTH)
+    sequence_length = int(_cfg_get(cfg, "sequence_length", SEQUENCE_LENGTH) or SEQUENCE_LENGTH)
     total_sequences = count_dataset_sequences(str(data_dir), sequence_length)
     if total_sequences is None:
         return None
 
-    overfit_n = int(cfg.get("overfit_n", 0) or 0)
+    overfit_n = int(_cfg_get(cfg, "overfit_n", 0) or 0)
     if overfit_n > 0:
         return min(overfit_n, total_sequences)
 
-    eval_samples = int(cfg.get("eval_samples", 0) or 0)
+    eval_samples = int(_cfg_get(cfg, "eval_samples", 0) or 0)
     if eval_samples > 0 and total_sequences > eval_samples:
         return total_sequences - eval_samples
     return total_sequences
@@ -427,8 +512,8 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
             ("name", run["name"]),
             ("dim", dim),
             ("cb_size", cb_size),
-            ("num_params", f"{cfg.get('num_parameters', 0):,}"),
-            ("batch_size", cfg.get("batch_size", "?")),
+            ("num_params", f"{_cfg_get(cfg, 'num_parameters', 0):,}"),
+            ("batch_size", _cfg_get(cfg, "batch_size", "?")),
             ("min_recon", f"{min_recon:.4f}"),
             ("eval_recon", f"{eval_recon:.4f}" if eval_recon is not None else ""),
             ("eval_px_acc", f"{eval_pixel_acc:.4f}" if eval_pixel_acc is not None else ""),
@@ -501,6 +586,7 @@ def plot_comparison(
     has_eval = any("eval_recon_loss" in m for run in runs for m in run["metrics"])
     axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
     run_styles = build_run_styles(runs)
+    run_labels = build_run_labels(runs)
 
     # Build panel list: recon loss always, then optional panels
     panels = ["recon"]
@@ -536,6 +622,17 @@ def plot_comparison(
             runs,
             key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
         )
+        legend_handles = [
+            Line2D(
+                [0],
+                [0],
+                color=run_styles[run["name"]]["color"],
+                linestyle=run_styles[run["name"]]["linestyle"],
+                linewidth=run_styles[run["name"]]["linewidth"],
+            )
+            for run in sorted_runs
+        ]
+        legend_labels = [run_labels[run["name"]] for run in sorted_runs]
 
         # --- Recon loss ---
         ax = axes[0]
@@ -543,11 +640,8 @@ def plot_comparison(
             _, x_values, recon = get_recon_series(run["metrics"], x_axis)
             if x_values:
                 style = run_styles[run["name"]]
-                label = run["name"]
-                params = run["config"].get("num_parameters", 0)
-                if params:
-                    label += f" ({params / 1e6:.1f}M)"
-                ax.plot(
+                label = run_labels[run["name"]]
+                line = ax.plot(
                     x_values,
                     smooth(recon, smooth_window),
                     label=label,
@@ -555,14 +649,12 @@ def plot_comparison(
                     linestyle=style["linestyle"],
                     alpha=0.9,
                     linewidth=style["linewidth"],
-                )
+                )[0]
         ylabel = "Smoothed Reconstruction Loss" if has_smoothed_recon else "Reconstruction Loss"
         title = "Smoothed Reconstruction Loss by Run" if has_smoothed_recon else "Reconstruction Loss by Run"
         ax.set_ylabel(ylabel)
         ax.set_yscale("log")
         ax.set_title(title)
-        if show_legend:
-            ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
         ax.grid(True, alpha=0.3)
 
         # --- Codebook usage ---
@@ -575,8 +667,8 @@ def plot_comparison(
                 cb_steps = [m[axis_key] * axis_scale for m in cb_points]
                 cb_usage = [m["codebook_usage"] for m in cb_points]
                 if cb_steps:
-                    cb_size = run["config"].get("codebook_size", None)
-                    label = run["name"]
+                    cb_size = _cfg_get(run["config"], "codebook_size", None)
+                    label = run_labels[run["name"]]
                     line = ax.plot(
                         cb_steps,
                         smooth(cb_usage, smooth_window),
@@ -595,8 +687,6 @@ def plot_comparison(
                 ax.set_ylim(*usage_ylim)
             ax.set_ylabel("Unique Codes Used")
             ax.set_title("Codebook Usage by Run")
-            if show_legend:
-                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
             ax.grid(True, alpha=0.3)
 
         # --- Eval recon loss + pixel accuracy ---
@@ -610,7 +700,7 @@ def plot_comparison(
                     ax.plot(
                         x_vals,
                         eval_recon,
-                        label=run["name"],
+                        label=run_labels[run["name"]],
                         color=style["color"],
                         linestyle=style["linestyle"],
                         marker="o",
@@ -634,8 +724,6 @@ def plot_comparison(
             ax.set_yscale("log")
             ax2.set_ylabel("Pixel Accuracy", alpha=0.6)
             ax.set_title("Eval Recon Loss and Pixel Accuracy by Run")
-            if show_legend:
-                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
             ax.grid(True, alpha=0.3)
 
         # --- LFQ loss breakdown ---
@@ -649,7 +737,7 @@ def plot_comparison(
                     ax.plot(
                         x_vals,
                         smooth(batch_h, smooth_window),
-                        label=f"{run['name']} (batch H)",
+                        label=f"{run_labels[run['name']]} H",
                         color=style["color"],
                         linestyle=style["linestyle"],
                         alpha=0.9,
@@ -660,7 +748,7 @@ def plot_comparison(
                     ax2.plot(
                         x_vals,
                         smooth(commit, smooth_window),
-                        label=f"{run['name']} (commit)",
+                        label=f"{run_labels[run['name']]} C",
                         color=style["color"],
                         linestyle=":",
                         alpha=0.5,
@@ -669,10 +757,6 @@ def plot_comparison(
             ax.set_ylabel("Batch Entropy")
             ax2.set_ylabel("Commitment", alpha=0.6)
             ax.set_title("Quantizer Health by Run")
-            if show_legend:
-                lines1, labels1 = ax.get_legend_handles_labels()
-                lines2, labels2 = ax2.get_legend_handles_labels()
-                ax.legend(lines1 + lines2, labels1 + labels2, ncol=legend_ncols, frameon=True, handlelength=3.0)
             ax.grid(True, alpha=0.3)
 
         # --- Learning rate schedule ---
@@ -700,7 +784,7 @@ def plot_comparison(
                     ax.plot(
                         x_plot,
                         lr_vals,
-                        label=run["name"],
+                        label=run_labels[run["name"]],
                         color=style["color"],
                         linestyle=style["linestyle"],
                         alpha=0.9,
@@ -714,12 +798,25 @@ def plot_comparison(
             ax.set_ylabel("Learning Rate")
             ax.set_title("Learning Rate Schedule by Run")
             ax.ticklabel_format(axis="y", style="scientific", scilimits=(-3, -3))
-            if show_legend:
-                ax.legend(ncol=legend_ncols, frameon=True, handlelength=3.0)
             ax.grid(True, alpha=0.3)
 
         axes[-1].set_xlabel(axis_label)
-        fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
+        if show_legend and legend_handles:
+            legend_rows = (len(legend_handles) + legend_ncols - 1) // legend_ncols
+            fig.legend(
+                legend_handles,
+                legend_labels,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.995),
+                ncol=legend_ncols,
+                frameon=True,
+                handlelength=2.6,
+                columnspacing=1.2,
+            )
+            top_margin = max(0.82, 0.98 - 0.03 * legend_rows)
+            fig.tight_layout(rect=(0, 0, 1, top_margin), pad=max(1.0, 1.0 * font_scale))
+        else:
+            fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
 
         if output_path:
             fig.savefig(output_path, dpi=DEFAULT_SAVE_DPI, bbox_inches="tight")
@@ -757,6 +854,7 @@ def plot_faceted(
     sorted_keys = sorted(groups.keys(), key=sort_key)
     ncols = len(sorted_keys)
     run_styles = build_run_styles(runs)
+    run_labels = build_run_labels(runs)
     has_smoothed = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
     axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
 
@@ -764,6 +862,21 @@ def plot_faceted(
         fig, axes = plt.subplots(1, ncols, figsize=scale_figsize(6 * ncols, 5, figure_scale), sharey=True)
         if ncols == 1:
             axes = [axes]
+        sorted_runs = sorted(
+            runs,
+            key=lambda r: min(get_recon_series(r["metrics"], x_axis)[2], default=float("inf")),
+        )
+        legend_handles = [
+            Line2D(
+                [0],
+                [0],
+                color=run_styles[run["name"]]["color"],
+                linestyle=run_styles[run["name"]]["linestyle"],
+                linewidth=run_styles[run["name"]]["linewidth"],
+            )
+            for run in sorted_runs
+        ]
+        legend_labels = [run_labels[run["name"]] for run in sorted_runs]
 
         for ax, key in zip(axes, sorted_keys):
             group_runs = sorted(
@@ -774,11 +887,8 @@ def plot_faceted(
                 _, x_values, recon = get_recon_series(run["metrics"], x_axis)
                 if x_values:
                     style = run_styles[run["name"]]
-                    label = run["name"].rsplit("/", 1)[-1]
-                    params = run["config"].get("num_parameters", 0)
-                    if params:
-                        label += f" ({params / 1e6:.1f}M)"
-                    ax.plot(
+                    label = run_labels[run["name"]]
+                    line = ax.plot(
                         x_values,
                         smooth(recon, smooth_window),
                         label=label,
@@ -786,18 +896,32 @@ def plot_faceted(
                         linestyle=style["linestyle"],
                         alpha=0.9,
                         linewidth=style["linewidth"],
-                    )
+                    )[0]
             ax.set_title(str(key))
             ax.set_yscale("log")
             ax.set_xlabel(axis_label)
-            if show_legend:
-                ax.legend(ncol=legend_columns(len(group_runs)), frameon=True)
             ax.grid(True, alpha=0.3)
 
         ylabel = "Smoothed Recon Loss" if has_smoothed else "Recon Loss"
         axes[0].set_ylabel(ylabel)
         fig.suptitle(f"Reconstruction Loss by {facet_by}", y=1.02)
-        fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
+        if show_legend and legend_handles:
+            legend_ncols = legend_columns(len(legend_handles))
+            legend_rows = (len(legend_handles) + legend_ncols - 1) // legend_ncols
+            fig.legend(
+                legend_handles,
+                legend_labels,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.995),
+                ncol=legend_ncols,
+                frameon=True,
+                handlelength=2.6,
+                columnspacing=1.2,
+            )
+            top_margin = max(0.82, 0.96 - 0.03 * legend_rows)
+            fig.tight_layout(rect=(0, 0, 1, top_margin), pad=max(1.0, 1.0 * font_scale))
+        else:
+            fig.tight_layout(pad=max(1.0, 1.0 * font_scale))
 
         if output_path:
             fig.savefig(output_path, dpi=DEFAULT_SAVE_DPI, bbox_inches="tight")
@@ -819,14 +943,12 @@ def plot_bar(
         print("Nothing to plot.")
         return
 
+    run_labels = build_run_labels(runs)
     entries = []
     for run in runs:
         _, recon_losses = get_recon_values(run["metrics"])
         best = min(recon_losses) if recon_losses else float("inf")
-        params = run["config"].get("num_parameters", 0)
-        label = run["name"].rsplit("/", 1)[-1]
-        if params:
-            label += f" ({params / 1e6:.1f}M)"
+        label = run_labels[run["name"]]
         prop = extract_run_property(run, color_by) if color_by else None
         entries.append((label, best, prop))
 
