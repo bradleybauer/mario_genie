@@ -13,6 +13,8 @@ if project_root_str not in sys.path:
 from src.models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
 from src.models.audio_vae import AudioVAE
 from src.models.audio_vocoder import AudioVocoder
+from src.models.ram_video_vae import RAMVideoVAE
+from src.models.ram_video_vae_v2 import RAMVideoVAEv2
 from src.models.video_vae import VideoVAE
 
 
@@ -43,6 +45,104 @@ def test_video_vae_temporal_downsample_preserves_output_shape() -> None:
     assert output.posterior_mean.shape == (2, 4, 3, 1, 1)
     assert output.posterior_logvar.shape == (2, 4, 3, 1, 1)
     assert output.latents.shape == (2, 4, 3, 1, 1)
+
+
+def test_ram_video_vae_preserves_ram_and_video_shapes() -> None:
+    model = RAMVideoVAE(
+        n_bytes=32,
+        num_colors=8,
+        frame_height=32,
+        frame_width=32,
+        hidden_dim=32,
+        latent_dim=8,
+        video_base_channels=8,
+        video_latent_channels=4,
+    )
+    ram = torch.randint(0, 256, (2, 4, 32), dtype=torch.uint8)
+
+    output = model(ram, sample_posterior=False)
+
+    assert output.video_logits.shape == (2, 8, 4, 32, 32)
+    assert output.ram_reconstruction.shape == (2, 4, 32)
+    assert output.posterior_mean.shape == (2, 4, 8)
+    assert output.posterior_logvar.shape == (2, 4, 8)
+    assert output.latents.shape == (2, 4, 8)
+    assert output.video_latents.shape == (2, 4, 4, 1, 1)
+
+
+def test_ram_video_vae_temporal_downsample_preserves_output_shape() -> None:
+    model = RAMVideoVAE(
+        n_bytes=16,
+        num_colors=8,
+        frame_height=64,
+        frame_width=96,
+        hidden_dim=32,
+        latent_dim=8,
+        video_base_channels=8,
+        video_latent_channels=4,
+        temporal_downsample=1,
+    )
+    ram = torch.randint(0, 256, (2, 5, 16), dtype=torch.uint8)
+
+    output = model(ram, sample_posterior=False)
+
+    assert output.video_logits.shape == (2, 8, 5, 64, 96)
+    assert output.ram_reconstruction.shape == (2, 5, 16)
+    assert output.posterior_mean.shape == (2, 5, 8)
+    assert output.posterior_logvar.shape == (2, 5, 8)
+    assert output.latents.shape == (2, 5, 8)
+    assert output.video_latents.shape == (2, 4, 3, 2, 3)
+
+
+def test_ram_video_vae_v2_preserves_ram_and_video_shapes() -> None:
+    model = RAMVideoVAEv2(
+        n_bytes=32,
+        num_colors=8,
+        frame_height=32,
+        frame_width=32,
+        hidden_dim=32,
+        latent_dim=8,
+        video_base_channels=8,
+        video_latent_channels=4,
+        video_adapter_dim=32,
+        video_adapter_heads=4,
+    )
+    ram = torch.randint(0, 256, (2, 4, 32), dtype=torch.uint8)
+
+    output = model(ram, sample_posterior=False)
+
+    assert output.video_logits.shape == (2, 8, 4, 32, 32)
+    assert output.ram_reconstruction.shape == (2, 4, 32)
+    assert output.posterior_mean.shape == (2, 4, 8)
+    assert output.posterior_logvar.shape == (2, 4, 8)
+    assert output.latents.shape == (2, 4, 8)
+    assert output.video_latents.shape == (2, 4, 4, 1, 1)
+
+
+def test_ram_video_vae_v2_temporal_downsample_preserves_output_shape() -> None:
+    model = RAMVideoVAEv2(
+        n_bytes=16,
+        num_colors=8,
+        frame_height=64,
+        frame_width=96,
+        hidden_dim=32,
+        latent_dim=8,
+        video_base_channels=8,
+        video_latent_channels=4,
+        temporal_downsample=1,
+        video_adapter_dim=32,
+        video_adapter_heads=4,
+    )
+    ram = torch.randint(0, 256, (2, 5, 16), dtype=torch.uint8)
+
+    output = model(ram, sample_posterior=False)
+
+    assert output.video_logits.shape == (2, 8, 5, 64, 96)
+    assert output.ram_reconstruction.shape == (2, 5, 16)
+    assert output.posterior_mean.shape == (2, 5, 8)
+    assert output.posterior_logvar.shape == (2, 5, 8)
+    assert output.latents.shape == (2, 5, 8)
+    assert output.video_latents.shape == (2, 4, 3, 2, 3)
 
 
 def test_audio_vae_preserves_mel_shape() -> None:

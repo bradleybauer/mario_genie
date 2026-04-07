@@ -182,11 +182,32 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return unwrapped
 
 
+def normalize_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    if not state_dict:
+        return state_dict
+    if any(key.startswith("_orig_mod.") for key in state_dict):
+        return {
+            key.removeprefix("_orig_mod."): value
+            for key, value in state_dict.items()
+        }
+    return state_dict
+
+
+def load_model_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict[str, Any],
+    *,
+    strict: bool = True,
+) -> Any:
+    target_model = unwrap_model(model)
+    normalized_state_dict = normalize_state_dict_keys(state_dict)
+    return target_model.load_state_dict(normalized_state_dict, strict=strict)
+
+
 def get_model_state_dict(
     model: torch.nn.Module,
     *,
     accelerator: Accelerator | None = None,
 ) -> dict[str, Any]:
-    if accelerator is not None:
-        return accelerator.get_state_dict(model)
-    return unwrap_model(model).state_dict()
+    base_model = accelerator.unwrap_model(model) if accelerator is not None else model
+    return unwrap_model(base_model).state_dict()

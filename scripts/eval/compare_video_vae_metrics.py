@@ -118,11 +118,24 @@ def get_metric_series(metrics: list[dict], key: str, x_axis: str) -> tuple[list[
 
 def get_recon_values(metrics: list[dict]) -> tuple[str | None, list[float]]:
     """Return the preferred reconstruction-loss values for summaries and sorting."""
-    for key in ("smoothed_recon_loss", "recon_loss"):
+    for key in ("smoothed_recon_loss", "recon_loss", "video_recon_loss"):
         values = [m[key] for m in metrics if key in m]
         if values:
             return key, values
     return None, []
+
+
+def get_latest_eval_metric(metrics: list[dict], *keys: str) -> float | None:
+    """Return the latest eval metric value for the first matching key."""
+    eval_row = next((metric for metric in reversed(metrics) if metric.get("type") == "eval"), None)
+    if eval_row is None:
+        return None
+
+    for key in keys:
+        value = eval_row.get(key)
+        if value is not None:
+            return value
+    return None
 
 
 def get_x_axis_metadata(x_axis: str) -> tuple[str, float, str]:
@@ -309,31 +322,6 @@ def abbreviate_layer_component(component: str) -> str:
     return f"{abbreviated_name}{sep}{value}"
 
 
-def get_codebook_usage_ylim(runs: list[dict]) -> tuple[float, float] | None:
-    """Fit codebook-usage axis limits to observed values only."""
-    usages = [
-        m["codebook_usage"]
-        for run in runs
-        for m in run["metrics"]
-        if "codebook_usage" in m
-    ]
-    if not usages:
-        return None
-
-    min_usage = min(usages)
-    max_usage = max(usages)
-    if min_usage == max_usage:
-        padding = max(1.0, max_usage * 0.05)
-    else:
-        padding = max(1.0, (max_usage - min_usage) * 0.05)
-
-    lower = max(0.0, min_usage - padding)
-    upper = max_usage + padding
-    if lower == upper:
-        upper = lower + 1.0
-    return lower, upper
-
-
 def resolve_data_dir(run: dict) -> Path | None:
     """Resolve a run's configured data directory to an existing path."""
     data_dir = _cfg_get(run["config"], "data_dir")
@@ -479,50 +467,28 @@ def summarise(runs: list[dict]) -> list[OrderedDict]:
         _, recon_values = get_recon_values(metrics)
         min_recon = min(recon_values) if recon_values else float("nan")
 
-        # Final codebook usage
-        cb_entries = [m for m in metrics if "codebook_usage" in m]
-        final_cb = cb_entries[-1]["codebook_usage"] if cb_entries else None
-        max_cb = max(m["codebook_usage"] for m in cb_entries) if cb_entries else None
-
-        # Eval metrics (from final entry if present)
+        # Eval metrics (from the latest eval entry if present)
         last = metrics[-1]
-        eval_recon = last.get("eval_recon_loss")
-        eval_pixel_acc = last.get("eval_pixel_accuracy")
-        eval_cb_util = last.get("eval_codebook_utilization")
-        eval_entropy = last.get("eval_code_entropy_bits")
-        eval_max_entropy = last.get("eval_max_entropy_bits")
+        eval_recon = get_latest_eval_metric(metrics, "eval_recon_loss", "recon_loss", "video_recon_loss")
+        eval_pixel_acc = get_latest_eval_metric(metrics, "eval_pixel_accuracy")
 
         # Last step / elapsed
         total_steps = get_total_steps(metrics)
         elapsed_s = last.get("elapsed_s", 0)
 
-        steps_per_s = total_steps / elapsed_s if elapsed_s > 0 else float("nan")
-
-        # LFQ loss breakdown from final entry
-        final_lfq_aux = last.get("lfq_aux_loss")
-        final_lfq_commitment = last.get("lfq_commitment")
-        final_lfq_batch_entropy = last.get("lfq_batch_entropy")
-        final_lfq_per_sample_entropy = last.get("lfq_per_sample_entropy")
         final_lr = last.get("lr")
         samples_per_sec = last.get("samples_per_sec")
 
-        dim, cb_size = _parse_model_dim_cb(cfg)
+        dim, _ = _parse_model_dim_cb(cfg)
 
         rows.append(OrderedDict([
             ("name", run["name"]),
             ("dim", dim),
-            ("cb_size", cb_size),
             ("num_params", f"{_cfg_get(cfg, 'num_parameters', 0):,}"),
             ("batch_size", _cfg_get(cfg, "batch_size", "?")),
             ("min_recon", f"{min_recon:.4f}"),
             ("eval_recon", f"{eval_recon:.4f}" if eval_recon is not None else ""),
             ("eval_px_acc", f"{eval_pixel_acc:.4f}" if eval_pixel_acc is not None else ""),
-            ("final_cb", final_cb),
-            ("cb_util", f"{eval_cb_util:.1%}" if eval_cb_util is not None else ""),
-            ("entropy", f"{eval_entropy:.2f}/{eval_max_entropy:.2f}" if eval_entropy is not None and eval_max_entropy is not None else ""),
-            ("lfq_aux", f"{final_lfq_aux:.4f}" if final_lfq_aux is not None else ""),
-            ("batch_H", f"{final_lfq_batch_entropy:.2f}" if final_lfq_batch_entropy is not None else ""),
-            ("commit", f"{final_lfq_commitment:.4f}" if final_lfq_commitment is not None else ""),
             ("lr", f"{final_lr:.2e}" if final_lr is not None else ""),
             ("steps", total_steps),
             ("elapsed", _format_elapsed(elapsed_s)),
@@ -579,23 +545,14 @@ def plot_comparison(
         print("Nothing to plot.")
         return
 
-    has_cb = any("codebook_usage" in m for run in runs for m in run["metrics"])
     has_smoothed_recon = any("smoothed_recon_loss" in m for run in runs for m in run["metrics"])
-    has_lfq = any("lfq_batch_entropy" in m for run in runs for m in run["metrics"])
     has_lr = any("lr" in m for run in runs for m in run["metrics"])
-    has_eval = any("eval_recon_loss" in m for run in runs for m in run["metrics"])
-    axis_key, axis_scale, axis_label = get_x_axis_metadata(x_axis)
+    _, _, axis_label = get_x_axis_metadata(x_axis)
     run_styles = build_run_styles(runs)
     run_labels = build_run_labels(runs)
 
-    # Build panel list: recon loss always, then optional panels
+    # Build panel list: recon loss always, then optional panels that vary over the x-axis.
     panels = ["recon"]
-    if has_eval:
-        panels.append("eval")
-    if has_cb:
-        panels.append("codebook")
-    if has_lfq:
-        panels.append("lfq")
     if has_lr:
         panels.append("lr")
     nrows = len(panels)
@@ -612,8 +569,6 @@ def plot_comparison(
         if nrows == 1:
             axes = [axes]
 
-        marker_small = max(3.0, 2.0 * font_scale)
-        marker_medium = max(4.0, 2.4 * font_scale)
         marker_large = max(6.0, 3.8 * font_scale)
         legend_ncols = legend_columns(len(runs))
 
@@ -656,108 +611,6 @@ def plot_comparison(
         ax.set_yscale("log")
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
-
-        # --- Codebook usage ---
-        if "codebook" in panels:
-            ax = axes[panels.index("codebook")]
-            for run in sorted_runs:
-                metrics = run["metrics"]
-                style = run_styles[run["name"]]
-                cb_points = [m for m in metrics if "codebook_usage" in m and axis_key in m]
-                cb_steps = [m[axis_key] * axis_scale for m in cb_points]
-                cb_usage = [m["codebook_usage"] for m in cb_points]
-                if cb_steps:
-                    cb_size = _cfg_get(run["config"], "codebook_size", None)
-                    label = run_labels[run["name"]]
-                    line = ax.plot(
-                        cb_steps,
-                        smooth(cb_usage, smooth_window),
-                        marker=".",
-                        markersize=marker_small,
-                        label=label,
-                        color=style["color"],
-                        linestyle=style["linestyle"],
-                        alpha=0.85,
-                        linewidth=style["linewidth"],
-                    )[0]
-                    if cb_size is not None:
-                        ax.axhline(cb_size, color=line.get_color(), linestyle=":", alpha=0.25, linewidth=0.8)
-            usage_ylim = get_codebook_usage_ylim(sorted_runs)
-            if usage_ylim is not None:
-                ax.set_ylim(*usage_ylim)
-            ax.set_ylabel("Unique Codes Used")
-            ax.set_title("Codebook Usage by Run")
-            ax.grid(True, alpha=0.3)
-
-        # --- Eval recon loss + pixel accuracy ---
-        if "eval" in panels:
-            ax = axes[panels.index("eval")]
-            ax2 = ax.twinx()
-            for run in sorted_runs:
-                style = run_styles[run["name"]]
-                x_vals, eval_recon = get_metric_series(run["metrics"], "eval_recon_loss", x_axis)
-                if x_vals:
-                    ax.plot(
-                        x_vals,
-                        eval_recon,
-                        label=run_labels[run["name"]],
-                        color=style["color"],
-                        linestyle=style["linestyle"],
-                        marker="o",
-                        markersize=marker_medium,
-                        alpha=0.9,
-                        linewidth=style["linewidth"],
-                    )
-                x_vals, px_acc = get_metric_series(run["metrics"], "eval_pixel_accuracy", x_axis)
-                if x_vals:
-                    ax2.plot(
-                        x_vals,
-                        px_acc,
-                        color=style["color"],
-                        linestyle=":",
-                        marker="s",
-                        markersize=marker_small,
-                        alpha=0.5,
-                        linewidth=max(0.8, style["linewidth"] * 0.6),
-                    )
-            ax.set_ylabel("Eval Recon Loss")
-            ax.set_yscale("log")
-            ax2.set_ylabel("Pixel Accuracy", alpha=0.6)
-            ax.set_title("Eval Recon Loss and Pixel Accuracy by Run")
-            ax.grid(True, alpha=0.3)
-
-        # --- LFQ loss breakdown ---
-        if "lfq" in panels:
-            ax = axes[panels.index("lfq")]
-            ax2 = ax.twinx()
-            for run in sorted_runs:
-                style = run_styles[run["name"]]
-                x_vals, batch_h = get_metric_series(run["metrics"], "lfq_batch_entropy", x_axis)
-                if x_vals:
-                    ax.plot(
-                        x_vals,
-                        smooth(batch_h, smooth_window),
-                        label=f"{run_labels[run['name']]} H",
-                        color=style["color"],
-                        linestyle=style["linestyle"],
-                        alpha=0.9,
-                        linewidth=style["linewidth"],
-                    )
-                x_vals, commit = get_metric_series(run["metrics"], "lfq_commitment", x_axis)
-                if x_vals:
-                    ax2.plot(
-                        x_vals,
-                        smooth(commit, smooth_window),
-                        label=f"{run_labels[run['name']]} C",
-                        color=style["color"],
-                        linestyle=":",
-                        alpha=0.5,
-                        linewidth=max(0.8, style["linewidth"] * 0.6),
-                    )
-            ax.set_ylabel("Batch Entropy")
-            ax2.set_ylabel("Commitment", alpha=0.6)
-            ax.set_title("Quantizer Health by Run")
-            ax.grid(True, alpha=0.3)
 
         # --- Learning rate schedule ---
         if "lr" in panels:
