@@ -41,7 +41,7 @@ def setup_worker(worker):
     )
     ssh(worker, (
         "apt-get update && "
-        "apt-get install -y build-essential ca-certificates curl htop pkg-config libssl-dev vim && "
+        "apt-get install -y build-essential ca-certificates curl ranger htop pkg-config libssl-dev vim && "
         "command -v cargo >/dev/null 2>&1 || curl https://sh.rustup.rs -sSf | sh -s -- -y && "
         ". $HOME/.cargo/env && "
         "command -v cargo-binstall >/dev/null 2>&1 || cargo install cargo-binstall && "
