@@ -6,6 +6,8 @@ Usage:
     python remote/provision.py up --disk-gb 200    # request a larger root disk
     python remote/provision.py up --sort dlperf    # sort by DL perf
     python remote/provision.py up --gpu RTX_5090   # filter by GPU type
+    python remote/provision.py up --num-gpus 2     # require 2 GPUs per instance
+    python remote/provision.py up --num-gpus any   # allow any GPU count
     python remote/provision.py ls                  # show running instances
     python remote/provision.py down                # tear down everything
     python remote/provision.py update-config       # regenerate config.py
@@ -16,11 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
-
-try:
-    import requests
-except ImportError:
-    sys.exit("Missing 'requests' — pip install requests")
+import requests
 
 API = "https://console.vast.ai/api/v0"
 CONFIG_PATH = Path(__file__).resolve().parent / "config.py"
@@ -85,7 +83,20 @@ def _parse_sort(sort_str: str) -> list[list[str]]:
     return order
 
 
-def _search(api_key: str, disk: int, sort: str, gpu: str | None = None) -> list[dict]:
+def _parse_num_gpus(value: str) -> int | None:
+    raw = value.strip().lower()
+    if raw == "any":
+        return None
+    try:
+        num_gpus = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError("--num-gpus must be a positive integer or 'any'") from None
+    if num_gpus <= 0:
+        raise argparse.ArgumentTypeError("--num-gpus must be a positive integer or 'any'")
+    return num_gpus
+
+
+def _search(api_key: str, disk: int, sort: str, gpu: str | None = None, num_gpus: int | None = 1) -> list[dict]:
     body = {
         "limit": 10000,
         "type": "on-demand",
@@ -93,6 +104,10 @@ def _search(api_key: str, disk: int, sort: str, gpu: str | None = None) -> list[
         "allocated_storage": disk,
         **FILTERS,
     }
+    if num_gpus is None:
+        body.pop("num_gpus", None)
+    else:
+        body["num_gpus"] = {"eq": num_gpus}
     if gpu:
         body["gpu_name"] = {"eq": gpu.replace("_", " ")}
     data = _req("POST", "/bundles/", api_key, json=body)
@@ -148,15 +163,19 @@ def _print_table(headers: tuple, rows: list[tuple]) -> None:
 def cmd_up(api_key: str, args: argparse.Namespace) -> None:
     if args.disk <= 0:
         sys.exit("Disk size must be a positive integer number of GB.")
+    num_gpus = getattr(args, "num_gpus", FILTERS["num_gpus"]["eq"])
+    if num_gpus is not None and num_gpus <= 0:
+        sys.exit("GPU count must be a positive integer.")
 
     gpu_msg = f", gpu: {args.gpu}" if args.gpu else ""
     cores = FILTERS.get("cpu_cores", {}).get("gte", "?")
     ram_gb = int(FILTERS.get("cpu_ram", {}).get("gte", 0) / 1000)
     vram_gb = int(FILTERS.get("gpu_ram", {}).get("gt", FILTERS.get("gpu_ram", {}).get("gte", 0)) / 1000)
     inet = FILTERS.get("inet_down", {}).get("gte", "?")
+    gpu_count_msg = "any GPU count" if num_gpus is None else f"{num_gpus} GPU(s)"
     print(f"Searching for offers (sort: {args.sort}{gpu_msg}) ...")
-    print(f"  Filters: ≥{cores} cores, ≥{ram_gb} GB RAM, >{vram_gb} GB VRAM, ≥{inet} Mbps")
-    offers = _search(api_key, args.disk, args.sort, gpu=args.gpu)
+    print(f"  Filters: {gpu_count_msg}, ≥{cores} cores, ≥{ram_gb} GB RAM, >{vram_gb} GB VRAM, ≥{inet} Mbps")
+    offers = _search(api_key, args.disk, args.sort, gpu=args.gpu, num_gpus=num_gpus)
     if not offers:
         sys.exit("No matching offers found.")
 
@@ -492,6 +511,8 @@ examples:
   provision.py up                       Search & provision instances
     provision.py up --disk-gb 200         Request a 200 GB root disk
   provision.py up --gpu RTX_5090        Only show RTX 5090 offers
+        provision.py up --num-gpus 2          Only show 2-GPU offers
+        provision.py up --num-gpus any        Allow any GPU count
   provision.py up --sort dlperf         Sort by DL performance
   provision.py ls                       List all running instances with stats
   provision.py down 32920182            Destroy instance by ID
@@ -525,6 +546,7 @@ sort keys (comma-separated):
     up.add_argument("--sort", default="price",
                     help="Sort keys, comma-separated: price,dlperf,value,vram,bw (default: price)")
     up.add_argument("--gpu", default=None, help="Filter by GPU type, e.g. RTX_5090, RTX_4090")
+    up.add_argument("--num-gpus", type=_parse_num_gpus, default=FILTERS["num_gpus"]["eq"], help="Require this many GPUs per instance, or 'any' to disable the filter (default: 1)")
 
     sub.add_parser("ls", help="List instances",
                    description="Show all Vast.ai instances with hardware specs and live usage stats.")

@@ -319,6 +319,20 @@ class TestSearch:
         assert body["rented"] == {"eq": False}
 
     @mock.patch.object(provision, "_req")
+    def test_num_gpus_filter_can_be_overridden(self, mock_req, api_key):
+        mock_req.return_value = {"offers": []}
+        provision._search(api_key, disk=50, sort="price", num_gpus=4)
+        body = mock_req.call_args[1]["json"]
+        assert body["num_gpus"] == {"eq": 4}
+
+    @mock.patch.object(provision, "_req")
+    def test_num_gpus_filter_can_be_disabled(self, mock_req, api_key):
+        mock_req.return_value = {"offers": []}
+        provision._search(api_key, disk=50, sort="price", num_gpus=None)
+        body = mock_req.call_args[1]["json"]
+        assert "num_gpus" not in body
+
+    @mock.patch.object(provision, "_req")
     def test_no_gpu_filter_when_none(self, mock_req, api_key):
         mock_req.return_value = {"offers": []}
         provision._search(api_key, disk=50, sort="price", gpu=None)
@@ -579,11 +593,12 @@ class TestMain:
     @mock.patch.object(provision, "_api_key", return_value="k")
     @mock.patch.object(provision, "cmd_up")
     def test_up_args(self, mock_up, mock_key):
-        with mock.patch("sys.argv", ["provision.py", "up", "--sort", "dlperf", "--gpu", "RTX_5090"]):
+        with mock.patch("sys.argv", ["provision.py", "up", "--sort", "dlperf", "--gpu", "RTX_5090", "--num-gpus", "2"]):
             provision.main()
         args = mock_up.call_args[0][1]
         assert args.sort == "dlperf"
         assert args.gpu == "RTX_5090"
+        assert args.num_gpus == 2
 
     @mock.patch.object(provision, "_api_key", return_value="k")
     @mock.patch.object(provision, "cmd_up")
@@ -592,6 +607,14 @@ class TestMain:
             provision.main()
         args = mock_up.call_args[0][1]
         assert args.disk == 200
+
+    @mock.patch.object(provision, "_api_key", return_value="k")
+    @mock.patch.object(provision, "cmd_up")
+    def test_up_any_gpu_count(self, mock_up, mock_key):
+        with mock.patch("sys.argv", ["provision.py", "up", "--num-gpus", "any"]):
+            provision.main()
+        args = mock_up.call_args[0][1]
+        assert args.num_gpus is None
 
     @mock.patch.object(provision, "_api_key", return_value="k")
     @mock.patch.object(provision, "cmd_down")

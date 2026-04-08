@@ -37,8 +37,9 @@ from src.training.palette_video_vae_training import (
 )
 from src.system_info import collect_system_info, print_system_info
 from src.training.trainer_common import (
+    add_resume_scheduler_args,
     build_trainer_config,
-    build_warmup_cosine_scheduler,
+    configure_resume_scheduler,
     configure_cuda_runtime,
     format_bytes,
     gpu_stats,
@@ -47,6 +48,7 @@ from src.training.trainer_common import (
     preview_path,
     seed_everything,
     should_log_step,
+    validate_resume_scheduler_args,
 )
 from src.training.training_utils import (
     ThroughputTracker,
@@ -57,17 +59,17 @@ from src.training.training_utils import (
     create_accelerator_runtime,
     get_model_state_dict,
     infinite_batches,
+    load_model_state_dict,
     save_json,
     save_metrics_json,
     split_train_eval_dataset,
-    unwrap_model,
 )
 
 
 console = Console()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Video VAE (symmetric 7x7-latent architecture).")
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
@@ -108,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temporal-downsample",
         type=int,
-        default=0,
+        default=1,
         choices=[0, 1],
         help="Number of temporal downsamples in the VAE bottleneck (0 or 1).",
     )
@@ -168,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--palette-aug-prob",
         type=float,
-        default=0.2,
+        default=0.5,
         help="Per-pixel probability of replacing an encoder input palette index once a sample is selected for augmentation.",
     )
     parser.add_argument(
@@ -225,7 +227,8 @@ def parse_args() -> argparse.Namespace:
         help="EMA decay for LeCAM running real/fake logits.",
     )
     parser.add_argument("--resume-from", type=str, default=None)
-    args = parser.parse_args()
+    add_resume_scheduler_args(parser, default_tail_final_lr_scale=0.25)
+    args = parser.parse_args(argv)
     if args.context_frames < 0:
         parser.error("--context-frames must be >= 0")
     if args.clip_frames <= 0:
@@ -236,6 +239,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--palette-aug-sample-prob must be in [0, 1]")
     if not (0.0 <= args.palette_aug_prob <= 1.0):
         parser.error("--palette-aug-prob must be in [0, 1]")
+    validate_resume_scheduler_args(parser, args)
     return args
 
 
@@ -320,6 +324,7 @@ def save_training_state(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: LambdaLR,
+    scheduler_metadata: dict[str, int | float | str],
     step: int,
     best_eval: float,
     metrics: list[dict[str, float]],
@@ -333,6 +338,7 @@ def save_training_state(
         "model": model_state,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "scheduler_metadata": scheduler_metadata,
         "step": step,
         "best_eval": best_eval,
         "metrics": metrics,
@@ -530,31 +536,19 @@ def main() -> None:
     if discriminator is not None:
         discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
     warmup_steps = max(int(args.warmup_steps), 0)
-    scheduler = build_warmup_cosine_scheduler(
-        optimizer,
-        max_steps=args.max_steps,
-        warmup_steps=warmup_steps,
-        min_lr_scale=0.25,
-    )
-    if warmup_steps > 0:
-        if is_main_process:
-            console.print(f"[lr] Warmup: {warmup_steps} steps → cosine decay to 25% of peak")
-    else:
-        if is_main_process:
-            console.print("[lr] Cosine decay (no warmup)")
+    scheduler_min_lr_scale = 0.25
 
-    start_step = 0
     best_eval = float("inf")
     metrics: list[dict[str, float]] = []
 
     if args.resume_from is not None:
         with accelerator.main_process_first():
             checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
-        unwrap_model(model).load_state_dict(checkpoint["model"])
+        load_model_state_dict(model, checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
             if "discriminator" in checkpoint and "discriminator_optimizer" in checkpoint:
-                discriminator.load_state_dict(checkpoint["discriminator"])
+                load_model_state_dict(discriminator, checkpoint["discriminator"])
                 discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
             else:
                 if is_main_process:
@@ -565,12 +559,27 @@ def main() -> None:
                 else:
                     if is_main_process:
                         console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_step = int(checkpoint["step"]) + 1
         best_eval = float(checkpoint.get("best_eval", float("inf")))
         metrics = list(checkpoint.get("metrics", []))
+        scheduler_setup = configure_resume_scheduler(
+            optimizer,
+            max_steps=args.max_steps,
+            warmup_steps=warmup_steps,
+            min_lr_scale=scheduler_min_lr_scale,
+            checkpoint=checkpoint,
+            resume_lr_mode=args.resume_lr_mode,
+            resume_extra_steps=args.resume_extra_steps,
+            resume_tail_final_lr_scale=args.resume_tail_final_lr_scale,
+            restart_base_lr=args.lr,
+        )
+        scheduler = scheduler_setup.scheduler
+        scheduler_metadata = scheduler_setup.scheduler_metadata
+        args.max_steps = scheduler_setup.max_steps
+        start_step = scheduler_setup.start_step
         if is_main_process:
             console.print(f"[resume] Loaded training state from {args.resume_from} at step {start_step}")
+            for message in scheduler_setup.log_messages:
+                console.print(message)
 
         if args.max_steps > 0 and start_step >= args.max_steps:
             if is_main_process:
@@ -578,6 +587,20 @@ def main() -> None:
                     f"[max-steps] Already at step {start_step} >= {args.max_steps}. Nothing to do."
                 )
             return
+    else:
+        scheduler_setup = configure_resume_scheduler(
+            optimizer,
+            max_steps=args.max_steps,
+            warmup_steps=warmup_steps,
+            min_lr_scale=scheduler_min_lr_scale,
+        )
+        scheduler = scheduler_setup.scheduler
+        scheduler_metadata = scheduler_setup.scheduler_metadata
+        args.max_steps = scheduler_setup.max_steps
+        start_step = scheduler_setup.start_step
+        if is_main_process:
+            for message in scheduler_setup.log_messages:
+                console.print(message)
 
     if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
         model, discriminator, optimizer, discriminator_optimizer, train_loader = accelerator.prepare(
@@ -911,6 +934,7 @@ def main() -> None:
                             model=model,
                             optimizer=optimizer,
                             scheduler=scheduler,
+                            scheduler_metadata=scheduler_metadata,
                             step=step,
                             best_eval=best_eval,
                             metrics=metrics,
@@ -931,6 +955,7 @@ def main() -> None:
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    scheduler_metadata=scheduler_metadata,
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,

@@ -457,6 +457,20 @@ def discover_runs(results_dirs: list[str]) -> list[dict]:
     return runs
 
 
+def filter_runs(
+    runs: list[dict],
+    include_filter: str | None = None,
+    exclude_filter: str | None = None,
+) -> list[dict]:
+    """Filter runs by optional include/exclude name substrings."""
+    filtered_runs = runs
+    if include_filter:
+        filtered_runs = [run for run in filtered_runs if include_filter in run["name"]]
+    if exclude_filter:
+        filtered_runs = [run for run in filtered_runs if exclude_filter not in run["name"]]
+    return filtered_runs
+
+
 def summarise(runs: list[dict]) -> list[OrderedDict]:
     """Extract key stats from each run into a flat row."""
     rows = []
@@ -846,7 +860,7 @@ def plot_bar(
             plt.show()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--results-dir", type=str, nargs="+", default=["checkpoints/"],
                         help="One or more directories containing run folders anywhere under them")
@@ -856,6 +870,8 @@ def parse_args() -> argparse.Namespace:
                         help="Save summary table as CSV")
     parser.add_argument("--filter", type=str, default=None,
                         help="Only include runs whose name contains this substring")
+    parser.add_argument("--exclude-filter", type=str, default=None,
+                        help="Exclude runs whose name contains this substring")
     parser.add_argument("--x-axis", choices=("time", "step"), default="step",
                         help="X-axis for plots: elapsed time in hours or training step")
     parser.add_argument("--facet", choices=FACET_PROPERTIES, default=None,
@@ -872,15 +888,17 @@ def parse_args() -> argparse.Namespace:
                         help="Scale all plot text for higher-DPI displays")
     parser.add_argument("--figure-scale", type=float, default=DEFAULT_FIGURE_SCALE,
                         help="Scale the base figure size used for plots")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
 
-    runs = discover_runs(args.results_dir)
-    if args.filter:
-        runs = [r for r in runs if args.filter in r["name"]]
+    runs = filter_runs(
+        discover_runs(args.results_dir),
+        include_filter=args.filter,
+        exclude_filter=args.exclude_filter,
+    )
 
     if not runs:
         searched_dirs = ", ".join(args.results_dir)

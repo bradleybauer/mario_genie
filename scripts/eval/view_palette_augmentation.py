@@ -5,7 +5,6 @@ The output image stacks a few sampled clips. Within each sample block, the rows
 are:
 1. clean clip
 2. augmented clip
-3. changed-pixel mask
 
 Usage examples
 --------------
@@ -13,8 +12,7 @@ Usage examples
   python scripts/eval/view_palette_augmentation.py --palette-aug-prob 0.05
     python scripts/eval/view_palette_augmentation.py --palette-aug-sample-prob 0.5 --palette-aug-prob 0.1
   python scripts/eval/view_palette_augmentation.py --recording "some_recording.npz" --num-samples 3
-    python scripts/eval/view_palette_augmentation.py --no-show --output /tmp/palette_aug.png
-  python scripts/eval/view_palette_augmentation.py --output /tmp/palette_aug.png --show
+    python scripts/eval/view_palette_augmentation.py --output /tmp/palette_aug.png
 """
 
 from __future__ import annotations
@@ -40,7 +38,7 @@ from src.training.palette_video_vae_training import apply_palette_index_augmenta
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "normalized"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data-dir",
@@ -102,21 +100,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to save the rendered augmentation sheet.",
     )
-    show_group = parser.add_mutually_exclusive_group()
-    show_group.add_argument(
-        "--show",
-        action="store_true",
-        help="Open the rendered sheet with matplotlib.",
-    )
-    show_group.add_argument(
-        "--no-show",
-        action="store_false",
-        dest="show",
-        help="Do not open the rendered sheet with matplotlib.",
-    )
-    args = parser.parse_args()
-    if args.show is None:
-        args.show = args.output is None
+    args = parser.parse_args(argv)
     if not (0.0 <= args.palette_aug_sample_prob <= 1.0):
         parser.error("--palette-aug-sample-prob must be in [0, 1]")
     if not (0.0 <= args.palette_aug_prob <= 1.0):
@@ -222,15 +206,12 @@ def build_sample_panel(
 ) -> np.ndarray:
     clean_rgb = frames_to_rgb(clean_frames, palette_rgb)
     augmented_rgb = frames_to_rgb(augmented_frames, palette_rgb)
-    changed_mask = (clean_frames != augmented_frames).squeeze(0).detach().cpu().numpy()
-    changed_rgb = np.repeat(changed_mask[..., None], 3, axis=-1).astype(np.uint8) * 255
 
     clean_row = concatenate_frames(clean_rgb, gap=frame_gap, fill_value=24)
     augmented_row = concatenate_frames(augmented_rgb, gap=frame_gap, fill_value=24)
-    mask_row = concatenate_frames(changed_rgb, gap=frame_gap, fill_value=24)
 
     spacer = np.full((row_gap, clean_row.shape[1], 3), 24, dtype=np.uint8)
-    return np.concatenate([clean_row, spacer, augmented_row, spacer, mask_row], axis=0)
+    return np.concatenate([clean_row, spacer, augmented_row], axis=0)
 
 
 def stack_sample_panels(panels: list[np.ndarray], *, gap: int = 8) -> np.ndarray:
@@ -319,8 +300,7 @@ def main() -> None:
         Image.fromarray(image).save(args.output)
         print(f"Saved augmentation sheet to {args.output}")
 
-    if args.show:
-        maybe_show(image)
+    maybe_show(image)
 
 
 if __name__ == "__main__":

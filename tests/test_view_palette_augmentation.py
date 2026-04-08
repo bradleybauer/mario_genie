@@ -17,7 +17,7 @@ def _load_view_palette_augmentation_module():
     return module
 
 
-def test_build_sample_panel_renders_changed_mask_as_rgb() -> None:
+def test_build_sample_panel_stacks_clean_and_augmented_rows() -> None:
     module = _load_view_palette_augmentation_module()
     palette_rgb = np.array(
         [
@@ -49,4 +49,23 @@ def test_build_sample_panel_renders_changed_mask_as_rgb() -> None:
 
     assert panel.ndim == 3
     assert panel.shape[2] == 3
-    assert np.any(np.all(panel == 255, axis=2))
+    assert panel.shape == (5, 5, 3)
+
+
+def test_parse_args_accepts_output_without_show_flag() -> None:
+    module = _load_view_palette_augmentation_module()
+
+    args = module.parse_args(["--output", "/tmp/palette_aug.png"])
+
+    assert args.output == Path("/tmp/palette_aug.png")
+
+
+def test_parse_args_rejects_removed_no_show_flag() -> None:
+    module = _load_view_palette_augmentation_module()
+
+    try:
+        module.parse_args(["--no-show"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("Expected parse_args to reject --no-show")

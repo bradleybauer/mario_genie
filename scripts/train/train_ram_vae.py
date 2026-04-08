@@ -56,10 +56,10 @@ from src.training.training_utils import (
     create_accelerator_runtime,
     get_model_state_dict,
     infinite_batches,
+    load_model_state_dict,
     save_json,
     save_metrics_json,
     split_train_eval_dataset,
-    unwrap_model,
 )
 
 console = Console()
@@ -337,7 +337,7 @@ def main() -> None:
     if args.resume_from is not None:
         with accelerator.main_process_first():
             checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
-        unwrap_model(model).load_state_dict(checkpoint["model"])
+        load_model_state_dict(model, checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"]) + 1
