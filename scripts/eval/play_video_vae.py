@@ -34,14 +34,18 @@ if project_root_str not in sys.path:
 
 from src.models.video_vae import VideoVAE
 from src.data.normalized_dataset import load_palette_info
+from src.data.video_frames import (
+    CANONICAL_FRAME_HEIGHT,
+    CANONICAL_FRAME_WIDTH,
+    SUPPORTED_FRAME_SIZES,
+    preprocess_live_nes_frame,
+)
 
 from scripts.eval import play_nes as nes_play
 
 DEFAULT_SCALE = 3
 DEFAULT_WINDOW_FRAMES = 4
 DEFAULT_FPS = 60
-CROP_H = 224
-CROP_W = 224
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +66,13 @@ def parse_args() -> argparse.Namespace:
                         help=f"Viewer target FPS (default: {DEFAULT_FPS})")
     parser.add_argument("--view", type=str, default="recon", choices=["recon", "side-by-side"],
                         help="Show reconstructed frame only or input+reconstruction (default: recon)")
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=None,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Override checkpoint frame size for live preprocessing.",
+    )
 
     parser.add_argument("--base-channels", type=int, default=None,
                         help="Override model base channels (defaults to config.json or 64)")
@@ -137,15 +148,6 @@ def _rgb_to_palette_indices(frame_rgb: np.ndarray, lut: np.ndarray, palette_rgb:
     return idx.astype(np.int64, copy=False)
 
 
-def _center_crop_224(frame_rgb: np.ndarray) -> np.ndarray:
-    h, w = frame_rgb.shape[:2]
-    if h < CROP_H or w < CROP_W:
-        raise ValueError(f"Frame too small for 224x224 crop: {frame_rgb.shape}")
-    y0 = (h - CROP_H) // 2
-    x0 = (w - CROP_W) // 2
-    return frame_rgb[y0:y0 + CROP_H, x0:x0 + CROP_W]
-
-
 def _frames_to_one_hot(
     frames: torch.Tensor,
     num_colors: int,
@@ -180,6 +182,8 @@ class LiveAutoencoder:
         palette_rgb: np.ndarray,
         onehot_dtype: torch.dtype,
         window_frames: int,
+        frame_height: int,
+        frame_width: int,
         autocast_enabled: bool,
         autocast_dtype: torch.dtype,
         sample_posterior: bool,
@@ -189,6 +193,8 @@ class LiveAutoencoder:
         self.palette_rgb = palette_rgb
         self.onehot_dtype = onehot_dtype
         self.window_frames = window_frames
+        self.frame_height = frame_height
+        self.frame_width = frame_width
         self.autocast_enabled = autocast_enabled
         self.autocast_dtype = autocast_dtype
         self.sample_posterior = sample_posterior
@@ -204,8 +210,12 @@ class LiveAutoencoder:
         return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
 
     def reconstruct(self, obs_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        cropped = _center_crop_224(obs_rgb)
-        indices = _rgb_to_palette_indices(cropped, self.rgb_lut, self.palette_rgb)
+        processed = preprocess_live_nes_frame(
+            obs_rgb,
+            target_height=self.frame_height,
+            target_width=self.frame_width,
+        )
+        indices = _rgb_to_palette_indices(processed, self.rgb_lut, self.palette_rgb)
         self.history.append(indices)
 
         frames = list(self.history)
@@ -229,12 +239,12 @@ class LiveAutoencoder:
 
         pred_idx = outputs.logits[:, :, -1].argmax(dim=1)[0].detach().cpu().numpy()
         recon_rgb = self.palette_rgb[pred_idx]
-        return cropped, recon_rgb
+        return processed, recon_rgb
 
 
-def _make_display_sizes(scale: int, view: str) -> tuple[int, int, int, int]:
-    panel_w = CROP_W * scale
-    panel_h = CROP_H * scale
+def _make_display_sizes(scale: int, view: str, *, frame_height: int, frame_width: int) -> tuple[int, int, int, int]:
+    panel_w = frame_width * scale
+    panel_h = frame_height * scale
     hud_h = 22
     if view == "side-by-side":
         win_w = panel_w * 2
@@ -263,7 +273,12 @@ def _run_nes_py(
     env = NESEnv(rom_path)
     obs = env.reset()
 
-    win_w, win_h, panel_w, panel_h = _make_display_sizes(scale, view)
+    win_w, win_h, panel_w, panel_h = _make_display_sizes(
+        scale,
+        view,
+        frame_height=viewer.frame_height,
+        frame_width=viewer.frame_width,
+    )
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
@@ -338,7 +353,12 @@ def _run_retro(
     )
     obs, _info = env.reset()
 
-    win_w, win_h, panel_w, panel_h = _make_display_sizes(scale, view)
+    win_w, win_h, panel_w, panel_h = _make_display_sizes(
+        scale,
+        view,
+        frame_height=viewer.frame_height,
+        frame_width=viewer.frame_width,
+    )
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h), pygame.DOUBLEBUF)
@@ -419,11 +439,17 @@ def main() -> None:
     device = _resolve_device(args.device)
     config = _load_config(args)
 
-    base_channels = args.base_channels or int(config.get("base_channels", 64))
-    latent_channels = args.latent_channels or int(config.get("latent_channels", 64))
-    temporal_downsample = int(config.get("temporal_downsample", 0))
+    config_model = dict(config.get("model", {}))
+    config_data = dict(config.get("data", {}))
+    config_training = dict(config.get("training", {}))
 
-    onehot_name = args.onehot_dtype or str(config.get("onehot_dtype", "float32"))
+    base_channels = args.base_channels or int(config_model.get("base_channels", config.get("base_channels", 64)))
+    latent_channels = args.latent_channels or int(config_model.get("latent_channels", config.get("latent_channels", 64)))
+    temporal_downsample = int(config_model.get("temporal_downsample", config.get("temporal_downsample", 0)))
+    frame_height = int(args.frame_size or config_data.get("frame_height", CANONICAL_FRAME_HEIGHT))
+    frame_width = int(args.frame_size or config_data.get("frame_width", CANONICAL_FRAME_WIDTH))
+
+    onehot_name = args.onehot_dtype or str(config_training.get("onehot_dtype", config.get("onehot_dtype", "float32")))
     onehot_dtype = _dtype_from_name(onehot_name)
 
     autocast_enabled = bool(args.autocast and device.type == "cuda")
@@ -449,6 +475,8 @@ def main() -> None:
         palette_rgb=palette_rgb,
         onehot_dtype=onehot_dtype,
         window_frames=args.window_frames,
+        frame_height=frame_height,
+        frame_width=frame_width,
         autocast_enabled=autocast_enabled,
         autocast_dtype=autocast_dtype,
         sample_posterior=args.sample_posterior,
@@ -467,7 +495,7 @@ def main() -> None:
     print(f"Using device: {device}")
     print(
         f"Model: base_channels={base_channels}, latent_channels={latent_channels}, "
-        f"temporal_downsample={temporal_downsample}, onehot_dtype={onehot_name}"
+        f"temporal_downsample={temporal_downsample}, frame={frame_height}x{frame_width}, onehot_dtype={onehot_name}"
     )
     print(f"Loading {name} (backend: {backend})")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")

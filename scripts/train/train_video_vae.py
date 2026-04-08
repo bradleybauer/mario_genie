@@ -23,6 +23,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
+from src.data.video_frames import SUPPORTED_FRAME_SIZES
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from src.training.losses import focal_cross_entropy, softened_inverse_frequency_weights
 from src.models.video_vae import VideoVAE
@@ -72,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=224,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Output frame size used for training and eval previews.",
+    )
     parser.add_argument(
         "--context-frames",
         type=int,
@@ -395,6 +403,7 @@ def main() -> None:
         dataset = NormalizedSequenceDataset(
             data_dir=args.data_dir,
             clip_frames=total_clip_frames,
+            frame_size=args.frame_size,
             num_workers=args.num_workers,
             system_info=system_info,
         )
@@ -402,6 +411,12 @@ def main() -> None:
         console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No training samples were found.")
+    frame_height = dataset.frame_height
+    frame_width = dataset.frame_width
+    source_frame_height = dataset.source_frame_height
+    source_frame_width = dataset.source_frame_width
+    if frame_height is None or frame_width is None:
+        raise RuntimeError("Could not determine training frame shape from dataset")
     if is_main_process:
         console.print(
             f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
@@ -587,6 +602,10 @@ def main() -> None:
             "num_colors": int(num_colors),
             "clip_frames": int(args.clip_frames),
             "context_frames": int(args.context_frames),
+            "frame_height": int(frame_height),
+            "frame_width": int(frame_width),
+            "source_frame_height": int(source_frame_height or frame_height),
+            "source_frame_width": int(source_frame_width or frame_width),
         },
         model={
             "num_parameters": int(num_parameters),

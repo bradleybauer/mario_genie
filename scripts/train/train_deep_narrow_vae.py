@@ -26,6 +26,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.models.deep_narrow_vae import DeepNarrowVideoVAE
+from src.data.video_frames import SUPPORTED_FRAME_SIZES
 from src.models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from src.training.losses import focal_cross_entropy, softened_inverse_frequency_weights
@@ -74,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=224,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Output frame size used for training and eval previews.",
+    )
     parser.add_argument(
         "--context-frames",
         type=int,
@@ -337,6 +345,7 @@ def main() -> None:
         dataset = NormalizedSequenceDataset(
             data_dir=args.data_dir,
             clip_frames=total_clip_frames,
+            frame_size=args.frame_size,
             num_workers=args.num_workers,
             system_info=system_info,
         )
@@ -344,6 +353,12 @@ def main() -> None:
         console.print("[dataset] Index build complete.")
     if len(dataset) == 0:
         raise RuntimeError("No training samples were found.")
+    frame_height = dataset.frame_height
+    frame_width = dataset.frame_width
+    source_frame_height = dataset.source_frame_height
+    source_frame_width = dataset.source_frame_width
+    if frame_height is None or frame_width is None:
+        raise RuntimeError("Could not determine training frame shape from dataset")
     if is_main_process:
         console.print(
             f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
@@ -415,14 +430,18 @@ def main() -> None:
     num_parameters = sum(p.numel() for p in model.parameters())
     num_res_blocks = args.blocks_per_level * num_levels * 2 + 4  # encoder + decoder + mids
     num_conv_layers = num_res_blocks * 2  # 2 conv3d per res block
+    latent_height = frame_height // args.patch_size
+    latent_width = frame_width // args.patch_size
+    for _ in range(max(num_levels - 1, 0)):
+        latent_height = (latent_height + 1) // 2
+        latent_width = (latent_width + 1) // 2
 
     if is_main_process:
         console.print(
             f"[model] DeepNarrowVideoVAE: {num_parameters:,} params, "
             f"{num_levels} levels, {args.blocks_per_level} blocks/level, "
             f"channels={channels}, latent={args.latent_channels}ch @ "
-            f"{224 // args.patch_size // (2 ** (num_levels - 1))}x"
-            f"{224 // args.patch_size // (2 ** (num_levels - 1))} spatial, "
+            f"{latent_height}x{latent_width} spatial, "
             f"{num_res_blocks} res blocks, {num_conv_layers} conv3d layers"
         )
 
@@ -534,6 +553,10 @@ def main() -> None:
             "num_colors": int(num_colors),
             "clip_frames": int(args.clip_frames),
             "context_frames": int(args.context_frames),
+            "frame_height": int(frame_height),
+            "frame_width": int(frame_width),
+            "source_frame_height": int(source_frame_height or frame_height),
+            "source_frame_width": int(source_frame_width or frame_width),
         },
         model={
             "num_parameters": int(num_parameters),

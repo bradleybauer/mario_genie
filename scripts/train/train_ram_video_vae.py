@@ -33,6 +33,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
+from src.data.video_frames import SUPPORTED_FRAME_SIZES
 from src.models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from src.models.ram_video_vae import RAMVideoVAE
 from src.models.ram_video_vae_v2 import RAMVideoVAEv2
@@ -85,6 +86,13 @@ def parse_args() -> argparse.Namespace:
         help="Model architecture to train.",
     )
     parser.add_argument("--clip-frames", type=int, default=16)
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=224,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Output frame size used for training and eval previews.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
@@ -397,6 +405,7 @@ def main() -> None:
         dataset = NormalizedSequenceDataset(
             data_dir=args.data_dir,
             clip_frames=args.clip_frames,
+            frame_size=args.frame_size,
             include_frames=True,
             include_audio=False,
             include_actions=False,
@@ -417,6 +426,8 @@ def main() -> None:
     probe_sample = dataset[0]
     frame_height = int(probe_sample["frames"].shape[-2])
     frame_width = int(probe_sample["frames"].shape[-1])
+    source_frame_height = int(dataset.source_frame_height or frame_height)
+    source_frame_width = int(dataset.source_frame_width or frame_width)
     del probe_sample
 
     palette_path = Path(args.data_dir) / "palette.json"
@@ -616,6 +627,8 @@ def main() -> None:
             "clip_frames": int(args.clip_frames),
             "frame_height": int(frame_height),
             "frame_width": int(frame_width),
+            "source_frame_height": int(source_frame_height),
+            "source_frame_width": int(source_frame_width),
         },
         model=model_config,
     )

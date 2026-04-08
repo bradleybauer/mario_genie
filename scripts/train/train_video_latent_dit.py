@@ -293,10 +293,12 @@ def load_video_vae(
     *, checkpoint_path: Path, config_path: Path, num_colors: int | None, device: torch.device
 ) -> tuple[torch.nn.Module, dict]:
     cfg = _load_json(config_path)
-    base_channels = int(cfg.get("base_channels", 64))
-    latent_channels = int(cfg.get("latent_channels", 64))
-    temporal_downsample = int(cfg.get("temporal_downsample", 0))
-    vae_num_colors = int(cfg.get("num_colors", num_colors or 0))
+    model_cfg = dict(cfg.get("model", {}))
+    data_cfg = dict(cfg.get("data", {}))
+    base_channels = int(model_cfg.get("base_channels", cfg.get("base_channels", 64)))
+    latent_channels = int(model_cfg.get("latent_channels", cfg.get("latent_channels", 64)))
+    temporal_downsample = int(model_cfg.get("temporal_downsample", cfg.get("temporal_downsample", 0)))
+    vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors or 0)))
     if vae_num_colors <= 0:
         raise ValueError("Cannot determine VAE num_colors.")
     vae = VideoVAE(
@@ -606,6 +608,21 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError("No training samples found.")
 
+    latent_frame_height = int(latent_meta.get("frame_height", 0)) if latent_meta is not None else 0
+    latent_frame_width = int(latent_meta.get("frame_width", 0)) if latent_meta is not None else 0
+    latent_source_height = int(latent_meta.get("source_frame_height", latent_frame_height or 0)) if latent_meta is not None else 0
+    latent_source_width = int(latent_meta.get("source_frame_width", latent_frame_width or 0)) if latent_meta is not None else 0
+    expected_latent_height = int(latent_meta.get("latent_height", 0)) if latent_meta is not None else 0
+    expected_latent_width = int(latent_meta.get("latent_width", 0)) if latent_meta is not None else 0
+    if expected_latent_height > 0 and expected_latent_height != int(dataset.latent_height):
+        raise ValueError(
+            f"Latent dataset height mismatch: metadata says {expected_latent_height}, indexed dataset says {dataset.latent_height}"
+        )
+    if expected_latent_width > 0 and expected_latent_width != int(dataset.latent_width):
+        raise ValueError(
+            f"Latent dataset width mismatch: metadata says {expected_latent_width}, indexed dataset says {dataset.latent_width}"
+        )
+
     train_dataset, eval_dataset = split_train_eval_dataset(
         dataset,
         eval_samples=args.eval_samples,
@@ -642,6 +659,12 @@ def main() -> None:
         )
         if accelerator.is_main_process:
             console.print(f"[latents] Per-channel normalization from {latent_stats_path}")
+            if latent_frame_height > 0 and latent_frame_width > 0:
+                console.print(
+                    f"[latents] Source frames {latent_source_height}x{latent_source_width} -> "
+                    f"encoded frames {latent_frame_height}x{latent_frame_width} -> "
+                    f"latent grid {dataset.latent_height}x{dataset.latent_width}"
+                )
 
     # ------------------------------------------------------------------
     # Palette and preview VAE
@@ -804,9 +827,15 @@ def main() -> None:
                 num_processes=accelerator.num_processes,
                 data={
                     "latent_channels": int(latent_channels),
+                    "latent_height": int(dataset.latent_height),
+                    "latent_width": int(dataset.latent_width),
                     "num_actions": int(num_actions),
                     "clip_frames": int(args.clip_frames),
                     "context_frames": int(args.context_frames),
+                    "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
+                    "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
+                    "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
+                    "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
                     "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
                 },
                 model={

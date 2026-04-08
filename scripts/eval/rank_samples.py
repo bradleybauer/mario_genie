@@ -135,6 +135,7 @@ def _load_run_config(checkpoint_path: Path) -> dict:
 
 def _build_model_from_config(config: dict, num_colors: int, device: torch.device) -> VideoVAE:
     model_name = config.get("model_name", "")
+    model_cfg = dict(config.get("model", {}))
     normalized_model_name = model_name
     if model_name.endswith("video_vae") and model_name != "video_vae" and "_" in model_name:
         normalized_model_name = model_name.split("_", maxsplit=1)[-1]
@@ -147,9 +148,9 @@ def _build_model_from_config(config: dict, num_colors: int, device: torch.device
 
     model = VideoVAE(
         num_colors=num_colors,
-        base_channels=int(config.get("base_channels", 64)),
-        latent_channels=int(config.get("latent_channels", 64)),
-        temporal_downsample=int(config.get("temporal_downsample", 0)),
+        base_channels=int(model_cfg.get("base_channels", config.get("base_channels", 64))),
+        latent_channels=int(model_cfg.get("latent_channels", config.get("latent_channels", 64))),
+        temporal_downsample=int(model_cfg.get("temporal_downsample", config.get("temporal_downsample", 0))),
     ).to(device)
     model.eval()
     return model
@@ -217,16 +218,20 @@ def main() -> None:
     model.load_state_dict(state_dict)
     del raw_checkpoint, state_dict
 
-    clip_frames = int(config.get("clip_frames", 16))
-    context_frames = int(config.get("context_frames", 0))
+    data_cfg = dict(config.get("data", {}))
+    training_cfg = dict(config.get("training", {}))
+    clip_frames = int(data_cfg.get("clip_frames", config.get("clip_frames", 16)))
+    context_frames = int(data_cfg.get("context_frames", config.get("context_frames", 0)))
     total_clip_frames = clip_frames + context_frames
 
-    onehot_dtype_name = args.onehot_dtype or str(config.get("onehot_dtype", "float32"))
+    onehot_dtype_name = args.onehot_dtype or str(training_cfg.get("onehot_dtype", config.get("onehot_dtype", "float32")))
     onehot_dtype = _resolve_dtype(onehot_dtype_name)
+    frame_size = int(data_cfg.get("frame_height", 224))
 
     dataset = NormalizedSequenceDataset(
         data_dir=data_dir,
         clip_frames=total_clip_frames,
+        frame_size=frame_size,
         num_workers=args.num_workers,
     )
     eval_indices = _build_eval_indices(len(dataset), args.sample_fraction, args.seed)

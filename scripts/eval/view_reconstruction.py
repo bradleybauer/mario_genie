@@ -67,6 +67,11 @@ def collect_images(path):
         return [path]
     pngs = sorted(glob.glob(os.path.join(path, "*.png")))
     pngs = [p for p in pngs if "histogram" not in os.path.basename(p)]
+    basenames = [os.path.basename(p) for p in pngs]
+    has_ram_previews = any("_ram_" in name for name in basenames)
+    has_video_previews = any("_video_" in name for name in basenames)
+    if has_ram_previews and has_video_previews:
+        pngs = [p for p in pngs if "_video_" in os.path.basename(p)]
     if not pngs:
         raise FileNotFoundError(f"No PNG files found in {path}")
     return pngs
@@ -108,6 +113,7 @@ def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames
     plt.subplots_adjust(bottom=0.18)
 
     im = ax.imshow(frames[0], interpolation="nearest")
+    ax.set_aspect("equal", adjustable="box")
     ax.set_axis_off()
     title = ax.set_title("", fontsize=10)
 
@@ -295,6 +301,12 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
 
     # Sidebar layout
     sidebar_frac = 0.28
+
+    image_left = sidebar_frac + 0.02
+    image_bottom = 0.18
+    image_width_frac = 1.0 - sidebar_frac - 0.04
+    image_height_frac = 0.78
+
     n_runs = len(available)
     btn_h_pts = 22
     btn_gap_pts = 4
@@ -310,25 +322,26 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
     first_frame = first_frames[0]
     fh, fw = first_frame.shape[:2]
     viewer_w_pts = fw * scale
-    viewer_h_pts = fh * scale + 80  # extra for controls
+    viewer_h_pts = fh * scale
 
-    fig_w_in = (viewer_w_pts / (1.0 - sidebar_frac)) / 100.0
-    fig_h_in = max(sidebar_needed_pts, viewer_h_pts) / 100.0
+    fig_w_in = viewer_w_pts / (image_width_frac * 100.0)
+    fig_h_in = max(sidebar_needed_pts / 100.0, viewer_h_pts / (image_height_frac * 100.0))
     fig_h_in = max(fig_h_in, 4.0)
 
     fig = plt.figure(figsize=(fig_w_in, fig_h_in))
     fig.canvas.manager.set_window_title(f"Reconstructions — {root}")
 
     # Image axes (right side)
-    ax_img = fig.add_axes([sidebar_frac + 0.02, 0.18, 1.0 - sidebar_frac - 0.04, 0.78])
+    ax_img = fig.add_axes([image_left, image_bottom, image_width_frac, image_height_frac])
     ax_img.set_axis_off()
 
     im = ax_img.imshow(first_frame, interpolation="nearest")
+    ax_img.set_aspect("equal", adjustable="box")
     title = ax_img.set_title("", fontsize=10)
 
     # Controls along the bottom-right
-    ctrl_left = sidebar_frac + 0.02
-    ctrl_w = 1.0 - sidebar_frac - 0.04
+    ctrl_left = image_left
+    ctrl_w = image_width_frac
 
     ax_slider = fig.add_axes([ctrl_left + 0.15, 0.06, ctrl_w - 0.45, 0.04])
     slider = Slider(ax_slider, "Frame", 1, len(first_frames), valinit=1, valstep=1, valfmt="%d")

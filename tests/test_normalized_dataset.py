@@ -45,6 +45,24 @@ def test_audio_mode_accepts_audio_arrays(tmp_path: Path) -> None:
     assert sample["audio_lengths"].shape == (4,)
 
 
+def test_runtime_frame_resize_supports_half_resolution(tmp_path: Path) -> None:
+    np.savez_compressed(
+        tmp_path / "sample.npz",
+        frames=np.arange(8 * 224 * 224, dtype=np.uint8).reshape(8, 224, 224),
+        actions=np.zeros((8,), dtype=np.uint8),
+        ram=np.zeros((8, 4), dtype=np.uint8),
+    )
+
+    dataset = NormalizedSequenceDataset(tmp_path, clip_frames=4, frame_size=112)
+    sample = dataset[0]
+
+    assert dataset.source_frame_height == 224
+    assert dataset.source_frame_width == 224
+    assert dataset.frame_height == 112
+    assert dataset.frame_width == 112
+    assert sample["frames"].shape == (4, 112, 112)
+
+
 def test_ram_mode_can_index_without_frames_array(tmp_path: Path) -> None:
     np.savez_compressed(
         tmp_path / "sample.npz",

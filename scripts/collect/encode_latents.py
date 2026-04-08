@@ -39,6 +39,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.models.video_vae import VideoVAE
+from src.data.video_frames import SUPPORTED_FRAME_SIZES, resize_palette_frames
 from src.path_utils import serialize_project_path
 
 console = Console()
@@ -48,12 +49,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-encode normalized frames into VAE latents.")
     parser.add_argument("--data-dir", type=str, default="data/normalized",
                         help="Directory containing normalized .npz files.")
-    parser.add_argument("--output-dir", type=str, default="data/latents",
-                        help="Directory to write latent .npz files.")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Directory to write latent .npz files (defaults to data/latents or data/latents_<frame-size>).")
     parser.add_argument("--video-vae-checkpoint", type=str, default=None,
                         help="Path to the video VAE checkpoint (.pt).")
     parser.add_argument("--video-vae-config", type=str, default=None,
                         help="Path to the video VAE config.json (inferred from checkpoint dir if omitted).")
+    parser.add_argument(
+        "--frame-size",
+        type=int,
+        default=224,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Frame size to encode after runtime resizing.",
+    )
     parser.add_argument("--batch-frames", type=int, default=64,
                         help="Number of frames to encode at once (temporal batch size).")
     parser.add_argument("--onehot-dtype", type=str, default="bfloat16",
@@ -70,6 +78,8 @@ def parse_args() -> argparse.Namespace:
         help="Skip encoding and recompute latent_stats.json from existing latent .npz files in output-dir.",
     )
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = "data/latents" if args.frame_size == 224 else f"data/latents_{args.frame_size}"
     if not args.stats_only and not args.video_vae_checkpoint:
         parser.error("--video-vae-checkpoint is required unless --stats-only is set")
     return args
@@ -100,10 +110,12 @@ def load_video_vae(
     device: torch.device,
 ) -> tuple[torch.nn.Module, dict]:
     cfg = load_json(config_path)
-    base_channels = int(cfg.get("base_channels", 64))
-    latent_channels = int(cfg.get("latent_channels", 64))
-    temporal_downsample = int(cfg.get("temporal_downsample", 0))
-    vae_num_colors = int(cfg.get("num_colors", num_colors))
+    model_cfg = dict(cfg.get("model", {}))
+    data_cfg = dict(cfg.get("data", {}))
+    base_channels = int(model_cfg.get("base_channels", cfg.get("base_channels", 64)))
+    latent_channels = int(model_cfg.get("latent_channels", cfg.get("latent_channels", 64)))
+    temporal_downsample = int(model_cfg.get("temporal_downsample", cfg.get("temporal_downsample", 0)))
+    vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors)))
 
     if vae_num_colors != num_colors:
         raise ValueError(
@@ -415,6 +427,8 @@ def main() -> None:
 
     total_frames_encoded = 0
     start_time = time.time()
+    source_frame_height: int | None = None
+    source_frame_width: int | None = None
 
     if npz_files:
         with Progress(
@@ -433,6 +447,23 @@ def main() -> None:
                 with np.load(npz_path) as data:
                     frames = np.asarray(data["frames"])
                     actions = np.asarray(data["actions"])
+
+                file_height = int(frames.shape[1])
+                file_width = int(frames.shape[2])
+                if source_frame_height is None:
+                    source_frame_height = file_height
+                    source_frame_width = file_width
+                elif (file_height, file_width) != (source_frame_height, source_frame_width):
+                    raise ValueError(
+                        f"{npz_path.name} has frame shape {(file_height, file_width)}; expected "
+                        f"{(source_frame_height, source_frame_width)}"
+                    )
+
+                frames = resize_palette_frames(
+                    frames,
+                    target_height=args.frame_size,
+                    target_width=args.frame_size,
+                )
 
                 num_frames = frames.shape[0]
                 progress.update(task, status=f"{npz_path.name} ({num_frames} frames)")
@@ -486,6 +517,13 @@ def main() -> None:
 
     latent_meta["latent_stats_file"] = stats_path.name
     latent_meta["latent_stats_path"] = serialize_project_path(stats_path, project_root=PROJECT_ROOT)
+    latent_meta["frame_height"] = int(args.frame_size)
+    latent_meta["frame_width"] = int(args.frame_size)
+    latent_meta["source_frame_height"] = int(source_frame_height or latent_meta.get("source_frame_height", args.frame_size))
+    latent_meta["source_frame_width"] = int(source_frame_width or latent_meta.get("source_frame_width", args.frame_size))
+    latent_meta["latent_channels"] = int(latent_stats["latent_shape"]["channels"])
+    latent_meta["latent_height"] = int(latent_stats["latent_shape"]["height"])
+    latent_meta["latent_width"] = int(latent_stats["latent_shape"]["width"])
     with latent_config_path.open("w") as f:
         json.dump(latent_meta, f, indent=2)
 
