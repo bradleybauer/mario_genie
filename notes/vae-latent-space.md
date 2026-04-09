@@ -132,3 +132,33 @@ Our RAMVAE is a **temporal categorical VAE**:
 - **Reconstruction loss**: Per-address cross-entropy with focal loss ($\gamma = 1.0$) to handle class imbalance
 - **Temporal downsampling**: $2\times$ via frame-pair packing in channel dimension, matching the video VAE's temporal structure
 - **Compile-friendly**: All operations are vectorized with precomputed gather buffers (no Python loops in hot path)
+
+---
+
+## Intuition: Posterior Collapse as Trivial Prior Enforcement
+
+Posterior collapse is what happens when we enforce the prior too strongly — the encoder's output becomes trivially equal to the prior $\mathcal{N}(0, I)$ for every input. The model "solves" the KL objective perfectly ($\text{KL} = 0$), but $z$ now contains zero information about $x$. The decoder learns to produce the best possible output unconditionally (the dataset mean/mode), and the encoder is effectively dead.
+
+It's a degenerate equilibrium: the KL loss is 0, but reconstruction plateaus at whatever the decoder can do on its own. The VAE has collapsed into a fancy unconditional generative model that ignores its encoder.
+
+That's why the two main remedies target different angles:
+- **KL annealing** prevents collapse by letting the encoder establish useful representations *before* the prior pressure kicks in
+- **Free bits** prevents collapse by saying "each dimension *must* carry at least $\lambda$ nats" — the optimizer can't zero out the KL; it has to actually use the latent
+
+---
+
+## Can a Strong Decoder Solve Both Objectives Perfectly?
+
+No — this is the fundamental tension in VAEs. If the decoder is powerful enough to reconstruct perfectly *without* looking at $z$, the optimizer takes the free lunch: set $q(z|x) = \mathcal{N}(0, I)$ (KL = 0) and let the decoder do all the work unconditionally. That **is** posterior collapse.
+
+When KL = 0, $z$ carries no information about *which* $x$ was input. The decoder receives a random sample from $\mathcal{N}(0, I)$ that's identical regardless of input. "Perfect reconstruction" is impossible — the decoder doesn't know what to reconstruct.
+
+The ELBO is fundamentally a trade-off between adversarial terms:
+
+$$\underbrace{-\mathbb{E}[\log p_\theta(x|z)]}_{\text{wants } z \text{ to carry info about } x} + \underbrace{\beta \cdot \text{KL}(q \| p)}_{\text{wants } z \text{ to ignore } x}$$
+
+Using $z$ improves reconstruction but costs KL. Ignoring $z$ gives KL = 0 but caps reconstruction at unconditional quality.
+
+### The Autoregressive Exception
+
+Autoregressive decoders that condition on previous tokens of $x$ itself (teacher forcing) **can** reconstruct perfectly while ignoring $z$ — but only during training. At generation time you have no latent control, just an autoregressive model. This is why papers like VQ-VAE deliberately use *weak* decoders to force the model to actually use the latent.
