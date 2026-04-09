@@ -55,12 +55,21 @@ class CausalConv2d(nn.Module):
 
 
 class ResidualBlock2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int | None = None) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int | None = None,
+        *,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         out_channels = in_channels if out_channels is None else out_channels
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
         self.norm1 = nn.GroupNorm(_num_groups(in_channels), in_channels)
         self.conv1 = CausalConv2d(in_channels, out_channels, kernel_size=3)
         self.norm2 = nn.GroupNorm(_num_groups(out_channels), out_channels)
+        self.dropout = nn.Dropout2d(dropout)
         self.conv2 = CausalConv2d(out_channels, out_channels, kernel_size=3)
         self.skip = (
             nn.Identity()
@@ -71,7 +80,7 @@ class ResidualBlock2d(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         residual = self.skip(x)
         x = self.conv1(F.silu(self.norm1(x)))
-        x = self.conv2(F.silu(self.norm2(x)))
+        x = self.conv2(self.dropout(F.silu(self.norm2(x))))
         return x + residual
 
 
@@ -95,8 +104,11 @@ class AudioVAE(nn.Module):
         n_mels: int = 64,
         base_channels: int = 64,
         latent_channels: int = 8,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
         self.in_channels = in_channels
         self.n_mels = n_mels
         self.latent_channels = latent_channels
@@ -105,21 +117,21 @@ class AudioVAE(nn.Module):
         hidden_4 = base_channels * 4
 
         self.encoder_in = CausalConv2d(in_channels, base_channels, kernel_size=3)
-        self.encoder_block1 = ResidualBlock2d(base_channels)
+        self.encoder_block1 = ResidualBlock2d(base_channels, dropout=dropout)
         self.encoder_down1 = CausalConv2d(base_channels, hidden_2, kernel_size=3, stride=(2, 2))
-        self.encoder_block2 = ResidualBlock2d(hidden_2)
+        self.encoder_block2 = ResidualBlock2d(hidden_2, dropout=dropout)
         self.encoder_down2 = CausalConv2d(hidden_2, hidden_4, kernel_size=3, stride=(2, 2))
-        self.encoder_block3 = ResidualBlock2d(hidden_4)
-        self.encoder_mid = ResidualBlock2d(hidden_4)
+        self.encoder_block3 = ResidualBlock2d(hidden_4, dropout=dropout)
+        self.encoder_mid = ResidualBlock2d(hidden_4, dropout=dropout)
         self.encoder_out = nn.Conv2d(hidden_4, latent_channels * 2, kernel_size=1)
 
         self.decoder_in = nn.Conv2d(latent_channels, hidden_4, kernel_size=1)
-        self.decoder_mid = ResidualBlock2d(hidden_4)
-        self.decoder_block3 = ResidualBlock2d(hidden_4)
+        self.decoder_mid = ResidualBlock2d(hidden_4, dropout=dropout)
+        self.decoder_block3 = ResidualBlock2d(hidden_4, dropout=dropout)
         self.decoder_up1 = Upsample2d(hidden_4, hidden_2)
-        self.decoder_block2 = ResidualBlock2d(hidden_2)
+        self.decoder_block2 = ResidualBlock2d(hidden_2, dropout=dropout)
         self.decoder_up2 = Upsample2d(hidden_2, base_channels)
-        self.decoder_block1 = ResidualBlock2d(base_channels)
+        self.decoder_block1 = ResidualBlock2d(base_channels, dropout=dropout)
         self.decoder_norm = nn.GroupNorm(_num_groups(base_channels), base_channels)
         self.decoder_out = nn.Conv2d(base_channels, in_channels, kernel_size=1)
 

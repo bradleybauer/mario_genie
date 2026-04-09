@@ -31,14 +31,18 @@ class VocoderResidualBlock(nn.Module):
         *,
         kernel_size: int,
         dilations: Sequence[int],
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
         if not dilations:
             raise ValueError("dilations must be non-empty")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
 
         self.acts = nn.ModuleList([SnakeBeta(channels) for _ in dilations])
+        self.dropout = nn.Dropout(dropout)
         self.convs = nn.ModuleList(
             [
                 nn.Conv1d(
@@ -56,7 +60,7 @@ class VocoderResidualBlock(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         for act, conv in zip(self.acts, self.convs, strict=True):
             residual = x
-            x = conv(act(x))
+            x = self.dropout(conv(act(x)))
             x = x + residual
         return x
 
@@ -86,6 +90,7 @@ class AudioVocoder(nn.Module):
         hop_length: int = 100,
         n_fft: int = 400,
         input_prepad_frames: int | None = None,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -107,6 +112,8 @@ class AudioVocoder(nn.Module):
             raise ValueError(f"hop_length must be positive, got {hop_length}")
         if n_fft <= 0:
             raise ValueError(f"n_fft must be positive, got {n_fft}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
 
         upsample_factor = int(math.prod(int(rate) for rate in upsample_rates))
         if upsample_factor != hop_length:
@@ -174,6 +181,7 @@ class AudioVocoder(nn.Module):
                         next_channels,
                         kernel_size=int(block_kernel),
                         dilations=tuple(int(dilation) for dilation in block_dilations),
+                        dropout=dropout,
                     )
                 )
             self.resblocks.append(stage_blocks)

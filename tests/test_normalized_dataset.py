@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 project_root_str = str(PROJECT_ROOT)
@@ -61,6 +62,21 @@ def test_runtime_frame_resize_supports_half_resolution(tmp_path: Path) -> None:
     assert dataset.frame_height == 112
     assert dataset.frame_width == 112
     assert sample["frames"].shape == (4, 112, 112)
+
+
+def test_frames_are_returned_as_uint8_even_if_source_is_int64(tmp_path: Path) -> None:
+    np.savez_compressed(
+        tmp_path / "sample.npz",
+        frames=np.arange(8 * 224 * 224, dtype=np.int64).reshape(8, 224, 224) % 23,
+        actions=np.zeros((8,), dtype=np.uint8),
+        ram=np.zeros((8, 4), dtype=np.uint8),
+    )
+
+    dataset = NormalizedSequenceDataset(tmp_path, clip_frames=4)
+    sample = dataset[0]
+
+    assert sample["frames"].dtype == torch.uint8
+    assert int(sample["frames"].max().item()) <= 22
 
 
 def test_ram_mode_can_index_without_frames_array(tmp_path: Path) -> None:

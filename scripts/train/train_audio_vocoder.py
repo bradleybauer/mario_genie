@@ -119,6 +119,12 @@ def parse_args() -> argparse.Namespace:
         default="1,3,9;1,3,9",
         help="Semicolon-separated dilation groups. Example: 1,3,9;1,3,9",
     )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability used in vocoder residual blocks.",
+    )
     parser.add_argument("--target-max-params", type=int, default=5_000_000)
 
     parser.add_argument("--sample-rate", type=int, default=AUDIO_SAMPLE_RATE)
@@ -170,6 +176,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-frames must be non-negative")
     if args.context_frames >= args.clip_frames:
         parser.error("--context-frames must be smaller than --clip-frames")
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
 
     return args
 
@@ -564,6 +572,7 @@ def main() -> None:
         resblock_dilation_sizes=args.resblock_dilation_sizes,
         hop_length=args.hop_length,
         n_fft=args.n_fft,
+        dropout=args.dropout,
     ).to(device)
 
     num_parameters = model.num_parameters
@@ -651,6 +660,7 @@ def main() -> None:
             "upsample_kernel_sizes": list(args.upsample_kernel_sizes),
             "resblock_kernel_sizes": list(args.resblock_kernel_sizes),
             "resblock_dilation_sizes": [list(group) for group in args.resblock_dilation_sizes],
+            "dropout": float(args.dropout),
         },
     )
     if is_main_process:

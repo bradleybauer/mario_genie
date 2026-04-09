@@ -318,6 +318,7 @@ def process_recording_pass1(task: tuple[int, str]) -> dict[str, Any]:
     palette_counts = np.bincount(pal_idx.ravel(), minlength=len(_PASS1_PALETTE))[: len(_PASS1_PALETTE)]
     ram_min = ram.min(axis=0)
     ram_max = ram.max(axis=0)
+    ram_unique_per_col = [np.unique(ram[:, c]).tolist() for c in range(ram.shape[1])]
     audio_out, audio_lengths = frame_aligned_audio(raw_audio, frame_count, fps)
     del raw_audio
 
@@ -338,6 +339,7 @@ def process_recording_pass1(task: tuple[int, str]) -> dict[str, Any]:
         "used_actions": np.unique(actions),
         "ram_min": ram_min,
         "ram_max": ram_max,
+        "ram_unique_per_col": ram_unique_per_col,
         "pal_idx_path": str(pal_path),
         "audio_path": str(audio_path),
         "audio_lengths_path": str(audio_len_path),
@@ -376,7 +378,7 @@ def process_recording_pass2(task: tuple[int, str, dict[str, Any]]) -> dict[str, 
     audio_out = np.load(str(audio_path))
     audio_lengths = np.load(str(audio_lengths_path))
 
-    frames_out = _PASS2_PAL_REMAP[pal_idx]
+    frames_out = _PASS2_PAL_REMAP[pal_idx].astype(np.uint8, copy=False)
     actions_out = _PASS2_ACT_REMAP[actions]
     ram_out = ram[:, _PASS2_KEPT_COLS]
 
@@ -503,6 +505,7 @@ def main():
     used_act: set[int] = set()
     ram_min: np.ndarray | None = None
     ram_max: np.ndarray | None = None
+    ram_unique_sets: list[set[int]] | None = None
     cache_meta: list[dict[str, Any]] = [dict() for _ in bases]
 
     try:
@@ -521,12 +524,16 @@ def main():
             used_act.update(int(v) for v in np.asarray(result["used_actions"]).tolist())
             file_ram_min = np.asarray(result["ram_min"])
             file_ram_max = np.asarray(result["ram_max"])
+            file_unique = result["ram_unique_per_col"]
             if ram_min is None:
                 ram_min = file_ram_min
                 ram_max = file_ram_max
+                ram_unique_sets = [set(vals) for vals in file_unique]
             else:
                 ram_min = np.minimum(ram_min, file_ram_min)
                 ram_max = np.maximum(ram_max, file_ram_max)
+                for col, vals in enumerate(file_unique):
+                    ram_unique_sets[col].update(vals)
             cache_meta[result["index"]] = {
                 "pal_idx_path": result["pal_idx_path"],
                 "audio_path": result["audio_path"],
@@ -534,7 +541,7 @@ def main():
                 "fps": result["fps"],
             }
 
-        if ram_min is None or ram_max is None:
+        if ram_min is None or ram_max is None or ram_unique_sets is None:
             raise RuntimeError("No recording statistics were collected")
 
         # Build remapping tables
@@ -585,9 +592,11 @@ def main():
             "num_actions": len(used_act_sorted),
             "reduced_to_original_value": used_act_sorted,
         }
+        values_per_address = [sorted(ram_unique_sets[c]) for c in kept_cols]
         ram_info = {
             "num_addresses": int(len(kept_cols)),
             "kept_addresses": kept_cols.tolist(),
+            "values_per_address": values_per_address,
         }
 
         for name, obj in [

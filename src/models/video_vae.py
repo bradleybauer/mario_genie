@@ -17,6 +17,8 @@ from einops import rearrange
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from src.models.onehot_conv3d import OneHotConv3d
+
 
 def _num_groups(channels: int, preferred: int = 8) -> int:
     groups = min(preferred, channels)
@@ -114,12 +116,21 @@ class CausalConv3d(nn.Module):
 
 
 class ResidualBlock3D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int | None = None) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int | None = None,
+        *,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         out_channels = in_channels if out_channels is None else out_channels
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
         self.norm1 = nn.GroupNorm(_num_groups(in_channels), in_channels)
         self.conv1 = CausalConv3d(in_channels, out_channels, kernel_size=3)
         self.norm2 = nn.GroupNorm(_num_groups(out_channels), out_channels)
+        self.dropout = nn.Dropout3d(dropout)
         self.conv2 = CausalConv3d(out_channels, out_channels, kernel_size=3)
         self.skip = (
             nn.Identity()
@@ -130,7 +141,7 @@ class ResidualBlock3D(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         residual = self.skip(x)
         x = self.conv1(F.silu(self.norm1(x)))
-        x = self.conv2(F.silu(self.norm2(x)))
+        x = self.conv2(self.dropout(F.silu(self.norm2(x))))
         return x + residual
 
 
@@ -152,12 +163,78 @@ class Downsample3D(nn.Module):
 class SpatialUpsample3D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, *, upsample_time: bool = False) -> None:
         super().__init__()
-        self.scale_factor = (2.0 if upsample_time else 1.0, 2.0, 2.0)
-        self.conv = CausalConv3d(in_channels, out_channels, kernel_size=3)
+        stride_t = 2 if upsample_time else 1
+        self.time_scale = stride_t
+        # Fuse nearest-neighbor upsample + conv into one transposed-conv op.
+        # Temporal padding stays left-aligned (no symmetric padding), then we trim
+        # any extra tail frames so each stage matches the expected scale exactly.
+        self.deconv = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size=(3, 4, 4),
+            stride=(stride_t, 2, 2),
+            padding=(0, 1, 1),
+            output_padding=(0, 0, 0),
+            bias=True,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.interpolate(x, scale_factor=self.scale_factor, mode="nearest")
-        return self.conv(x)
+        target_t = x.shape[2] * self.time_scale
+        x = self.deconv(x)
+        if x.shape[2] < target_t:
+            raise ValueError(
+                f"Upsample produced too few frames: got {x.shape[2]}, expected >= {target_t}"
+            )
+        if x.shape[2] > target_t:
+            x = x[:, :, :target_t]
+        return x
+
+
+class GlobalBottleneckAttention3D(nn.Module):
+    """Lightweight global self-attention over ``(T * H * W)`` bottleneck tokens."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        num_heads: int,
+        dropout: float = 0.0,
+        mlp_ratio: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if channels % num_heads != 0:
+            raise ValueError(
+                f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+            )
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
+        hidden = max(channels, int(channels * mlp_ratio))
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, c, t, h, w = x.shape
+        tokens = rearrange(x, "b c t h w -> b (t h w) c")
+        attn_in = self.norm1(tokens)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        tokens = tokens + attn_out
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return rearrange(tokens, "b (t h w) c -> b c t h w", t=t, h=h, w=w)
 
 
 class VideoVAE(nn.Module):
@@ -174,54 +251,86 @@ class VideoVAE(nn.Module):
         self,
         *,
         num_colors: int,
-        base_channels: int = 64,
-        latent_channels: int = 64,
+        base_channels: int = 24,
+        latent_channels: int = 16,
         temporal_downsample: int = 0,
+        dropout: float = 0.01,
+        onehot_conv: bool = False,
+        global_bottleneck_attn: bool = False,
+        global_bottleneck_attn_heads: int = 8,
     ) -> None:
         super().__init__()
         if temporal_downsample not in (0, 1):
             raise ValueError("temporal_downsample must be 0 or 1")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
+        if global_bottleneck_attn_heads <= 0:
+            raise ValueError("global_bottleneck_attn_heads must be positive")
         self.num_colors = num_colors
         self.latent_channels = latent_channels
         self.temporal_downsample = temporal_downsample
+        self.onehot_conv = onehot_conv
+        self.global_bottleneck_attn = global_bottleneck_attn
+        self.global_bottleneck_attn_heads = global_bottleneck_attn_heads
 
         hidden_2 = base_channels * 2
         hidden_4 = base_channels * 4
         hidden_8 = base_channels * 8
 
-        self.encoder_in = CausalConv3d(num_colors, base_channels, kernel_size=3)
-        self.encoder_block1 = ResidualBlock3D(base_channels)
+        if onehot_conv:
+            self.encoder_in = OneHotConv3d(num_colors, base_channels, kernel_size=3)
+        else:
+            self.encoder_in = CausalConv3d(num_colors, base_channels, kernel_size=3)
+        self.encoder_block1 = ResidualBlock3D(base_channels, dropout=dropout)
         self.encoder_down1 = Downsample3D(base_channels, base_channels)
-        self.encoder_block2 = ResidualBlock3D(base_channels)
+        self.encoder_block2 = ResidualBlock3D(base_channels, dropout=dropout)
         self.encoder_down2 = Downsample3D(base_channels, hidden_2)
-        self.encoder_block3 = ResidualBlock3D(hidden_2)
+        self.encoder_block3 = ResidualBlock3D(hidden_2, dropout=dropout)
         self.encoder_down3 = Downsample3D(hidden_2, hidden_4)
-        self.encoder_block4 = ResidualBlock3D(hidden_4)
+        self.encoder_block4 = ResidualBlock3D(hidden_4, dropout=dropout)
         self.encoder_down4 = Downsample3D(hidden_4, hidden_8)
-        self.encoder_block5 = ResidualBlock3D(hidden_8)
+        self.encoder_block5 = ResidualBlock3D(hidden_8, dropout=dropout)
         self.encoder_down5 = Downsample3D(hidden_8, hidden_8, downsample_time=temporal_downsample == 1)
-        self.encoder_block6 = ResidualBlock3D(hidden_8)
-        self.encoder_mid = ResidualBlock3D(hidden_8)
+        self.encoder_block6 = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.encoder_mid = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.encoder_global_attn = (
+            GlobalBottleneckAttention3D(
+                hidden_8,
+                num_heads=global_bottleneck_attn_heads,
+                dropout=dropout,
+            )
+            if global_bottleneck_attn
+            else None
+        )
         self.encoder_out = nn.Conv3d(hidden_8, latent_channels * 2, kernel_size=1)
 
         self.decoder_in = nn.Conv3d(latent_channels, hidden_8, kernel_size=1)
-        self.decoder_mid = ResidualBlock3D(hidden_8)
-        self.decoder_block6 = ResidualBlock3D(hidden_8)
+        self.decoder_mid = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.decoder_block6 = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.decoder_global_attn = (
+            GlobalBottleneckAttention3D(
+                hidden_8,
+                num_heads=global_bottleneck_attn_heads,
+                dropout=dropout,
+            )
+            if global_bottleneck_attn
+            else None
+        )
 
         self.decoder_up1 = SpatialUpsample3D(hidden_8, hidden_8, upsample_time=temporal_downsample == 1)
-        self.decoder_block5 = ResidualBlock3D(hidden_8)
+        self.decoder_block5 = ResidualBlock3D(hidden_8, dropout=dropout)
 
         self.decoder_up2 = SpatialUpsample3D(hidden_8, hidden_4)
-        self.decoder_block4 = ResidualBlock3D(hidden_4)
+        self.decoder_block4 = ResidualBlock3D(hidden_4, dropout=dropout)
 
         self.decoder_up3 = SpatialUpsample3D(hidden_4, hidden_2)
-        self.decoder_block3 = ResidualBlock3D(hidden_2)
+        self.decoder_block3 = ResidualBlock3D(hidden_2, dropout=dropout)
 
         self.decoder_up4 = SpatialUpsample3D(hidden_2, base_channels)
-        self.decoder_block2 = ResidualBlock3D(base_channels)
+        self.decoder_block2 = ResidualBlock3D(base_channels, dropout=dropout)
 
         self.decoder_up5 = SpatialUpsample3D(base_channels, base_channels)
-        self.decoder_block1 = ResidualBlock3D(base_channels)
+        self.decoder_block1 = ResidualBlock3D(base_channels, dropout=dropout)
 
         self.decoder_norm = nn.GroupNorm(_num_groups(base_channels), base_channels)
         self.decoder_out = CausalConv3d(base_channels, num_colors, kernel_size=3)
@@ -230,7 +339,44 @@ class VideoVAE(nn.Module):
     def kl_loss(mean: Tensor, logvar: Tensor) -> Tensor:
         return -0.5 * (1.0 + logvar - mean.square() - logvar.exp()).mean()
 
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, object],
+        prefix: str,
+        local_metadata: dict[str, object],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # Remap between CausalConv3d ↔ OneHotConv3d encoder_in keys.
+        # CausalConv3d stores as encoder_in.conv.{weight,bias};
+        # OneHotConv3d stores as encoder_in.{weight,bias}.
+        causal_w = f"{prefix}encoder_in.conv.weight"
+        causal_b = f"{prefix}encoder_in.conv.bias"
+        onehot_w = f"{prefix}encoder_in.weight"
+        onehot_b = f"{prefix}encoder_in.bias"
+        if self.onehot_conv:
+            # Loading into OneHotConv3d — remap CausalConv3d keys if present
+            if causal_w in state_dict and onehot_w not in state_dict:
+                state_dict[onehot_w] = state_dict.pop(causal_w)
+            if causal_b in state_dict and onehot_b not in state_dict:
+                state_dict[onehot_b] = state_dict.pop(causal_b)
+        else:
+            # Loading into CausalConv3d — remap OneHotConv3d keys if present
+            if onehot_w in state_dict and causal_w not in state_dict:
+                state_dict[causal_w] = state_dict.pop(onehot_w)
+            if onehot_b in state_dict and causal_b not in state_dict:
+                state_dict[causal_b] = state_dict.pop(onehot_b)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
     def encode(self, video: Tensor) -> tuple[Tensor, Tensor]:
+        if self.onehot_conv:
+            # OneHotConv3d expects 4D palette indices (B, T, H, W)
+            if video.ndim == 5:
+                video = video.argmax(dim=1).byte()
         x = self.encoder_in(video)
         x = self.encoder_block1(x)
         x = self.encoder_down1(x)
@@ -244,6 +390,8 @@ class VideoVAE(nn.Module):
         x = self.encoder_down5(x)
         x = self.encoder_block6(x)
         x = self.encoder_mid(x)
+        if self.encoder_global_attn is not None:
+            x = self.encoder_global_attn(x)
         mean, logvar = self.encoder_out(x).chunk(2, dim=1)
         return mean, torch.clamp(logvar, min=-30.0, max=10.0)
 
@@ -257,6 +405,8 @@ class VideoVAE(nn.Module):
         x = self.decoder_in(latents)
         x = self.decoder_mid(x)
         x = self.decoder_block6(x)
+        if self.decoder_global_attn is not None:
+            x = self.decoder_global_attn(x)
         x = self.decoder_up1(x)
         x = self.decoder_block5(x)
         x = self.decoder_up2(x)
@@ -282,16 +432,22 @@ class VideoVAE(nn.Module):
         return x
 
     def forward(self, video: Tensor, *, sample_posterior: bool = True) -> VideoVAEOutput:
-        if video.ndim != 5:
-            raise ValueError(f"Expected video tensor with shape (B, C, T, H, W), got {tuple(video.shape)}")
-        if video.shape[1] != self.num_colors:
-            raise ValueError(
-                f"Expected {self.num_colors} channels, got {video.shape[1]}. "
-                "Pass palette one-hot frames into the video VAE."
-            )
+        """Accept palette indices ``(B, T, H, W)`` or one-hot ``(B, C, T, H, W)``."""
+        if video.ndim == 4:
+            # Palette indices (B, T, H, W)
+            output_shape = (video.shape[1], video.shape[2], video.shape[3])
+        elif video.ndim == 5:
+            if video.shape[1] != self.num_colors:
+                raise ValueError(
+                    f"Expected {self.num_colors} channels, got {video.shape[1]}. "
+                    "Pass palette one-hot frames or (B, T, H, W) index tensors."
+                )
+            output_shape = (video.shape[2], video.shape[3], video.shape[4])
+        else:
+            raise ValueError(f"Expected (B, T, H, W) or (B, C, T, H, W), got {tuple(video.shape)}")
         mean, logvar = self.encode(video)
         latents = self.reparameterize(mean, logvar, sample_posterior=sample_posterior)
-        logits = self.decode(latents, output_shape=(video.shape[2], video.shape[3], video.shape[4]))
+        logits = self.decode(latents, output_shape=output_shape)
         return VideoVAEOutput(
             logits=logits,
             posterior_mean=mean,

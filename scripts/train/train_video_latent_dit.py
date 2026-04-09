@@ -298,6 +298,13 @@ def load_video_vae(
     base_channels = int(model_cfg.get("base_channels", cfg.get("base_channels", 64)))
     latent_channels = int(model_cfg.get("latent_channels", cfg.get("latent_channels", 64)))
     temporal_downsample = int(model_cfg.get("temporal_downsample", cfg.get("temporal_downsample", 0)))
+    dropout = float(model_cfg.get("dropout", cfg.get("dropout", 0.0)))
+    global_bottleneck_attn = bool(
+        model_cfg.get("global_bottleneck_attn", cfg.get("global_bottleneck_attn", False))
+    )
+    global_bottleneck_attn_heads = int(
+        model_cfg.get("global_bottleneck_attn_heads", cfg.get("global_bottleneck_attn_heads", 8))
+    )
     vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors or 0)))
     if vae_num_colors <= 0:
         raise ValueError("Cannot determine VAE num_colors.")
@@ -306,6 +313,9 @@ def load_video_vae(
         base_channels=base_channels,
         latent_channels=latent_channels,
         temporal_downsample=temporal_downsample,
+        dropout=dropout,
+        global_bottleneck_attn=global_bottleneck_attn,
+        global_bottleneck_attn_heads=global_bottleneck_attn_heads,
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     vae.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)

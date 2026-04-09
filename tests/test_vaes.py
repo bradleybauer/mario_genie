@@ -15,7 +15,8 @@ from src.models.audio_vae import AudioVAE
 from src.models.audio_vocoder import AudioVocoder
 from src.models.ram_video_vae import RAMVideoVAE
 from src.models.ram_video_vae_v2 import RAMVideoVAEv2
-from src.models.video_vae import VideoVAE
+from src.models.onehot_conv3d import OneHotConv3d
+from src.models.video_vae import CausalConv3d, VideoVAE
 
 
 def test_video_vae_preserves_video_shape() -> None:
@@ -36,6 +37,25 @@ def test_video_vae_temporal_downsample_preserves_output_shape() -> None:
         base_channels=8,
         latent_channels=4,
         temporal_downsample=1,
+    )
+    video = torch.randn(2, 8, 5, 32, 32)
+
+    output = model(video, sample_posterior=False)
+
+    assert output.logits.shape == video.shape
+    assert output.posterior_mean.shape == (2, 4, 3, 1, 1)
+    assert output.posterior_logvar.shape == (2, 4, 3, 1, 1)
+    assert output.latents.shape == (2, 4, 3, 1, 1)
+
+
+def test_video_vae_global_bottleneck_attention_preserves_shape() -> None:
+    model = VideoVAE(
+        num_colors=8,
+        base_channels=8,
+        latent_channels=4,
+        temporal_downsample=1,
+        global_bottleneck_attn=True,
+        global_bottleneck_attn_heads=4,
     )
     video = torch.randn(2, 8, 5, 32, 32)
 
@@ -198,3 +218,89 @@ def test_mel_discriminator_returns_one_logit_per_sample() -> None:
     logits = discriminator(mel)
 
     assert logits.shape == (2,)
+
+
+# ---------- OneHotConv3d tests ----------
+
+
+def test_onehot_conv3d_matches_causal_conv3d() -> None:
+    """OneHotConv3d on palette indices must produce the same output as CausalConv3d on one-hot."""
+    num_classes, out_channels = 8, 12
+    causal = CausalConv3d(num_classes, out_channels, kernel_size=3)
+    onehot = OneHotConv3d.from_causal_conv3d(causal)
+
+    indices = torch.randint(0, num_classes, (2, 4, 32, 32))
+    one_hot = torch.zeros(2, num_classes, 4, 32, 32)
+    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
+
+    expected = causal(one_hot)
+    actual = onehot(indices)
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_onehot_conv3d_uint8_matches_int64() -> None:
+    """OneHotConv3d produces identical output for uint8 and int64 indices."""
+    num_classes, out_channels = 8, 12
+    causal = CausalConv3d(num_classes, out_channels, kernel_size=3)
+    onehot = OneHotConv3d.from_causal_conv3d(causal)
+
+    indices_long = torch.randint(0, num_classes, (2, 4, 32, 32))
+    indices_byte = indices_long.byte()
+
+    out_long = onehot(indices_long)
+    out_byte = onehot(indices_byte)
+
+    torch.testing.assert_close(out_byte, out_long, atol=1e-5, rtol=1e-5)
+
+
+def test_onehot_conv3d_different_kernel_sizes() -> None:
+    """OneHotConv3d matches CausalConv3d for non-cubic kernels too."""
+    num_classes, out_channels = 6, 10
+    for ks in [(1, 1, 1), (3, 1, 1), (1, 3, 3)]:
+        causal = CausalConv3d(num_classes, out_channels, kernel_size=ks)
+        onehot = OneHotConv3d.from_causal_conv3d(causal)
+
+        indices = torch.randint(0, num_classes, (1, 3, 16, 16))
+        one_hot = torch.zeros(1, num_classes, 3, 16, 16)
+        one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
+
+        expected = causal(one_hot)
+        actual = onehot(indices)
+
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_video_vae_4d_indices_match_5d_onehot() -> None:
+    """VideoVAE(onehot_conv=True) forward with 4D indices matches 5D one-hot."""
+    num_colors = 8
+    model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4, onehot_conv=True)
+    model.eval()
+
+    indices = torch.randint(0, num_colors, (2, 4, 32, 32))
+    one_hot = torch.zeros(2, num_colors, 4, 32, 32)
+    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
+
+    with torch.no_grad():
+        out_idx = model(indices, sample_posterior=False)
+        out_oh = model(one_hot, sample_posterior=False)
+
+    torch.testing.assert_close(out_idx.logits, out_oh.logits, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_idx.posterior_mean, out_oh.posterior_mean, atol=1e-5, rtol=1e-5)
+
+
+def test_video_vae_loads_old_checkpoint_keys() -> None:
+    """Checkpoints cross-load between onehot_conv=True and False."""
+    num_colors = 8
+
+    # CausalConv3d (default) -> OneHotConv3d
+    default_model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4)
+    default_state = default_model.state_dict()
+    onehot_model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4, onehot_conv=True)
+    onehot_model.load_state_dict(default_state, strict=True)
+
+    # OneHotConv3d -> CausalConv3d (default)
+    onehot_state = onehot_model.state_dict()
+    fresh_default = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4)
+    fresh_default.load_state_dict(onehot_state, strict=True)

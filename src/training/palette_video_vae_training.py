@@ -64,8 +64,8 @@ def apply_palette_index_augmentation(
         raise ValueError("replacement_probs must sum to a positive value")
     probs = probs / probs_sum
 
-    if frames.dtype != torch.long:
-        frames = frames.long()
+    if frames.dtype.is_floating_point or frames.dtype.is_complex:
+        raise ValueError("frames must contain integer palette indices")
     if int(frames.max().item()) >= num_classes or int(frames.min().item()) < 0:
         raise ValueError("frames contain palette indices outside the augmentation distribution")
 
@@ -125,6 +125,7 @@ def evaluate_video_vae(
     kl_weight: float,
     context_frames: int = 0,
     onehot_dtype: torch.dtype = torch.float32,
+    onehot_conv: bool = False,
     focal_gamma: float = 0.0,
     class_weight: torch.Tensor | None = None,
     accelerator: Accelerator | None = None,
@@ -147,10 +148,13 @@ def evaluate_video_vae(
     with torch.no_grad():
         for batch in loader:
             frames = batch["frames"].to(device, non_blocking=True).long()
-            inputs = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-            onehot_buffer = inputs
+            if onehot_conv:
+                model_input = frames.byte()
+            else:
+                model_input = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+                onehot_buffer = model_input
             with autocast_context():
-                outputs = model(inputs, sample_posterior=False)
+                outputs = model(model_input, sample_posterior=False)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
             recon_loss = focal_cross_entropy(
                 recon_logits,
@@ -163,10 +167,11 @@ def evaluate_video_vae(
             kl_losses.append(kl_loss.item())
             if preview is None:
                 with autocast_context():
-                    preview_out = model(inputs[:1], sample_posterior=False)
+                    preview_input = frames[:1].byte() if onehot_conv else model_input[:1]
+                    preview_out = model(preview_input, sample_posterior=False)
                 preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
                 del preview_out
-            del recon_logits, recon_targets, recon_loss, kl_loss, outputs, inputs, frames
+            del recon_logits, recon_targets, recon_loss, kl_loss, outputs, model_input, frames
 
     model.train()
     if torch.cuda.is_available():

@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--latent-channels", type=int, default=8)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability used in model residual blocks.",
+    )
     parser.add_argument("--sample-rate", type=int, default=AUDIO_SAMPLE_RATE)
     parser.add_argument("--n-fft", type=int, default=AUDIO_N_FFT)
     parser.add_argument("--hop-length", type=int, default=AUDIO_HOP_LENGTH)
@@ -159,6 +165,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-frames must be non-negative")
     if args.context_frames >= args.clip_frames:
         parser.error("--context-frames must be smaller than --clip-frames")
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
 
     return args
 
@@ -409,6 +417,7 @@ def main() -> None:
         n_mels=args.n_mels,
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
+        dropout=args.dropout,
     ).to(device)
     discriminator = None
     discriminator_optimizer = None
@@ -522,6 +531,7 @@ def main() -> None:
             "discriminator_parameters": int(discriminator_num_parameters),
             "base_channels": int(args.base_channels),
             "latent_channels": int(args.latent_channels),
+            "dropout": float(args.dropout),
         },
     )
     if is_main_process:

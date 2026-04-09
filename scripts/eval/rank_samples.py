@@ -151,6 +151,14 @@ def _build_model_from_config(config: dict, num_colors: int, device: torch.device
         base_channels=int(model_cfg.get("base_channels", config.get("base_channels", 64))),
         latent_channels=int(model_cfg.get("latent_channels", config.get("latent_channels", 64))),
         temporal_downsample=int(model_cfg.get("temporal_downsample", config.get("temporal_downsample", 0))),
+        dropout=float(model_cfg.get("dropout", config.get("dropout", 0.0))),
+        onehot_conv=bool(model_cfg.get("onehot_conv", config.get("onehot_conv", False))),
+        global_bottleneck_attn=bool(
+            model_cfg.get("global_bottleneck_attn", config.get("global_bottleneck_attn", False))
+        ),
+        global_bottleneck_attn_heads=int(
+            model_cfg.get("global_bottleneck_attn_heads", config.get("global_bottleneck_attn_heads", 8))
+        ),
     ).to(device)
     model.eval()
     return model

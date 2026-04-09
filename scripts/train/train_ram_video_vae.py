@@ -155,6 +155,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--latent-dim", type=int, default=128)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability used in model residual/attention blocks.",
+    )
     parser.add_argument("--n-fc-blocks", type=int, default=2)
     parser.add_argument("--n-temporal-blocks", type=int, default=2)
     parser.add_argument("--temporal-kernel-size", type=int, default=3)
@@ -207,7 +213,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
+    return args
 
 
 def save_ram_preview(
@@ -477,6 +486,7 @@ def main() -> None:
             frame_width=frame_width,
             hidden_dim=args.hidden_dim,
             latent_dim=args.latent_dim,
+            dropout=args.dropout,
             n_fc_blocks=args.n_fc_blocks,
             n_temporal_blocks=args.n_temporal_blocks,
             temporal_kernel_size=args.temporal_kernel_size,
@@ -497,6 +507,7 @@ def main() -> None:
             frame_width=frame_width,
             hidden_dim=args.hidden_dim,
             latent_dim=args.latent_dim,
+            dropout=args.dropout,
             n_fc_blocks=args.n_fc_blocks,
             n_temporal_blocks=args.n_temporal_blocks,
             temporal_kernel_size=args.temporal_kernel_size,
@@ -598,6 +609,7 @@ def main() -> None:
         "discriminator_parameters": int(discriminator_num_parameters),
         "hidden_dim": int(args.hidden_dim),
         "latent_dim": int(args.latent_dim),
+        "dropout": float(args.dropout),
         "n_fc_blocks": int(args.n_fc_blocks),
         "n_temporal_blocks": int(args.n_temporal_blocks),
         "temporal_kernel_size": int(args.temporal_kernel_size),

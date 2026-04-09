@@ -47,8 +47,11 @@ class DeepNarrowVideoVAE(nn.Module):
         latent_channels: int = 32,
         blocks_per_level: int = 6,
         channel_mult: tuple[float, ...] = (1, 1, 1.5, 1.5),
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
         self.num_colors = num_colors
         self.patch_size = patch_size
         self.latent_channels = latent_channels
@@ -69,7 +72,7 @@ class DeepNarrowVideoVAE(nn.Module):
         self.encoder_downsamples = nn.ModuleList()
         for i in range(num_levels):
             level = nn.ModuleList(
-                [ResidualBlock3D(channels[i]) for _ in range(blocks_per_level)]
+                [ResidualBlock3D(channels[i], dropout=dropout) for _ in range(blocks_per_level)]
             )
             self.encoder_levels.append(level)
             if i < num_levels - 1:
@@ -78,8 +81,8 @@ class DeepNarrowVideoVAE(nn.Module):
                 )
 
         self.encoder_mid = nn.Sequential(
-            ResidualBlock3D(channels[-1]),
-            ResidualBlock3D(channels[-1]),
+            ResidualBlock3D(channels[-1], dropout=dropout),
+            ResidualBlock3D(channels[-1], dropout=dropout),
         )
         self.encoder_out = nn.Conv3d(channels[-1], latent_channels * 2, kernel_size=1)
 
@@ -94,7 +97,7 @@ class DeepNarrowVideoVAE(nn.Module):
         self.decoder_upsamples = nn.ModuleList()
         for i in reversed(range(num_levels)):
             level = nn.ModuleList(
-                [ResidualBlock3D(channels[i]) for _ in range(blocks_per_level)]
+                [ResidualBlock3D(channels[i], dropout=dropout) for _ in range(blocks_per_level)]
             )
             self.decoder_levels.append(level)
             if i > 0:

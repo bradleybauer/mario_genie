@@ -83,12 +83,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output frame size used for training and eval previews.",
     )
     parser.add_argument(
+        "--progressive-resize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train first at lower resolution, then switch to --frame-size for fine-tuning.",
+    )
+    parser.add_argument(
+        "--progressive-start-size",
+        type=int,
+        default=112,
+        choices=SUPPORTED_FRAME_SIZES,
+        help="Initial lower resolution when --progressive-resize is enabled.",
+    )
+    parser.add_argument(
+        "--progressive-switch-ratio",
+        type=float,
+        default=0.8,
+        help="Fraction of total steps spent at --progressive-start-size before switching to --frame-size.",
+    )
+    parser.add_argument(
         "--context-frames",
         type=int,
-        default=8,
+        default=3,
         help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
     )
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=2000,
@@ -107,6 +126,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=24)
     parser.add_argument("--latent-channels", type=int, default=16)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.00,
+        help="Dropout probability used in model residual blocks.",
+    )
     parser.add_argument(
         "--temporal-downsample",
         type=int,
@@ -136,12 +161,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Mixed precision mode passed to Accelerator.",
     )
     parser.add_argument(
+        "--onehot-conv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use OneHotConv3d for the encoder input (index-gather instead of dense conv on one-hot).",
+    )
+    parser.add_argument(
+        "--global-bottleneck-attn",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable a lightweight global self-attention block at the 3D bottleneck.",
+    )
+    parser.add_argument(
+        "--global-bottleneck-attn-heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for --global-bottleneck-attn.",
+    )
+    parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Compile the Video VAE with torch.compile.",
     )
-    parser.add_argument("--focal-gamma", type=float, default=1.0,
+    parser.add_argument("--focal-gamma", type=float, default=0.8,
                         help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
     parser.add_argument(
         "--use-class-weights",
@@ -158,7 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--class-weight-soften",
         type=float,
-        default=0.2,
+        default=0.3,
         help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
     )
     parser.add_argument(
@@ -170,7 +213,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--palette-aug-prob",
         type=float,
-        default=0.5,
+        default=0.4,
         help="Per-pixel probability of replacing an encoder input palette index once a sample is selected for augmentation.",
     )
     parser.add_argument(
@@ -239,6 +282,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--palette-aug-sample-prob must be in [0, 1]")
     if not (0.0 <= args.palette_aug_prob <= 1.0):
         parser.error("--palette-aug-prob must be in [0, 1]")
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
+    if args.global_bottleneck_attn_heads <= 0:
+        parser.error("--global-bottleneck-attn-heads must be > 0")
+    if args.progressive_resize:
+        if args.progressive_start_size >= args.frame_size:
+            parser.error("--progressive-start-size must be smaller than --frame-size")
+        if not (0.0 < args.progressive_switch_ratio < 1.0):
+            parser.error("--progressive-switch-ratio must be in (0, 1)")
     validate_resume_scheduler_args(parser, args)
     return args
 
@@ -402,59 +454,112 @@ def main() -> None:
         print_system_info(system_info)
 
     total_clip_frames = args.clip_frames + args.context_frames
-
-    if is_main_process:
-        console.print("[dataset] Building sequence index (can take a few minutes on large runs)...")
-    with accelerator.main_process_first():
-        dataset = NormalizedSequenceDataset(
-            data_dir=args.data_dir,
-            clip_frames=total_clip_frames,
-            frame_size=args.frame_size,
-            num_workers=args.num_workers,
-            system_info=system_info,
-        )
-    if is_main_process:
-        console.print("[dataset] Index build complete.")
-    if len(dataset) == 0:
-        raise RuntimeError("No training samples were found.")
-    frame_height = dataset.frame_height
-    frame_width = dataset.frame_width
-    source_frame_height = dataset.source_frame_height
-    source_frame_width = dataset.source_frame_width
-    if frame_height is None or frame_width is None:
-        raise RuntimeError("Could not determine training frame shape from dataset")
-    if is_main_process:
-        console.print(
-            f"Found {len(dataset)} sequence segments of {total_clip_frames} frames "
-            f"({args.context_frames} context + {args.clip_frames} target)."
-        )
-        console.print(
-            f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
-            f"{format_bytes(dataset.dataset_bytes)} on disk."
-        )
-
-    train_dataset, eval_dataset = split_train_eval_dataset(
-        dataset,
-        eval_samples=args.eval_samples,
-        seed=args.seed,
-    )
-    if eval_dataset is not None and is_main_process:
-        console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train samples")
-
-    train_loader = build_replacement_train_loader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
     eval_batch_size = args.eval_batch_size or args.batch_size
-    eval_loader = build_eval_loader(
+
+    def build_data_for_frame_size(
+        frame_size: int,
+        *,
+        stage_label: str,
+    ) -> tuple[
+        NormalizedSequenceDataset,
+        torch.utils.data.Dataset,
+        torch.utils.data.Dataset | None,
+        torch.utils.data.DataLoader,
+        torch.utils.data.DataLoader | None,
+        int,
+        int,
+        int,
+        int,
+    ]:
+        if is_main_process:
+            console.print(
+                f"[dataset:{stage_label}] Building sequence index at {frame_size}x{frame_size} "
+                "(can take a few minutes on large runs)..."
+            )
+        with accelerator.main_process_first():
+            stage_dataset = NormalizedSequenceDataset(
+                data_dir=args.data_dir,
+                clip_frames=total_clip_frames,
+                frame_size=frame_size,
+                num_workers=args.num_workers,
+                system_info=system_info,
+            )
+        if is_main_process:
+            console.print(f"[dataset:{stage_label}] Index build complete.")
+        if len(stage_dataset) == 0:
+            raise RuntimeError("No training samples were found.")
+
+        stage_frame_height = stage_dataset.frame_height
+        stage_frame_width = stage_dataset.frame_width
+        stage_source_frame_height = stage_dataset.source_frame_height
+        stage_source_frame_width = stage_dataset.source_frame_width
+        if stage_frame_height is None or stage_frame_width is None:
+            raise RuntimeError("Could not determine training frame shape from dataset")
+        if is_main_process:
+            console.print(
+                f"[dataset:{stage_label}] Found {len(stage_dataset)} sequence segments of {total_clip_frames} "
+                f"frames ({args.context_frames} context + {args.clip_frames} target)."
+            )
+            console.print(
+                f"[dataset:{stage_label}] Dataset: {stage_dataset.num_files} files, {len(stage_dataset):,} samples, "
+                f"{format_bytes(stage_dataset.dataset_bytes)} on disk."
+            )
+
+        stage_train_dataset, stage_eval_dataset = split_train_eval_dataset(
+            stage_dataset,
+            eval_samples=args.eval_samples,
+            seed=args.seed,
+        )
+        if stage_eval_dataset is not None and is_main_process:
+            console.print(
+                f"[dataset:{stage_label}] Eval split: {len(stage_eval_dataset)} eval, "
+                f"{len(stage_train_dataset)} train samples"
+            )
+
+        stage_train_loader = build_replacement_train_loader(
+            stage_train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+        stage_eval_loader = build_eval_loader(
+            stage_eval_dataset,
+            batch_size=eval_batch_size,
+            num_workers=0,
+            pin_memory=False,
+        )
+        return (
+            stage_dataset,
+            stage_train_dataset,
+            stage_eval_dataset,
+            stage_train_loader,
+            stage_eval_loader,
+            int(stage_frame_height),
+            int(stage_frame_width),
+            int(stage_source_frame_height or stage_frame_height),
+            int(stage_source_frame_width or stage_frame_width),
+        )
+
+    progressive_resize = args.progressive_resize and args.progressive_start_size != args.frame_size
+    target_frame_size = int(args.frame_size)
+    current_frame_size = int(args.progressive_start_size if progressive_resize else target_frame_size)
+    if progressive_resize and is_main_process:
+        console.print(
+            f"[progressive] Enabled: {current_frame_size}x{current_frame_size} -> "
+            f"{target_frame_size}x{target_frame_size} at {args.progressive_switch_ratio:.0%} of training."
+        )
+
+    (
+        dataset,
+        train_dataset,
         eval_dataset,
-        batch_size=eval_batch_size,
-        num_workers=0,
-        pin_memory=False,
-    )
+        train_loader,
+        eval_loader,
+        frame_height,
+        frame_width,
+        source_frame_height,
+        source_frame_width,
+    ) = build_data_for_frame_size(current_frame_size, stage_label="initial")
 
     palette_path = Path(args.data_dir) / "palette.json"
     palette = load_palette_tensor(args.data_dir)
@@ -497,6 +602,10 @@ def main() -> None:
         base_channels=args.base_channels,
         latent_channels=args.latent_channels,
         temporal_downsample=args.temporal_downsample,
+        dropout=args.dropout,
+        onehot_conv=args.onehot_conv,
+        global_bottleneck_attn=args.global_bottleneck_attn,
+        global_bottleneck_attn_heads=args.global_bottleneck_attn_heads,
     ).to(device)
     discriminator = None
     discriminator_optimizer = None
@@ -602,6 +711,45 @@ def main() -> None:
             for message in scheduler_setup.log_messages:
                 console.print(message)
 
+    progressive_switch_step: int | None = None
+    if progressive_resize:
+        if args.max_steps < 2:
+            progressive_resize = False
+            if is_main_process:
+                console.print("[progressive] Disabled because --max-steps < 2.")
+        else:
+            progressive_switch_step = int(args.max_steps * args.progressive_switch_ratio)
+            progressive_switch_step = min(max(progressive_switch_step, 1), args.max_steps - 1)
+            if is_main_process:
+                console.print(
+                    f"[progressive] Switch step: {progressive_switch_step} "
+                    f"(start_step={start_step}, max_steps={args.max_steps})."
+                )
+
+    if (
+        progressive_resize
+        and progressive_switch_step is not None
+        and start_step >= progressive_switch_step
+        and current_frame_size != target_frame_size
+    ):
+        if is_main_process:
+            console.print(
+                f"[progressive] Resume starts at step {start_step} >= switch step {progressive_switch_step}; "
+                f"loading full-resolution data ({target_frame_size}x{target_frame_size}) now."
+            )
+        (
+            dataset,
+            train_dataset,
+            eval_dataset,
+            train_loader,
+            eval_loader,
+            frame_height,
+            frame_width,
+            source_frame_height,
+            source_frame_width,
+        ) = build_data_for_frame_size(target_frame_size, stage_label="fullres-resume")
+        current_frame_size = target_frame_size
+
     if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
         model, discriminator, optimizer, discriminator_optimizer, train_loader = accelerator.prepare(
             model,
@@ -625,10 +773,12 @@ def main() -> None:
             "num_colors": int(num_colors),
             "clip_frames": int(args.clip_frames),
             "context_frames": int(args.context_frames),
-            "frame_height": int(frame_height),
-            "frame_width": int(frame_width),
+            "frame_height": int(target_frame_size),
+            "frame_width": int(target_frame_size),
             "source_frame_height": int(source_frame_height or frame_height),
             "source_frame_width": int(source_frame_width or frame_width),
+            "initial_frame_height": int(frame_height),
+            "initial_frame_width": int(frame_width),
         },
         model={
             "num_parameters": int(num_parameters),
@@ -636,6 +786,9 @@ def main() -> None:
             "base_channels": int(args.base_channels),
             "latent_channels": int(args.latent_channels),
             "temporal_downsample": int(args.temporal_downsample),
+            "dropout": float(args.dropout),
+            "global_bottleneck_attn": bool(args.global_bottleneck_attn),
+            "global_bottleneck_attn_heads": int(args.global_bottleneck_attn_heads),
         },
     )
     if is_main_process:
@@ -663,10 +816,42 @@ def main() -> None:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         onehot_buffer: torch.Tensor | None = None
-        clean_onehot_buffer: torch.Tensor | None = None
+        use_onehot_conv = args.onehot_conv
         for step in range(start_step, args.max_steps):
+            if (
+                progressive_resize
+                and progressive_switch_step is not None
+                and current_frame_size != target_frame_size
+                and step >= progressive_switch_step
+            ):
+                accelerator.wait_for_everyone()
+                if is_main_process:
+                    log_console.print(
+                        f"[progressive] Switching to full resolution at step {step}: "
+                        f"{current_frame_size}x{current_frame_size} -> "
+                        f"{target_frame_size}x{target_frame_size}"
+                    )
+                (
+                    dataset,
+                    train_dataset,
+                    eval_dataset,
+                    train_loader,
+                    eval_loader,
+                    frame_height,
+                    frame_width,
+                    source_frame_height,
+                    source_frame_width,
+                ) = build_data_for_frame_size(target_frame_size, stage_label=f"fullres@{step}")
+                train_loader = accelerator.prepare(train_loader)
+                train_iter = infinite_batches(train_loader)
+                current_frame_size = target_frame_size
+                onehot_buffer = None
+                bytes_per_sample = None
+                accelerator.wait_for_everyone()
+
             batch = next(train_iter)
-            frames = batch["frames"].to(device, non_blocking=True).long()
+            # Keep palette indices compact on-device for onehot_conv; convert to long only when needed.
+            frames = batch["frames"].to(device, non_blocking=True)
             input_frames = frames
             if palette_aug_probs is not None:
                 input_frames = apply_palette_index_augmentation(
@@ -675,8 +860,11 @@ def main() -> None:
                     replacement_prob=args.palette_aug_prob,
                     replacement_probs=palette_aug_probs,
                 )
-            inputs = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-            onehot_buffer = inputs
+            if use_onehot_conv:
+                input_frames = input_frames.byte()
+            else:
+                input_frames = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+                onehot_buffer = input_frames
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
@@ -695,8 +883,9 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
-                outputs = model(inputs)
-            recon_logits, recon_targets = split_context_targets(outputs.logits, frames, args.context_frames)
+                outputs = model(input_frames)
+            target_frames = frames.long()
+            recon_logits, recon_targets = split_context_targets(outputs.logits, target_frames, args.context_frames)
             recon_loss = focal_cross_entropy(
                 recon_logits,
                 recon_targets,
@@ -707,15 +896,15 @@ def main() -> None:
             loss = recon_loss + args.kl_weight * kl_loss
 
             fake_video_detached = None
-            discriminator_real_inputs = inputs
-            if gan_active and discriminator is not None and palette_aug_probs is not None:
+            discriminator_real_inputs: torch.Tensor | None = None
+            if gan_active and discriminator is not None:
                 discriminator_real_inputs = frames_to_one_hot(
-                    frames,
+                    target_frames,
                     num_colors,
                     dtype=onehot_dtype,
-                    out=clean_onehot_buffer,
+                    out=onehot_buffer,
                 )
-                clean_onehot_buffer = discriminator_real_inputs
+                onehot_buffer = discriminator_real_inputs
             if gan_active and discriminator is not None:
                 set_requires_grad(discriminator, False)
                 with accelerator.autocast():
@@ -730,7 +919,7 @@ def main() -> None:
             grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
             optimizer.step()
             scheduler.step()
-            del outputs, recon_logits, recon_targets
+            del outputs, recon_logits, recon_targets, target_frames
 
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
@@ -761,6 +950,7 @@ def main() -> None:
 
             if is_main_process:
                 status = (
+                    f"res={current_frame_size} "
                     f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
                     f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
                     f"gnorm={grad_norm:.2f} "
@@ -792,6 +982,7 @@ def main() -> None:
                 train_row = {
                     "type": "train",
                     "step": step,
+                    "frame_size": int(current_frame_size),
                     "loss": loss.item(),
                     "recon_loss": recon_loss.item(),
                     "kl_loss": kl_loss.item(),
@@ -868,6 +1059,7 @@ def main() -> None:
                         kl_weight=args.kl_weight,
                         context_frames=args.context_frames,
                         onehot_dtype=onehot_dtype,
+                        onehot_conv=use_onehot_conv,
                         focal_gamma=args.focal_gamma,
                         class_weight=class_weight,
                         accelerator=accelerator,
@@ -880,6 +1072,7 @@ def main() -> None:
                 else:
                     eval_metrics["type"] = "eval"
                     eval_metrics["step"] = step
+                    eval_metrics["frame_size"] = int(current_frame_size)
                     eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                     eval_metrics["train_grad_norm"] = grad_norm
                     metrics.append(eval_metrics)
@@ -905,9 +1098,12 @@ def main() -> None:
                             try:
                                 train_batch = next(train_iter)
                                 train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
-                                train_inputs = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                                if use_onehot_conv:
+                                    train_input = train_frames.byte()
+                                else:
+                                    train_input = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
                                 with accelerator.autocast():
-                                    train_outputs = model(train_inputs, sample_posterior=False)
+                                    train_outputs = model(train_input, sample_posterior=False)
                                 save_video_preview(
                                     preview_path(output_dir, split="train", step=step),
                                     train_frames.detach().cpu(),
@@ -915,7 +1111,7 @@ def main() -> None:
                                     palette,
                                     max_frames=total_clip_frames,
                                 )
-                                del train_outputs, train_inputs, train_frames, train_batch
+                                del train_outputs, train_frames, train_batch
                             except torch.cuda.OutOfMemoryError:
                                 log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
                                 if torch.cuda.is_available():

@@ -107,6 +107,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--base-channels", type=int, default=32)
     parser.add_argument("--latent-channels", type=int, default=32)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability used in model residual blocks.",
+    )
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument(
         "--blocks-per-level",
@@ -216,6 +222,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--blocks-per-level must be >= 1")
     if len(args.channel_mult) < 1:
         parser.error("--channel-mult must have at least 1 value")
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
     return args
 
 
@@ -425,6 +433,7 @@ def main() -> None:
         latent_channels=args.latent_channels,
         blocks_per_level=args.blocks_per_level,
         channel_mult=channel_mult,
+        dropout=args.dropout,
     ).to(device)
 
     num_parameters = sum(p.numel() for p in model.parameters())
@@ -563,6 +572,7 @@ def main() -> None:
             "discriminator_parameters": int(discriminator_num_parameters),
             "base_channels": int(args.base_channels),
             "latent_channels": int(args.latent_channels),
+            "dropout": float(args.dropout),
             "patch_size": int(args.patch_size),
             "blocks_per_level": int(args.blocks_per_level),
             "channels_per_level": channels,

@@ -49,6 +49,7 @@ class RAMVideoVAE(nn.Module):
         video_base_channels: int = 24,
         video_latent_channels: int = 16,
         temporal_downsample: int = 0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if n_bytes <= 0:
@@ -59,6 +60,8 @@ class RAMVideoVAE(nn.Module):
             raise ValueError("frame_height and frame_width must be positive")
         if temporal_downsample not in (0, 1):
             raise ValueError("temporal_downsample must be 0 or 1")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
 
         self.n_bytes = n_bytes
         self.num_colors = num_colors
@@ -73,19 +76,19 @@ class RAMVideoVAE(nn.Module):
 
         self.encoder_in = nn.Linear(n_bytes, hidden_dim)
         self.encoder_blocks = nn.ModuleList(
-            [ResidualFC(hidden_dim) for _ in range(n_fc_blocks)]
+            [ResidualFC(hidden_dim, dropout=dropout) for _ in range(n_fc_blocks)]
         )
         self.encoder_temporal = nn.ModuleList(
-            [TemporalResBlock(hidden_dim, temporal_kernel_size) for _ in range(n_temporal_blocks)]
+            [TemporalResBlock(hidden_dim, temporal_kernel_size, dropout=dropout) for _ in range(n_temporal_blocks)]
         )
         self.encoder_out = nn.Conv1d(hidden_dim, latent_dim * 2, kernel_size=1)
 
         self.ram_decoder_in = nn.Conv1d(latent_dim, hidden_dim, kernel_size=1)
         self.ram_decoder_temporal = nn.ModuleList(
-            [TemporalResBlock(hidden_dim, temporal_kernel_size) for _ in range(n_temporal_blocks)]
+            [TemporalResBlock(hidden_dim, temporal_kernel_size, dropout=dropout) for _ in range(n_temporal_blocks)]
         )
         self.ram_decoder_blocks = nn.ModuleList(
-            [ResidualFC(hidden_dim) for _ in range(n_fc_blocks)]
+            [ResidualFC(hidden_dim, dropout=dropout) for _ in range(n_fc_blocks)]
         )
         self.ram_decoder_out = nn.Linear(hidden_dim, n_bytes)
 
@@ -99,23 +102,23 @@ class RAMVideoVAE(nn.Module):
         hidden_4 = video_base_channels * 4
         hidden_8 = video_base_channels * 8
         self.video_decoder_in = nn.Conv3d(video_latent_channels, hidden_8, kernel_size=1)
-        self.video_decoder_mid = ResidualBlock3D(hidden_8)
-        self.video_decoder_block6 = ResidualBlock3D(hidden_8)
+        self.video_decoder_mid = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.video_decoder_block6 = ResidualBlock3D(hidden_8, dropout=dropout)
 
         self.video_decoder_up1 = SpatialUpsample3D(hidden_8, hidden_8, upsample_time=temporal_downsample == 1)
-        self.video_decoder_block5 = ResidualBlock3D(hidden_8)
+        self.video_decoder_block5 = ResidualBlock3D(hidden_8, dropout=dropout)
 
         self.video_decoder_up2 = SpatialUpsample3D(hidden_8, hidden_4)
-        self.video_decoder_block4 = ResidualBlock3D(hidden_4)
+        self.video_decoder_block4 = ResidualBlock3D(hidden_4, dropout=dropout)
 
         self.video_decoder_up3 = SpatialUpsample3D(hidden_4, hidden_2)
-        self.video_decoder_block3 = ResidualBlock3D(hidden_2)
+        self.video_decoder_block3 = ResidualBlock3D(hidden_2, dropout=dropout)
 
         self.video_decoder_up4 = SpatialUpsample3D(hidden_2, video_base_channels)
-        self.video_decoder_block2 = ResidualBlock3D(video_base_channels)
+        self.video_decoder_block2 = ResidualBlock3D(video_base_channels, dropout=dropout)
 
         self.video_decoder_up5 = SpatialUpsample3D(video_base_channels, video_base_channels)
-        self.video_decoder_block1 = ResidualBlock3D(video_base_channels)
+        self.video_decoder_block1 = ResidualBlock3D(video_base_channels, dropout=dropout)
 
         self.video_decoder_norm = nn.GroupNorm(_num_groups(video_base_channels), video_base_channels)
         self.video_decoder_out = CausalConv3d(video_base_channels, num_colors, kernel_size=3)

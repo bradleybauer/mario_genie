@@ -33,17 +33,29 @@ class RAMVideoVAEv2Output:
 class SpatialCrossAttentionBlock(nn.Module):
     """Cross-attend spatial queries over temporal RAM-derived video memory."""
 
-    def __init__(self, dim: int, *, num_heads: int, mlp_ratio: int = 4) -> None:
+    def __init__(
+        self,
+        dim: int,
+        *,
+        num_heads: int,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
         self.query_norm = nn.LayerNorm(dim)
         self.memory_norm = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads=num_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.attn_dropout = nn.Dropout(dropout)
         self.ffn_norm = nn.LayerNorm(dim)
         hidden_dim = dim * mlp_ratio
         self.ffn = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(
@@ -62,7 +74,7 @@ class SpatialCrossAttentionBlock(nn.Module):
             attn_mask=attn_mask,
             need_weights=False,
         )
-        queries = queries + attn_out
+        queries = queries + self.attn_dropout(attn_out)
         return queries + self.ffn(self.ffn_norm(queries))
 
 
@@ -91,6 +103,7 @@ class RAMVideoVAEv2(nn.Module):
         n_ram_groups: int = 128,
         n_video_temporal_blocks: int = 2,
         n_video_renderer_blocks: int = 2,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if n_bytes <= 0:
@@ -109,6 +122,8 @@ class RAMVideoVAEv2(nn.Module):
             raise ValueError("video_adapter_dim must be divisible by video_adapter_heads")
         if n_ram_groups <= 0:
             raise ValueError("n_ram_groups must be positive")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError("dropout must be in [0, 1)")
 
         self.n_bytes = n_bytes
         self.num_colors = num_colors
@@ -130,19 +145,19 @@ class RAMVideoVAEv2(nn.Module):
 
         self.encoder_in = nn.Linear(n_bytes, hidden_dim)
         self.encoder_blocks = nn.ModuleList(
-            [ResidualFC(hidden_dim) for _ in range(n_fc_blocks)]
+            [ResidualFC(hidden_dim, dropout=dropout) for _ in range(n_fc_blocks)]
         )
         self.encoder_temporal = nn.ModuleList(
-            [TemporalResBlock(hidden_dim, temporal_kernel_size) for _ in range(n_temporal_blocks)]
+            [TemporalResBlock(hidden_dim, temporal_kernel_size, dropout=dropout) for _ in range(n_temporal_blocks)]
         )
         self.encoder_out = nn.Conv1d(hidden_dim, latent_dim * 2, kernel_size=1)
 
         self.ram_decoder_in = nn.Conv1d(latent_dim, hidden_dim, kernel_size=1)
         self.ram_decoder_temporal = nn.ModuleList(
-            [TemporalResBlock(hidden_dim, temporal_kernel_size) for _ in range(n_temporal_blocks)]
+            [TemporalResBlock(hidden_dim, temporal_kernel_size, dropout=dropout) for _ in range(n_temporal_blocks)]
         )
         self.ram_decoder_blocks = nn.ModuleList(
-            [ResidualFC(hidden_dim) for _ in range(n_fc_blocks)]
+            [ResidualFC(hidden_dim, dropout=dropout) for _ in range(n_fc_blocks)]
         )
         self.ram_decoder_out = nn.Linear(hidden_dim, n_bytes)
 
@@ -156,7 +171,10 @@ class RAMVideoVAEv2(nn.Module):
             torch.randn(self.n_ram_groups, video_adapter_dim) * 0.02
         )
         self.video_memory_temporal = nn.ModuleList(
-            [TemporalResBlock(video_adapter_dim, temporal_kernel_size) for _ in range(n_video_temporal_blocks)]
+            [
+                TemporalResBlock(video_adapter_dim, temporal_kernel_size, dropout=dropout)
+                for _ in range(n_video_temporal_blocks)
+            ]
         )
         self.video_spatial_queries = nn.Parameter(
             torch.randn(self.num_spatial_queries, video_adapter_dim) * 0.02
@@ -166,6 +184,7 @@ class RAMVideoVAEv2(nn.Module):
                 SpatialCrossAttentionBlock(
                     video_adapter_dim,
                     num_heads=video_adapter_heads,
+                    dropout=dropout,
                 )
                 for _ in range(n_video_renderer_blocks)
             ]
@@ -177,23 +196,23 @@ class RAMVideoVAEv2(nn.Module):
         hidden_4 = video_base_channels * 4
         hidden_8 = video_base_channels * 8
         self.video_decoder_in = nn.Conv3d(video_latent_channels, hidden_8, kernel_size=1)
-        self.video_decoder_mid = ResidualBlock3D(hidden_8)
-        self.video_decoder_block6 = ResidualBlock3D(hidden_8)
+        self.video_decoder_mid = ResidualBlock3D(hidden_8, dropout=dropout)
+        self.video_decoder_block6 = ResidualBlock3D(hidden_8, dropout=dropout)
 
         self.video_decoder_up1 = SpatialUpsample3D(hidden_8, hidden_8, upsample_time=temporal_downsample == 1)
-        self.video_decoder_block5 = ResidualBlock3D(hidden_8)
+        self.video_decoder_block5 = ResidualBlock3D(hidden_8, dropout=dropout)
 
         self.video_decoder_up2 = SpatialUpsample3D(hidden_8, hidden_4)
-        self.video_decoder_block4 = ResidualBlock3D(hidden_4)
+        self.video_decoder_block4 = ResidualBlock3D(hidden_4, dropout=dropout)
 
         self.video_decoder_up3 = SpatialUpsample3D(hidden_4, hidden_2)
-        self.video_decoder_block3 = ResidualBlock3D(hidden_2)
+        self.video_decoder_block3 = ResidualBlock3D(hidden_2, dropout=dropout)
 
         self.video_decoder_up4 = SpatialUpsample3D(hidden_2, video_base_channels)
-        self.video_decoder_block2 = ResidualBlock3D(video_base_channels)
+        self.video_decoder_block2 = ResidualBlock3D(video_base_channels, dropout=dropout)
 
         self.video_decoder_up5 = SpatialUpsample3D(video_base_channels, video_base_channels)
-        self.video_decoder_block1 = ResidualBlock3D(video_base_channels)
+        self.video_decoder_block1 = ResidualBlock3D(video_base_channels, dropout=dropout)
 
         self.video_decoder_norm = nn.GroupNorm(_num_groups(video_base_channels), video_base_channels)
         self.video_decoder_out = CausalConv3d(video_base_channels, num_colors, kernel_size=3)

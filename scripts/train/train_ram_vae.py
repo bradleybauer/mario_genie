@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -76,16 +77,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--kl-weight", type=float, default=1e-4)
+    parser.add_argument("--focal-gamma", type=float, default=0.0, help="Focal loss gamma (0 = standard CE).")
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--embed-dim", type=int, default=8, help="Per-address embedding dimension.")
     parser.add_argument("--latent-dim", type=int, default=32)
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout probability used in model residual blocks.",
+    )
     parser.add_argument("--n-fc-blocks", type=int, default=2)
     parser.add_argument("--n-temporal-blocks", type=int, default=2)
     parser.add_argument("--temporal-kernel-size", type=int, default=3)
+    parser.add_argument(
+        "--temporal-downsample",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="Enable 2× temporal downsampling in latent (0=off, 1=on).",
+    )
     parser.add_argument(
         "--mixed-precision",
         type=str,
@@ -96,7 +112,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (0.0 <= args.dropout < 1.0):
+        parser.error("--dropout must be in [0, 1)")
+    return args
 
 
 def save_ram_preview(
@@ -109,29 +128,29 @@ def save_ram_preview(
     """Save a visual comparison of target vs reconstructed RAM for one sample."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Take first sample from batch: (T, N_bytes)
-    tgt = target[0].detach().cpu().numpy()
-    rec = reconstruction[0].detach().cpu().numpy()
+    # Take first sample from batch: (T, N_addr) — raw byte values
+    tgt = target[0].detach().cpu().float().numpy()
+    rec = reconstruction[0].detach().cpu().float().numpy()
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 8), constrained_layout=True)
 
-    im0 = axes[0].imshow(tgt.T, origin="lower", aspect="auto", cmap="viridis", vmin=0, vmax=1)
+    im0 = axes[0].imshow(tgt.T, origin="lower", aspect="auto", cmap="viridis", vmin=0, vmax=255)
     axes[0].set_title(f"{title_prefix}Target RAM" if title_prefix else "Target RAM")
     axes[0].set_xlabel("Frame")
-    axes[0].set_ylabel("Byte index")
+    axes[0].set_ylabel("Address index")
     fig.colorbar(im0, ax=axes[0], fraction=0.02, pad=0.01)
 
-    im1 = axes[1].imshow(rec.T, origin="lower", aspect="auto", cmap="viridis", vmin=0, vmax=1)
+    im1 = axes[1].imshow(rec.T, origin="lower", aspect="auto", cmap="viridis", vmin=0, vmax=255)
     axes[1].set_title(f"{title_prefix}Reconstructed RAM" if title_prefix else "Reconstructed RAM")
     axes[1].set_xlabel("Frame")
-    axes[1].set_ylabel("Byte index")
+    axes[1].set_ylabel("Address index")
     fig.colorbar(im1, ax=axes[1], fraction=0.02, pad=0.01)
 
     diff = np.abs(tgt - rec)
-    im2 = axes[2].imshow(diff.T, origin="lower", aspect="auto", cmap="hot", vmin=0, vmax=0.5)
+    im2 = axes[2].imshow(diff.T, origin="lower", aspect="auto", cmap="hot", vmin=0, vmax=128)
     axes[2].set_title("Absolute error")
     axes[2].set_xlabel("Frame")
-    axes[2].set_ylabel("Byte index")
+    axes[2].set_ylabel("Address index")
     fig.colorbar(im2, ax=axes[2], fraction=0.02, pad=0.01)
 
     fig.savefig(path, dpi=150)
@@ -142,12 +161,12 @@ def compute_ram_vae_losses(
     model: RAMVAE,
     outputs,
     target_ram: torch.Tensor,
+    *,
+    focal_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    reconstruction = outputs.reconstruction.float()
-    posterior_mean = outputs.posterior_mean.float()
-    posterior_logvar = outputs.posterior_logvar.float()
-    recon_loss = F.mse_loss(reconstruction, target_ram)
-    kl_loss = model.kl_loss(posterior_mean, posterior_logvar)
+    """Compute categorical (focal) cross-entropy reconstruction loss and KL."""
+    recon_loss = model.categorical_loss(outputs.logits.float(), target_ram, gamma=focal_gamma)
+    kl_loss = model.kl_loss(outputs.posterior_mean.float(), outputs.posterior_logvar.float())
     return recon_loss, kl_loss
 
 
@@ -157,6 +176,7 @@ def evaluate(
     *,
     device: torch.device,
     kl_weight: float,
+    focal_gamma: float = 0.0,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
     model.eval()
     recon_losses: list[float] = []
@@ -165,9 +185,9 @@ def evaluate(
 
     with torch.no_grad():
         for batch in loader:
-            ram = batch["ram"].to(device, non_blocking=True).float() / 255.0
+            ram = batch["ram"].to(device, non_blocking=True)
             outputs = model(ram)
-            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram)
+            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram, focal_gamma=focal_gamma)
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
 
@@ -175,7 +195,7 @@ def evaluate(
                 preview_out = model(ram[:1], sample_posterior=False)
                 preview = (
                     ram[:1].detach().cpu(),
-                    preview_out.reconstruction.detach().float().cpu(),
+                    preview_out.reconstruction.detach().cpu(),
                 )
                 del preview_out
 
@@ -267,15 +287,18 @@ def main() -> None:
     if len(dataset) == 0:
         raise RuntimeError("No RAM training samples were found.")
 
-    n_bytes = dataset.ram_n_bytes
-    if n_bytes is None:
-        # Probe from first file
-        with np.load(dataset.data_files[0], mmap_mode="r") as npz:
-            n_bytes = npz["ram"].shape[1]
+    # Load per-address value vocabularies from ram_addresses.json
+    ram_json_path = Path(args.data_dir) / "ram_addresses.json"
+    with open(ram_json_path) as f:
+        ram_addr_info = json.load(f)
+    values_per_address: list[list[int]] = ram_addr_info["values_per_address"]
+    n_addresses = len(values_per_address)
     if is_main_process:
+        cardinalities = [len(v) for v in values_per_address]
         console.print(
             f"Found {len(dataset):,} sequence segments of {args.clip_frames} frames, "
-            f"{n_bytes} RAM bytes per frame."
+            f"{n_addresses} RAM addresses per frame "
+            f"(total {sum(cardinalities)} categorical classes)."
         )
         console.print(
             f"Dataset: {dataset.num_files} files, {len(dataset):,} samples, "
@@ -306,12 +329,15 @@ def main() -> None:
 
     # --- Model ---
     model = RAMVAE(
-        n_bytes=n_bytes,
+        values_per_address=values_per_address,
+        embed_dim=args.embed_dim,
         hidden_dim=args.hidden_dim,
         latent_dim=args.latent_dim,
         n_fc_blocks=args.n_fc_blocks,
         n_temporal_blocks=args.n_temporal_blocks,
         temporal_kernel_size=args.temporal_kernel_size,
+        temporal_downsample=args.temporal_downsample,
+        dropout=args.dropout,
     ).to(device)
 
     if args.compile:
@@ -361,16 +387,20 @@ def main() -> None:
         mixed_precision=args.mixed_precision,
         num_processes=accelerator.num_processes,
         data={
-            "n_bytes": int(n_bytes),
+            "n_addresses": n_addresses,
+            "total_classes": int(sum(len(v) for v in values_per_address)),
             "clip_frames": int(args.clip_frames),
         },
         model={
             "num_parameters": int(num_params),
+            "embed_dim": int(args.embed_dim),
             "hidden_dim": int(args.hidden_dim),
             "latent_dim": int(args.latent_dim),
+            "dropout": float(args.dropout),
             "n_fc_blocks": int(args.n_fc_blocks),
             "n_temporal_blocks": int(args.n_temporal_blocks),
             "temporal_kernel_size": int(args.temporal_kernel_size),
+            "temporal_downsample": int(args.temporal_downsample),
         },
     )
     if is_main_process:
@@ -379,7 +409,7 @@ def main() -> None:
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
         console.print(f"Model parameters: {num_params:,}")
-        console.print(f"RAM bytes: {n_bytes}, latent_dim: {args.latent_dim}")
+        console.print(f"RAM addresses: {n_addresses}, embed_dim: {args.embed_dim}, latent_dim: {args.latent_dim}")
         if accelerator.num_processes > 1:
             console.print(
                 f"Distributed training enabled with {accelerator.num_processes} processes "
@@ -398,12 +428,12 @@ def main() -> None:
 
         for step in range(start_step, args.max_steps):
             batch = next(train_iter)
-            ram = batch["ram"].to(device, non_blocking=True).float() / 255.0
+            ram = batch["ram"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
                 outputs = model(ram)
-            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram)
+            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram, focal_gamma=args.focal_gamma)
             loss = recon_loss + args.kl_weight * kl_loss
 
             accelerator.backward(loss)
@@ -478,6 +508,7 @@ def main() -> None:
                     eval_loader,
                     device=device,
                     kl_weight=args.kl_weight,
+                    focal_gamma=args.focal_gamma,
                 )
                 eval_loss = eval_metrics["loss"]
                 eval_metrics["type"] = "eval"
