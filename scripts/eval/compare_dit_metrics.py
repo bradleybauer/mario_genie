@@ -21,6 +21,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 

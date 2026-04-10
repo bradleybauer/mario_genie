@@ -19,6 +19,7 @@ from PIL import Image
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 from matplotlib.widgets import Slider, Button
 from matplotlib.animation import FuncAnimation
 

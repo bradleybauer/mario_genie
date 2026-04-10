@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import torch
 
 
@@ -38,6 +39,12 @@ def load_metrics(checkpoint_dir: str) -> tuple[list[dict], dict]:
 
 HW_METRICS = {"gpu_mem_pct", "samples_per_sec", "steps_per_sec", "throughput_mb_per_sec"}
 ALWAYS_SKIP = {"type", "step", "frame_size"}
+LOG_SCALE_PATTERNS = {"loss", "kl", "grad_norm"}
+
+
+def _use_log_scale(name: str) -> bool:
+    lower = name.lower()
+    return any(p in lower for p in LOG_SCALE_PATTERNS)
 
 
 def _make_label(name: str, config: dict) -> str:
@@ -135,6 +142,8 @@ def plot_metrics(
         ax.set_xlabel("step")
         ax.set_ylabel(name)
         ax.set_title(name)
+        if _use_log_scale(name):
+            ax.set_yscale("log")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
@@ -197,6 +206,8 @@ def plot_compare(
         ax.set_xlabel("step")
         ax.set_ylabel(name)
         ax.set_title(name)
+        if _use_log_scale(name):
+            ax.set_yscale("log")
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 

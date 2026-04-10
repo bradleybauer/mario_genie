@@ -25,7 +25,7 @@ if project_root_str not in sys.path:
 from src.models.gan_discriminator import build_palette_discriminator, count_trainable_parameters
 from src.data.video_frames import SUPPORTED_FRAME_SIZES
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
-from src.training.losses import focal_cross_entropy, softened_inverse_frequency_weights
+from src.training.losses import focal_cross_entropy, softened_inverse_frequency_weights, spatial_weight_map, temporal_change_weight
 from src.models.video_vae import VideoVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from src.training.palette_video_vae_training import (
@@ -129,7 +129,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.00,
+        default=0.005,
         help="Dropout probability used in model residual blocks.",
     )
     parser.add_argument(
@@ -203,6 +203,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.3,
         help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
+    )
+    parser.add_argument(
+        "--class-weight-radius",
+        type=float,
+        default=2.0,
+        help="Spatial LogSumExp pooling radius for per-pixel class weights (0=disabled).",
+    )
+    parser.add_argument(
+        "--class-weight-hardness",
+        type=float,
+        default=20.0,
+        help="LogSumExp hardness β for spatial class-weight pooling (higher=closer to local max).",
+    )
+    parser.add_argument(
+        "--temporal-change-boost",
+        type=float,
+        default=1.0,
+        help="Additive weight boost for pixels that changed from the previous frame (0=disabled).",
     )
     parser.add_argument(
         "--palette-aug-sample-prob",
@@ -582,6 +600,13 @@ def main() -> None:
                 f"(soften={args.class_weight_soften:.2f}, "
                 f"min={class_weight.min().item():.3f}, max={class_weight.max().item():.3f})"
             )
+            if args.class_weight_radius >= 0.5:
+                console.print(
+                    f"[class-weights] Spatial LogSumExp pooling: "
+                    f"radius={args.class_weight_radius:.1f}, hardness={args.class_weight_hardness:.1f}"
+                )
+    if args.temporal_change_boost > 0 and is_main_process:
+        console.print(f"[temporal-change] Boost={args.temporal_change_boost:.2f}")
     palette_aug_probs = None
     if args.palette_aug_sample_prob > 0.0 and args.palette_aug_prob > 0.0:
         palette_aug_probs = load_palette_probabilities(
@@ -886,11 +911,40 @@ def main() -> None:
                 outputs = model(input_frames)
             target_frames = frames.long()
             recon_logits, recon_targets = split_context_targets(outputs.logits, target_frames, args.context_frames)
+
+            # Build per-pixel weight combining spatial pooling + temporal change boost.
+            pixel_weight = None
+            pw_parts: list[torch.Tensor] = []
+            if class_weight is not None and args.class_weight_radius >= 0.5:
+                pw_parts.append(spatial_weight_map(
+                    target_frames, class_weight,
+                    radius=args.class_weight_radius,
+                    hardness=args.class_weight_hardness,
+                ))
+            if args.temporal_change_boost > 0:
+                pw_parts.append(temporal_change_weight(
+                    target_frames, boost=args.temporal_change_boost,
+                    context_frames=args.context_frames,
+                ))
+            if pw_parts:
+                pixel_weight = pw_parts[0]
+                if class_weight is not None and args.class_weight_radius >= 0.5:
+                    # Spatial map already includes class weights; strip them
+                    # from the per-class vector to avoid double-counting.
+                    pixel_weight = pw_parts[0]
+                    if args.temporal_change_boost > 0:
+                        # spatial map covers full T; strip context to match targets.
+                        spatial_pw = pixel_weight[:, args.context_frames:] if args.context_frames > 0 else pixel_weight
+                        pixel_weight = spatial_pw * pw_parts[1]
+                elif len(pw_parts) == 1:
+                    pixel_weight = pw_parts[0]
+
             recon_loss = focal_cross_entropy(
                 recon_logits,
                 recon_targets,
                 gamma=args.focal_gamma,
-                class_weight=class_weight,
+                class_weight=class_weight if args.class_weight_radius < 0.5 else None,
+                pixel_weight=pixel_weight,
             )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             loss = recon_loss + args.kl_weight * kl_loss
@@ -1062,6 +1116,9 @@ def main() -> None:
                         onehot_conv=use_onehot_conv,
                         focal_gamma=args.focal_gamma,
                         class_weight=class_weight,
+                        class_weight_radius=args.class_weight_radius,
+                        class_weight_hardness=args.class_weight_hardness,
+                        temporal_change_boost=args.temporal_change_boost,
                         accelerator=accelerator,
                     )
                 except torch.cuda.OutOfMemoryError:

@@ -23,6 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch

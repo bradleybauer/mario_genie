@@ -9,7 +9,7 @@ from accelerate import Accelerator
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from src.training.losses import focal_cross_entropy
+from src.training.losses import focal_cross_entropy, spatial_weight_map, temporal_change_weight
 
 
 def frames_to_one_hot(
@@ -128,6 +128,9 @@ def evaluate_video_vae(
     onehot_conv: bool = False,
     focal_gamma: float = 0.0,
     class_weight: torch.Tensor | None = None,
+    class_weight_radius: float = 0.0,
+    class_weight_hardness: float = 5.0,
+    temporal_change_boost: float = 0.0,
     accelerator: Accelerator | None = None,
     autocast_enabled: bool = False,
     autocast_dtype: torch.dtype = torch.bfloat16,
@@ -156,11 +159,32 @@ def evaluate_video_vae(
             with autocast_context():
                 outputs = model(model_input, sample_posterior=False)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
+
+            pixel_weight = None
+            pw_parts: list[torch.Tensor] = []
+            if class_weight is not None and class_weight_radius >= 0.5:
+                pw_parts.append(spatial_weight_map(
+                    frames, class_weight,
+                    radius=class_weight_radius,
+                    hardness=class_weight_hardness,
+                ))
+            if temporal_change_boost > 0:
+                pw_parts.append(temporal_change_weight(
+                    frames, boost=temporal_change_boost,
+                    context_frames=context_frames,
+                ))
+            if pw_parts:
+                pixel_weight = pw_parts[0]
+                if class_weight is not None and class_weight_radius >= 0.5 and temporal_change_boost > 0:
+                    spatial_pw = pixel_weight[:, context_frames:] if context_frames > 0 else pixel_weight
+                    pixel_weight = spatial_pw * pw_parts[1]
+
             recon_loss = focal_cross_entropy(
                 recon_logits,
                 recon_targets,
                 gamma=focal_gamma,
-                class_weight=class_weight,
+                class_weight=class_weight if class_weight_radius < 0.5 else None,
+                pixel_weight=pixel_weight,
             )
             kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             recon_losses.append(recon_loss.item())

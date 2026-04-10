@@ -29,6 +29,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import numpy as np
 from matplotlib.colors import to_hex
 from rich.console import Console

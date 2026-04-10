@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import numpy as np
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn

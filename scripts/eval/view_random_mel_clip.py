@@ -24,6 +24,7 @@ from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
+plt.style.use("dark_background")
 import numpy as np
 from scipy import signal
 from scipy.io import wavfile
