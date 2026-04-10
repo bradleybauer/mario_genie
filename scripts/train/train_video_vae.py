@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from rich.console import Console
 from torch.optim import AdamW
@@ -27,6 +28,13 @@ from src.data.video_frames import SUPPORTED_FRAME_SIZES
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from src.training.losses import focal_cross_entropy, softened_inverse_frequency_weights, spatial_weight_map, temporal_change_weight
 from src.models.video_vae import VideoVAE
+from src.models.auxiliary_heads import (
+    NextFramePredictor,
+    RAMAlignmentHead,
+    load_frozen_ram_vae,
+    temporal_smoothness_loss,
+)
+from src.models.ram_vae import RAMVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from src.training.palette_video_vae_training import (
     apply_palette_index_augmentation,
@@ -76,6 +84,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
     parser.add_argument(
+        "--context-frames",
+        type=int,
+        default=2,
+        help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
+    )
+    parser.add_argument(
         "--frame-size",
         type=int,
         default=224,
@@ -101,18 +115,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.8,
         help="Fraction of total steps spent at --progressive-start-size before switching to --frame-size.",
     )
-    parser.add_argument(
-        "--context-frames",
-        type=int,
-        default=3,
-        help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
-    )
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=2000,
-                        help="Linear warmup from 0 to --lr over this many steps (default: 2000)")
-    parser.add_argument("--kl-weight", type=float, default=5e-4)
+    parser.add_argument("--warmup-steps", type=int, default=2000, help="Linear warmup from 0 to --lr over this many steps (default: 2000)")
+    parser.add_argument("--kl-weight", type=float, default=5e-4, help="Weight for KL divergence loss term.")
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
     parser.add_argument(
@@ -184,7 +191,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Compile the Video VAE with torch.compile.",
     )
-    parser.add_argument("--focal-gamma", type=float, default=0.8,
+    parser.add_argument("--focal-gamma", type=float, default=1.0,
                         help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
     parser.add_argument(
         "--use-class-weights",
@@ -215,6 +222,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=20.0,
         help="LogSumExp hardness β for spatial class-weight pooling (higher=closer to local max).",
+    )
+    parser.add_argument(
+        "--class-weight-temporal-ema",
+        type=float,
+        default=0.6,
+        help="Causal max-decay persistence for spatial weight map (0=disabled, 0.9=strong carry-over).",
     )
     parser.add_argument(
         "--temporal-change-boost",
@@ -260,7 +273,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--gan-start-step",
         type=int,
-        default=0,
+        default=100000,
         help="Global step to start GAN updates.",
     )
     parser.add_argument(
@@ -287,6 +300,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.999,
         help="EMA decay for LeCAM running real/fake logits.",
     )
+    # --- Auxiliary losses ---
+    parser.add_argument(
+        "--next-frame-weight",
+        type=float,
+        default=0.1,
+        help="Weight for next-frame latent prediction loss (0=disabled).",
+    )
+    parser.add_argument(
+        "--temporal-smooth-weight",
+        type=float,
+        default=0.01,
+        help="Weight for temporal smoothness loss (0=disabled).",
+    )
+    parser.add_argument(
+        "--ram-align-weight",
+        type=float,
+        default=0.0,
+        help="Weight for RAM alignment loss (0=disabled).",
+    )
+    parser.add_argument(
+        "--ram-vae-checkpoint",
+        type=str,
+        default=None,
+        help="Path to frozen RAM VAE checkpoint (required when --ram-align-weight > 0).",
+    )
+    parser.add_argument("--num-actions", type=int, default=42,
+                        help="Number of discrete actions for next-frame predictor embedding.")
+    parser.add_argument("--action-embed-dim", type=int, default=16,
+                        help="Action embedding dimension for next-frame predictor.")
+    parser.add_argument("--next-frame-hidden-dim", type=int, default=128,
+                        help="Hidden dim for next-frame predictor MLP.")
+
     parser.add_argument("--resume-from", type=str, default=None)
     add_resume_scheduler_args(parser, default_tail_final_lr_scale=0.25)
     args = parser.parse_args(argv)
@@ -309,6 +354,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--progressive-start-size must be smaller than --frame-size")
         if not (0.0 < args.progressive_switch_ratio < 1.0):
             parser.error("--progressive-switch-ratio must be in (0, 1)")
+    if args.ram_align_weight > 0 and args.ram_vae_checkpoint is None:
+        parser.error("--ram-vae-checkpoint is required when --ram-align-weight > 0")
     validate_resume_scheduler_args(parser, args)
     return args
 
@@ -402,6 +449,8 @@ def save_training_state(
     discriminator: torch.nn.Module | None = None,
     discriminator_optimizer: torch.optim.Optimizer | None = None,
     lecam_ema: LeCAMEMA | None = None,
+    next_frame_predictor: torch.nn.Module | None = None,
+    ram_align_head: torch.nn.Module | None = None,
 ) -> None:
     model_state = get_model_state_dict(model, accelerator=accelerator)
     state = {
@@ -418,6 +467,10 @@ def save_training_state(
         state["discriminator_optimizer"] = discriminator_optimizer.state_dict()
         if lecam_ema is not None:
             state["lecam_ema"] = lecam_ema.state_dict()
+    if next_frame_predictor is not None:
+        state["next_frame_predictor"] = next_frame_predictor.state_dict()
+    if ram_align_head is not None:
+        state["ram_align_head"] = ram_align_head.state_dict()
     torch.save(state, path)
 
 
@@ -473,6 +526,8 @@ def main() -> None:
 
     total_clip_frames = args.clip_frames + args.context_frames
     eval_batch_size = args.eval_batch_size or args.batch_size
+    use_aux_actions = args.next_frame_weight > 0
+    use_aux_ram = args.ram_align_weight > 0
 
     def build_data_for_frame_size(
         frame_size: int,
@@ -499,6 +554,8 @@ def main() -> None:
                 data_dir=args.data_dir,
                 clip_frames=total_clip_frames,
                 frame_size=frame_size,
+                include_actions=use_aux_actions,
+                include_ram=use_aux_ram,
                 num_workers=args.num_workers,
                 system_info=system_info,
             )
@@ -604,6 +661,7 @@ def main() -> None:
                 console.print(
                     f"[class-weights] Spatial LogSumExp pooling: "
                     f"radius={args.class_weight_radius:.1f}, hardness={args.class_weight_hardness:.1f}"
+                    + (f", temporal_ema={args.class_weight_temporal_ema:.2f}" if args.class_weight_temporal_ema > 0 else "")
                 )
     if args.temporal_change_boost > 0 and is_main_process:
         console.print(f"[temporal-change] Boost={args.temporal_change_boost:.2f}")
@@ -653,6 +711,40 @@ def main() -> None:
                 f"lecam={'on' if args.use_lecam else 'off'}"
             )
 
+    # --- Auxiliary heads ---
+    next_frame_predictor: NextFramePredictor | None = None
+    ram_align_head: RAMAlignmentHead | None = None
+    frozen_ram_vae: RAMVAE | None = None
+    if use_aux_actions:
+        next_frame_predictor = NextFramePredictor(
+            latent_dim=args.latent_channels,
+            num_actions=args.num_actions,
+            action_embed_dim=args.action_embed_dim,
+            hidden_dim=args.next_frame_hidden_dim,
+        ).to(device)
+        if is_main_process:
+            nfp_params = sum(p.numel() for p in next_frame_predictor.parameters())
+            console.print(
+                f"[aux] Next-frame predictor enabled ({nfp_params:,} params), "
+                f"weight={args.next_frame_weight}"
+            )
+    if use_aux_ram:
+        frozen_ram_vae = load_frozen_ram_vae(
+            args.ram_vae_checkpoint, args.data_dir, device=device,
+        )
+        ram_align_head = RAMAlignmentHead(
+            video_latent_dim=args.latent_channels,
+            ram_latent_dim=frozen_ram_vae.latent_dim,
+        ).to(device)
+        if is_main_process:
+            rah_params = sum(p.numel() for p in ram_align_head.parameters())
+            console.print(
+                f"[aux] RAM alignment enabled ({rah_params:,} params), "
+                f"weight={args.ram_align_weight}"
+            )
+    if args.temporal_smooth_weight > 0 and is_main_process:
+        console.print(f"[aux] Temporal smoothness enabled, weight={args.temporal_smooth_weight}")
+
     if args.compile:
         if is_main_process:
             console.print("[compile] Compiling the model with torch.compile()...")
@@ -666,7 +758,13 @@ def main() -> None:
 
     num_parameters = int(sum(parameter.numel() for parameter in model.parameters()))
 
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    # Collect all trainable params: model + auxiliary heads
+    all_params = list(model.parameters())
+    if next_frame_predictor is not None:
+        all_params += list(next_frame_predictor.parameters())
+    if ram_align_head is not None:
+        all_params += list(ram_align_head.parameters())
+    optimizer = AdamW(all_params, lr=args.lr)
     if discriminator is not None:
         discriminator_optimizer = AdamW(discriminator.parameters(), lr=args.gan_lr)
     warmup_steps = max(int(args.warmup_steps), 0)
@@ -693,6 +791,10 @@ def main() -> None:
                 else:
                     if is_main_process:
                         console.print("[resume] Checkpoint has no LeCAM EMA state; LeCAM EMA resets.")
+        if next_frame_predictor is not None and "next_frame_predictor" in checkpoint:
+            next_frame_predictor.load_state_dict(checkpoint["next_frame_predictor"])
+        if ram_align_head is not None and "ram_align_head" in checkpoint:
+            ram_align_head.load_state_dict(checkpoint["ram_align_head"])
         best_eval = float(checkpoint.get("best_eval", float("inf")))
         metrics = list(checkpoint.get("metrics", []))
         scheduler_setup = configure_resume_scheduler(
@@ -814,6 +916,9 @@ def main() -> None:
             "dropout": float(args.dropout),
             "global_bottleneck_attn": bool(args.global_bottleneck_attn),
             "global_bottleneck_attn_heads": int(args.global_bottleneck_attn_heads),
+            "next_frame_weight": float(args.next_frame_weight),
+            "temporal_smooth_weight": float(args.temporal_smooth_weight),
+            "ram_align_weight": float(args.ram_align_weight),
         },
     )
     if is_main_process:
@@ -920,6 +1025,7 @@ def main() -> None:
                     target_frames, class_weight,
                     radius=args.class_weight_radius,
                     hardness=args.class_weight_hardness,
+                    temporal_ema=args.class_weight_temporal_ema,
                 ))
             if args.temporal_change_boost > 0:
                 pw_parts.append(temporal_change_weight(
@@ -939,15 +1045,43 @@ def main() -> None:
                 elif len(pw_parts) == 1:
                     pixel_weight = pw_parts[0]
 
+            # Upcast to float32 for numerically stable loss computation.
+            # bf16 logvar.exp() can overflow and focal log_softmax loses precision.
             recon_loss = focal_cross_entropy(
-                recon_logits,
+                recon_logits.float(),
                 recon_targets,
                 gamma=args.focal_gamma,
                 class_weight=class_weight if args.class_weight_radius < 0.5 else None,
                 pixel_weight=pixel_weight,
             )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
+            kl_loss = model.kl_loss(outputs.posterior_mean.float(), outputs.posterior_logvar.float())
             loss = recon_loss + args.kl_weight * kl_loss
+
+            # --- Auxiliary losses ---
+            next_frame_loss_value = 0.0
+            temporal_smooth_loss_value = 0.0
+            ram_align_loss_value = 0.0
+
+            with accelerator.autocast():
+                if next_frame_predictor is not None:
+                    actions = batch["actions"].to(device, non_blocking=True)
+                    nf_pred, nf_target = next_frame_predictor(outputs.posterior_mean, actions)
+                    next_frame_loss = F.mse_loss(nf_pred, nf_target)
+                    loss = loss + args.next_frame_weight * next_frame_loss
+                    next_frame_loss_value = next_frame_loss.item()
+
+                if args.temporal_smooth_weight > 0:
+                    temporal_loss = temporal_smoothness_loss(outputs.posterior_mean)
+                    loss = loss + args.temporal_smooth_weight * temporal_loss
+                    temporal_smooth_loss_value = temporal_loss.item()
+
+                if ram_align_head is not None and frozen_ram_vae is not None:
+                    ram = batch["ram"].to(device, non_blocking=True)
+                    with torch.no_grad():
+                        ram_mean, _ = frozen_ram_vae.encode(ram)
+                    ram_loss = ram_align_head.loss(outputs.posterior_mean, ram_mean)
+                    loss = loss + args.ram_align_weight * ram_loss
+                    ram_align_loss_value = ram_loss.item()
 
             fake_video_detached = None
             discriminator_real_inputs: torch.Tensor | None = None
@@ -970,7 +1104,7 @@ def main() -> None:
                 del fake_video, gen_adv_loss
 
             accelerator.backward(loss)
-            grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            grad_norm = accelerator.clip_grad_norm_(all_params, max_norm=1.0).item()
             optimizer.step()
             scheduler.step()
             del outputs, recon_logits, recon_targets, target_frames
@@ -1023,6 +1157,12 @@ def main() -> None:
                     status += f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f}"
                     if args.use_lecam:
                         status += f" lecam={gan_lecam_reg_value:.4f}"
+                if next_frame_predictor is not None:
+                    status += f" nf={next_frame_loss_value:.4f}"
+                if args.temporal_smooth_weight > 0:
+                    status += f" ts={temporal_smooth_loss_value:.4f}"
+                if ram_align_head is not None:
+                    status += f" ram={ram_align_loss_value:.4f}"
 
                 advance_progress(progress, train_task, status=status)
 
@@ -1059,6 +1199,12 @@ def main() -> None:
                     )
                     if args.use_lecam:
                         train_row["gan_lecam_reg"] = gan_lecam_reg_value
+                if next_frame_predictor is not None:
+                    train_row["next_frame_loss"] = next_frame_loss_value
+                if args.temporal_smooth_weight > 0:
+                    train_row["temporal_smooth_loss"] = temporal_smooth_loss_value
+                if ram_align_head is not None:
+                    train_row["ram_align_loss"] = ram_align_loss_value
                 metrics.append(train_row)
 
             if log_due and not use_live_progress and is_main_process:
@@ -1118,6 +1264,7 @@ def main() -> None:
                         class_weight=class_weight,
                         class_weight_radius=args.class_weight_radius,
                         class_weight_hardness=args.class_weight_hardness,
+                        class_weight_temporal_ema=args.class_weight_temporal_ema,
                         temporal_change_boost=args.temporal_change_boost,
                         accelerator=accelerator,
                     )
@@ -1195,6 +1342,8 @@ def main() -> None:
                             discriminator=discriminator,
                             discriminator_optimizer=discriminator_optimizer,
                             lecam_ema=lecam_ema,
+                            next_frame_predictor=next_frame_predictor,
+                            ram_align_head=ram_align_head,
                         )
                         eval_line += f" | best={best_eval:.6f}"
 
@@ -1216,6 +1365,8 @@ def main() -> None:
                     discriminator=discriminator,
                     discriminator_optimizer=discriminator_optimizer,
                     lecam_ema=lecam_ema,
+                    next_frame_predictor=next_frame_predictor,
+                    ram_align_head=ram_align_head,
                 )
 
             if eval_line is not None and is_main_process:

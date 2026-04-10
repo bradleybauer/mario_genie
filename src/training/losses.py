@@ -111,6 +111,7 @@ def spatial_weight_map(
     class_weight: Tensor,
     radius: float,
     hardness: float = 5.0,
+    temporal_ema: float = 0.0,
 ) -> Tensor:
     """Spatially pool per-pixel class weights with LogSumExp (soft local max).
 
@@ -119,6 +120,10 @@ def spatial_weight_map(
         class_weight: ``(C,)`` per-class weight vector.
         radius: spatial radius for the circular pooling region.
         hardness: β for LogSumExp.  Higher → closer to hard max.
+        temporal_ema: causal max-decay persistence factor in [0, 1).
+            At each time step the accumulator is ``max(current, ema * previous)``,
+            so high-weight regions persist and decay through subsequent frames
+            (e.g. through star-power color cycling).  0 disables.
 
     Returns:
         Weight tensor of shape ``(B, T, H, W)``.
@@ -151,5 +156,11 @@ def spatial_weight_map(
     avg_exp = F.conv2d(exp_shifted, kernel_4d, padding=r)
     avg_exp = avg_exp.clamp_min(1e-30)
     out = local_max + avg_exp.log() / hardness
+    out = out.reshape(B, T, H, W)
 
-    return out.reshape(B, T, H, W)
+    # Causal max-decay temporal persistence.
+    if temporal_ema > 0:
+        for t in range(1, T):
+            out[:, t] = torch.maximum(out[:, t], temporal_ema * out[:, t - 1])
+
+    return out

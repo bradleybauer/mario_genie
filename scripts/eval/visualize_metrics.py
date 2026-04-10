@@ -42,6 +42,11 @@ ALWAYS_SKIP = {"type", "step", "frame_size"}
 LOG_SCALE_PATTERNS = {"loss", "kl", "grad_norm"}
 
 
+def _is_lr_metric(name: str) -> bool:
+    lower = name.lower()
+    return lower == "lr" or lower.startswith("lr_") or lower.endswith("_lr") or "learning_rate" in lower
+
+
 def _use_log_scale(name: str) -> bool:
     lower = name.lower()
     return any(p in lower for p in LOG_SCALE_PATTERNS)
@@ -64,6 +69,7 @@ def _discover_metrics(
     all_entries: list[list[dict]],
     metric_names: list[str] | None,
     show_hw: bool,
+    show_lr: bool,
 ) -> list[str]:
     skip_keys = set(ALWAYS_SKIP)
     if not show_hw:
@@ -78,6 +84,8 @@ def _discover_metrics(
     # Keep only numeric
     numeric = []
     for name in candidates:
+        if not show_lr and _is_lr_metric(name):
+            continue
         for entries in all_entries:
             sample = next((m[name] for m in entries if name in m), None)
             if isinstance(sample, (int, float)):
@@ -101,6 +109,7 @@ def plot_metrics(
     smooth: int = 10,
     show_hw: bool = False,
     show_eval: bool = False,
+    show_lr: bool = False,
 ):
     train = [m for m in metrics if m.get("type") == "train"]
     evals = [m for m in metrics if m.get("type") == "eval"] if show_eval else []
@@ -109,7 +118,7 @@ def plot_metrics(
         print("No metrics found in checkpoint.")
         sys.exit(1)
 
-    numeric_metrics = _discover_metrics([train, evals], metric_names, show_hw)
+    numeric_metrics = _discover_metrics([train, evals], metric_names, show_hw, show_lr)
     if not numeric_metrics:
         print("No numeric metrics to plot.")
         sys.exit(1)
@@ -160,6 +169,7 @@ def plot_compare(
     smooth: int = 10,
     show_hw: bool = False,
     show_eval: bool = False,
+    show_lr: bool = False,
 ):
     all_train = []
     all_evals = []
@@ -167,7 +177,7 @@ def plot_compare(
         all_train.append([m for m in metrics if m.get("type") == "train"])
         all_evals.append([m for m in metrics if m.get("type") == "eval"] if show_eval else [])
 
-    numeric_metrics = _discover_metrics(all_train + all_evals, metric_names, show_hw)
+    numeric_metrics = _discover_metrics(all_train + all_evals, metric_names, show_hw, show_lr)
     if not numeric_metrics:
         print("No numeric metrics to plot.")
         sys.exit(1)
@@ -225,18 +235,34 @@ def main():
     parser.add_argument("--smooth", type=int, default=10, help="Smoothing window size (default: 10)")
     parser.add_argument("--hw", action="store_true", help="Include hardware perf metrics (gpu_mem_pct, samples/steps per sec)")
     parser.add_argument("--eval", action="store_true", help="Include eval metrics")
+    parser.add_argument("--show-lr", action="store_true", help="Include learning-rate metrics in auto-discovery")
     args = parser.parse_args()
 
     if len(args.checkpoints) == 1:
         metrics, config = load_metrics(args.checkpoints[0])
-        plot_metrics(metrics, config, metric_names=args.metrics, smooth=args.smooth, show_hw=args.hw, show_eval=getattr(args, 'eval'))
+        plot_metrics(
+            metrics,
+            config,
+            metric_names=args.metrics,
+            smooth=args.smooth,
+            show_hw=args.hw,
+            show_eval=getattr(args, "eval"),
+            show_lr=args.show_lr,
+        )
     else:
         runs = []
         for ckpt in args.checkpoints:
             metrics, config = load_metrics(ckpt)
             run_name = Path(ckpt).name
             runs.append((run_name, metrics, config))
-        plot_compare(runs, metric_names=args.metrics, smooth=args.smooth, show_hw=args.hw, show_eval=getattr(args, 'eval'))
+        plot_compare(
+            runs,
+            metric_names=args.metrics,
+            smooth=args.smooth,
+            show_hw=args.hw,
+            show_eval=getattr(args, "eval"),
+            show_lr=args.show_lr,
+        )
 
 
 if __name__ == "__main__":

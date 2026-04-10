@@ -130,6 +130,7 @@ def evaluate_video_vae(
     class_weight: torch.Tensor | None = None,
     class_weight_radius: float = 0.0,
     class_weight_hardness: float = 5.0,
+    class_weight_temporal_ema: float = 0.0,
     temporal_change_boost: float = 0.0,
     accelerator: Accelerator | None = None,
     autocast_enabled: bool = False,
@@ -167,6 +168,7 @@ def evaluate_video_vae(
                     frames, class_weight,
                     radius=class_weight_radius,
                     hardness=class_weight_hardness,
+                    temporal_ema=class_weight_temporal_ema,
                 ))
             if temporal_change_boost > 0:
                 pw_parts.append(temporal_change_weight(
