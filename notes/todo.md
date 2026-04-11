@@ -59,9 +59,9 @@ which samples do we perform well on? late training to determine sample weights t
 ppu registers?
 
 
-
-
-
+i've had this idea alot that the gradient signal decreases over training and eventually the only signal remaining is from the hard to learn and sparse features.
+like, in every training run all the moving sprites are learned last. even tho the loss decreases more slowly it's still learning its just that the things its learning do not decrease the loss as much. maybe i need to pump up the class weight loss coefficient. also increasing batch size to lessen chance of getting no-signal batches
+build a 'curriculum'?
 
 
 

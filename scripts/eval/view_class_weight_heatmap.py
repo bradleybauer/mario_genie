@@ -20,7 +20,6 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, Slider
 import numpy as np
@@ -31,6 +30,9 @@ import torch
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.plot_style import apply_plot_style, enable_slider_scroll, style_image_axes, style_widget
+apply_plot_style()
 
 from src.data.normalized_dataset import load_palette_tensor
 from src.data.video_frames import resize_palette_frames
@@ -171,11 +173,13 @@ def main() -> None:
 
     im_rgb = ax_rgb.imshow(rgb_frames[0], interpolation="nearest")
     ax_rgb.set_axis_off()
+    style_image_axes(ax_rgb)
     ax_rgb.set_title("RGB", fontsize=10)
 
     im_hm = ax_hm.imshow(weight_maps[0], interpolation="nearest",
                           cmap="inferno", vmin=vmin, vmax=vmax)
     ax_hm.set_axis_off()
+    style_image_axes(ax_hm)
     ax_hm.set_title("Weight", fontsize=10)
 
     fig.colorbar(im_hm, cax=ax_cb, label="weight")
@@ -188,21 +192,32 @@ def main() -> None:
 
     ax_slider = plt.axes([0.25, 0.10, 0.45, 0.03])
     slider = Slider(ax_slider, "Frame", 1, T, valinit=1, valstep=1, valfmt="%d")
+    style_widget(slider)
+    enable_slider_scroll(slider)
 
     ax_radius = plt.axes([0.25, 0.055, 0.45, 0.03])
     slider_radius = Slider(ax_radius, "Radius", 0, 20, valinit=0, valstep=0.5, valfmt="%.1f")
+    style_widget(slider_radius)
+    enable_slider_scroll(slider_radius)
 
     ax_hard = plt.axes([0.25, 0.015, 0.45, 0.03])
     slider_hard = Slider(ax_hard, "Hardness", 0.5, 30, valinit=5.0, valstep=0.5, valfmt="%.1f")
+    style_widget(slider_hard)
+    enable_slider_scroll(slider_hard)
 
     ax_ema = plt.axes([0.75, 0.015, 0.2, 0.03])
     slider_ema = Slider(ax_ema, "EMA", 0.0, 0.99, valinit=0.0, valstep=0.01, valfmt="%.2f")
+    style_widget(slider_ema)
+    enable_slider_scroll(slider_ema)
 
     ax_boost = plt.axes([0.75, 0.055, 0.2, 0.03])
     slider_boost = Slider(ax_boost, "Δ boost", 0.0, 10.0, valinit=0.0, valstep=0.25, valfmt="%.2f")
+    style_widget(slider_boost)
+    enable_slider_scroll(slider_boost)
 
     ax_pause = plt.axes([0.75, 0.09, 0.1, 0.05])
     btn_pause = Button(ax_pause, "Play")
+    style_widget(btn_pause)
 
     def _recompute():
         pooled = soft_max_pool(

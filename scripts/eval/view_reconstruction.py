@@ -14,14 +14,26 @@ Usage:
 import argparse
 import glob
 import os
+import sys
+from pathlib import Path
+
 import numpy as np
 from PIL import Image
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 from matplotlib.widgets import Slider, Button
 from matplotlib.animation import FuncAnimation
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from src.plot_style import (
+    apply_plot_style, enable_slider_scroll, style_image_axes, style_widget,
+    WIDGET_BG, WIDGET_HOVER, WIDGET_ACTIVE, WIDGET_TEXT,
+)
+apply_plot_style()
 
 
 DEFAULT_PREDICTED_FRAMES = 16
@@ -116,6 +128,7 @@ def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames
     im = ax.imshow(frames[0], interpolation="nearest")
     ax.set_aspect("equal", adjustable="box")
     ax.set_axis_off()
+    style_image_axes(ax)
     title = ax.set_title("", fontsize=10)
 
     folder_label = os.path.basename(os.path.normpath(folder_path))
@@ -128,15 +141,21 @@ def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames
 
     ax_slider = plt.axes([0.25, 0.06, 0.45, 0.04])
     slider = Slider(ax_slider, "Frame", 1, n, valinit=1, valstep=1, valfmt="%d")
+    style_widget(slider)
+    enable_slider_scroll(slider)
 
     ax_prev = plt.axes([0.05, 0.05, 0.08, 0.05])
-    btn_prev = Button(ax_prev, "\u25c0 Prev")
+    btn_prev = Button(ax_prev, "◀ Prev")
+    style_widget(btn_prev)
     ax_next = plt.axes([0.87, 0.05, 0.08, 0.05])
-    btn_next = Button(ax_next, "Next \u25b6")
+    btn_next = Button(ax_next, "Next ▶")
+    style_widget(btn_next)
     ax_pause = plt.axes([0.75, 0.05, 0.1, 0.05])
     btn_pause = Button(ax_pause, "Play")
+    style_widget(btn_pause)
     ax_save = plt.axes([0.14, 0.05, 0.1, 0.05])
     btn_save = Button(ax_save, "Save GIF")
+    style_widget(btn_save)
 
     def _switch_image(new_idx):
         new_idx = new_idx % len(image_paths)
@@ -335,6 +354,7 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
     # Image axes (right side)
     ax_img = fig.add_axes([image_left, image_bottom, image_width_frac, image_height_frac])
     ax_img.set_axis_off()
+    style_image_axes(ax_img)
 
     im = ax_img.imshow(first_frame, interpolation="nearest")
     ax_img.set_aspect("equal", adjustable="box")
@@ -346,15 +366,21 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
 
     ax_slider = fig.add_axes([ctrl_left + 0.15, 0.06, ctrl_w - 0.45, 0.04])
     slider = Slider(ax_slider, "Frame", 1, len(first_frames), valinit=1, valstep=1, valfmt="%d")
+    style_widget(slider)
+    enable_slider_scroll(slider)
 
     ax_prev = fig.add_axes([ctrl_left, 0.05, 0.07, 0.05])
-    btn_prev = Button(ax_prev, "\u25c0 Prev")
+    btn_prev = Button(ax_prev, "◀ Prev")
+    style_widget(btn_prev)
     ax_next = fig.add_axes([ctrl_left + ctrl_w - 0.07, 0.05, 0.07, 0.05])
-    btn_next = Button(ax_next, "Next \u25b6")
+    btn_next = Button(ax_next, "Next ▶")
+    style_widget(btn_next)
     ax_pause = fig.add_axes([ctrl_left + ctrl_w - 0.18, 0.05, 0.09, 0.05])
     btn_pause = Button(ax_pause, "Play")
+    style_widget(btn_pause)
     ax_save = fig.add_axes([ctrl_left, 0.00, 0.09, 0.05])
     btn_save = Button(ax_save, "Save GIF")
+    style_widget(btn_save)
 
     # Run selector buttons (left sidebar)
     run_buttons = []
@@ -362,9 +388,10 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
         y_frac = 1.0 - (sidebar_top_margin_pts + i * (btn_h_pts + btn_gap_pts)) / (fig_h_in * 100.0)
         h_frac = btn_h_pts / (fig_h_in * 100.0)
         ax_btn = fig.add_axes([0.01, y_frac - h_frac, sidebar_frac - 0.02, h_frac])
-        btn = Button(ax_btn, name, color="0.92", hovercolor="0.78")
+        btn = Button(ax_btn, name, color=WIDGET_BG, hovercolor=WIDGET_HOVER)
         btn.label.set_fontfamily("monospace")
         btn.label.set_fontsize(8)
+        btn.label.set_color(WIDGET_TEXT)
 
         def on_run_click(_event, idx=i):
             _select_run(idx)
@@ -382,7 +409,7 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
 
     def _highlight_button(idx):
         for i, btn in enumerate(run_buttons):
-            btn.color = "0.72" if i == idx else "0.92"
+            btn.color = WIDGET_ACTIVE if i == idx else WIDGET_BG
             btn.ax.set_facecolor(btn.color)
 
     def _select_run(idx):

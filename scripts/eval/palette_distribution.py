@@ -29,7 +29,6 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import numpy as np
 from matplotlib.colors import to_hex
 from rich.console import Console
@@ -49,6 +48,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
+
+from src.plot_style import apply_plot_style
+apply_plot_style()
 
 
 def parse_args() -> argparse.Namespace:

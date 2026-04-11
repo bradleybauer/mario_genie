@@ -86,7 +86,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--context-frames",
         type=int,
-        default=2,
+        default=0,
         help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
     )
     parser.add_argument(

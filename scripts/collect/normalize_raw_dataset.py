@@ -624,6 +624,13 @@ def main():
         total_frames = sum(int(result["frames_shape"][0]) for result in pass2_results)
         CONSOLE.print(f"Done. Wrote {len(pass2_results)} normalized file(s), {total_frames:,} frames total.")
         CONSOLE.print(f"Output in {OUT_DIR}")
+
+        # ── Write dataset index for fast loading ─────────────────────────
+        from src.data.dataset_index import build_normalized_index, write_index
+
+        ds_index = build_normalized_index(OUT_DIR)
+        idx_path = write_index(OUT_DIR, ds_index)
+        CONSOLE.print(f"Wrote {idx_path}")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

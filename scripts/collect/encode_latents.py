@@ -211,21 +211,24 @@ def encode_file(
     return np.concatenate(latent_chunks, axis=1)
 
 
-def compute_latent_channel_stats(
+def compute_latent_component_stats(
     latent_files: list[Path],
     *,
     chunk_frames: int = 2048,
 ) -> dict[str, Any]:
-    """Compute per-channel latent statistics over encoded latent files."""
+    """Compute per-component latent statistics over encoded latent files.
+
+    Components are indexed by (C, H, W) and aggregated over time/file axes.
+    """
     if not latent_files:
         raise RuntimeError("No latent files were provided for statistics computation.")
 
-    channel_sum: np.ndarray | None = None
-    channel_sum_sq: np.ndarray | None = None
+    component_sum: np.ndarray | None = None
+    component_sum_sq: np.ndarray | None = None
     channels = 0
     height = 0
     width = 0
-    count_per_channel = 0
+    count_per_component = 0
     total_values = 0
     global_sum = 0.0
     global_sum_sq = 0.0
@@ -245,12 +248,12 @@ def compute_latent_channel_stats(
                 )
 
             file_channels, file_frames, file_height, file_width = (int(v) for v in latents.shape)
-            if channel_sum is None:
+            if component_sum is None:
                 channels = file_channels
                 height = file_height
                 width = file_width
-                channel_sum = np.zeros(channels, dtype=np.float64)
-                channel_sum_sq = np.zeros(channels, dtype=np.float64)
+                component_sum = np.zeros((channels, height, width), dtype=np.float64)
+                component_sum_sq = np.zeros((channels, height, width), dtype=np.float64)
             elif (file_channels, file_height, file_width) != (channels, height, width):
                 raise ValueError(
                     f"{npz_path.name} has inconsistent latent shape {tuple(latents.shape)}; "
@@ -264,12 +267,12 @@ def compute_latent_channel_stats(
                 chunk_sq = np.square(chunk64)
                 chunk_abs = np.abs(chunk64)
 
-                assert channel_sum is not None
-                assert channel_sum_sq is not None
-                channel_sum += chunk64.sum(axis=(1, 2, 3), dtype=np.float64)
-                channel_sum_sq += chunk_sq.sum(axis=(1, 2, 3), dtype=np.float64)
+                assert component_sum is not None
+                assert component_sum_sq is not None
+                component_sum += chunk64.sum(axis=1, dtype=np.float64)
+                component_sum_sq += chunk_sq.sum(axis=1, dtype=np.float64)
 
-                count_per_channel += int((end - start) * height * width)
+                count_per_component += int(end - start)
                 total_values += int(chunk.size)
                 global_sum += float(chunk64.sum(dtype=np.float64))
                 global_sum_sq += float(chunk_sq.sum(dtype=np.float64))
@@ -277,15 +280,15 @@ def compute_latent_channel_stats(
                 global_min = min(global_min, float(chunk.min()))
                 global_max = max(global_max, float(chunk.max()))
 
-    if channel_sum is None or channel_sum_sq is None or count_per_channel <= 0 or total_values <= 0:
+    if component_sum is None or component_sum_sq is None or count_per_component <= 0 or total_values <= 0:
         raise RuntimeError("Unable to compute latent statistics from provided files.")
 
-    channel_mean = channel_sum / float(count_per_channel)
-    channel_var = channel_sum_sq / float(count_per_channel) - np.square(channel_mean)
-    channel_std = np.sqrt(np.maximum(channel_var, 0.0))
+    component_mean = component_sum / float(count_per_component)
+    component_var = component_sum_sq / float(count_per_component) - np.square(component_mean)
+    component_std = np.sqrt(np.maximum(component_var, 0.0))
 
     std_epsilon = 1e-6
-    channel_std_clamped = np.maximum(channel_std, std_epsilon)
+    component_std_clamped = np.maximum(component_std, std_epsilon)
 
     global_mean = global_sum / float(total_values)
     global_var = global_sum_sq / float(total_values) - global_mean * global_mean
@@ -293,17 +296,19 @@ def compute_latent_channel_stats(
     global_rms = float(np.sqrt(max(global_sum_sq / float(total_values), 0.0)))
 
     return {
+        "latent_stats_version": 2,
+        "normalization_scheme": "component_chw_shared_time",
         "num_files": len(latent_files),
         "latent_shape": {
             "channels": channels,
             "height": height,
             "width": width,
         },
-        "count_per_channel": int(count_per_channel),
+        "count_per_component": int(count_per_component),
         "std_epsilon": std_epsilon,
-        "channel_mean": [float(v) for v in channel_mean],
-        "channel_std": [float(v) for v in channel_std],
-        "channel_std_clamped": [float(v) for v in channel_std_clamped],
+        "component_mean": component_mean.tolist(),
+        "component_std": component_std.tolist(),
+        "component_std_clamped": component_std_clamped.tolist(),
         "global_stats": {
             "mean": float(global_mean),
             "std": global_std,
@@ -329,14 +334,16 @@ def main() -> None:
         if not latent_npz_files:
             raise RuntimeError(f"No latent .npz files found in {output_dir}.")
 
-        console.print(f"[stats] Computing latent channel stats over {len(latent_npz_files)} files...")
+        console.print(f"[stats] Computing latent component stats over {len(latent_npz_files)} files...")
         stats_start = time.time()
-        latent_stats = compute_latent_channel_stats(latent_npz_files)
+        latent_stats = compute_latent_component_stats(latent_npz_files)
         stats_path = output_dir / "latent_stats.json"
         with stats_path.open("w") as f:
             json.dump(latent_stats, f, indent=2)
         latent_meta["latent_stats_file"] = stats_path.name
-        latent_meta["latent_stats_path"] = str(stats_path.resolve())
+        latent_meta["latent_stats_path"] = serialize_project_path(stats_path, project_root=PROJECT_ROOT)
+        latent_meta["latent_stats_version"] = int(latent_stats["latent_stats_version"])
+        latent_meta["latent_normalization_scheme"] = str(latent_stats["normalization_scheme"])
         with latent_config_path.open("w") as f:
             json.dump(latent_meta, f, indent=2)
         stats_elapsed = time.time() - stats_start
@@ -412,6 +419,8 @@ def main() -> None:
         "temporal_downsample": int(vae_summary["temporal_downsample"]),
         "latent_temporal_stride": int(2 ** vae_summary["temporal_downsample"]),
         "action_downsample": "last_of_pair" if vae_summary["temporal_downsample"] > 0 else "none",
+        "latent_stats_version": 2,
+        "latent_normalization_scheme": "component_chw_shared_time",
     }
     with latent_config_path.open("w") as f:
         json.dump(latent_meta, f, indent=2)
@@ -516,9 +525,9 @@ def main() -> None:
     if not latent_npz_files:
         raise RuntimeError(f"No latent .npz files found in {output_dir}.")
 
-    console.print(f"[stats] Computing latent channel stats over {len(latent_npz_files)} files...")
+    console.print(f"[stats] Computing latent component stats over {len(latent_npz_files)} files...")
     stats_start = time.time()
-    latent_stats = compute_latent_channel_stats(latent_npz_files)
+    latent_stats = compute_latent_component_stats(latent_npz_files)
     stats_path = output_dir / "latent_stats.json"
     with stats_path.open("w") as f:
         json.dump(latent_stats, f, indent=2)
@@ -527,6 +536,8 @@ def main() -> None:
 
     latent_meta["latent_stats_file"] = stats_path.name
     latent_meta["latent_stats_path"] = serialize_project_path(stats_path, project_root=PROJECT_ROOT)
+    latent_meta["latent_stats_version"] = int(latent_stats["latent_stats_version"])
+    latent_meta["latent_normalization_scheme"] = str(latent_stats["normalization_scheme"])
     latent_meta["frame_height"] = int(args.frame_size)
     latent_meta["frame_width"] = int(args.frame_size)
     latent_meta["source_frame_height"] = int(source_frame_height or latent_meta.get("source_frame_height", args.frame_size))
@@ -536,6 +547,13 @@ def main() -> None:
     latent_meta["latent_width"] = int(latent_stats["latent_shape"]["width"])
     with latent_config_path.open("w") as f:
         json.dump(latent_meta, f, indent=2)
+
+    # ── Write dataset index for fast loading ─────────────────────────
+    from src.data.dataset_index import build_latent_index, write_index
+
+    ds_index = build_latent_index(output_dir)
+    idx_path = write_index(output_dir, ds_index)
+    console.print(f"Wrote {idx_path}")
 
     console.print(f"Output: {output_dir}")
 

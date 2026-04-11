@@ -34,13 +34,15 @@ from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
+
+from src.plot_style import apply_plot_style
+apply_plot_style()
 
 from src.data.npy_db import load_recordings, build_dataframe
 from src.data.smb1_memory_map import SMB1_RAM_LABELS

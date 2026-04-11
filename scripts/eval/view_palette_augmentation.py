@@ -240,7 +240,8 @@ def maybe_show(image: np.ndarray) -> None:
 
     matplotlib.use("TkAgg")
     import matplotlib.pyplot as plt
-    plt.style.use("dark_background")
+    from src.plot_style import apply_plot_style
+    apply_plot_style()
 
     plt.figure(figsize=(16, 10))
     plt.imshow(image)

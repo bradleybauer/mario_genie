@@ -330,7 +330,8 @@ def main() -> None:
     backend = "Agg" if args.no_show else "TkAgg"
     matplotlib.use(backend)
     import matplotlib.pyplot as plt
-    plt.style.use("dark_background")
+    from src.plot_style import apply_plot_style
+    apply_plot_style()
 
     rng = np.random.default_rng(args.seed)
     device = _resolve_device(args.device)

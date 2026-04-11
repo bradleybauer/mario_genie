@@ -13,7 +13,6 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import numpy as np
 import torch
 from accelerate import Accelerator
@@ -26,6 +25,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
+
+from src.plot_style import apply_plot_style
+apply_plot_style()
 
 from src.models.gan_discriminator import build_mel_discriminator, count_trainable_parameters
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad

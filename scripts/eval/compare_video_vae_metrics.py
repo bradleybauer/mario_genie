@@ -23,7 +23,6 @@ from functools import lru_cache
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -34,6 +33,8 @@ project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
+from src.plot_style import apply_plot_style, BASE_PLOT_RC, DEFAULT_SAVE_DPI, build_plot_rc, scale_figsize
+apply_plot_style()
 from src.config import SEQUENCE_LENGTH
 
 
@@ -74,29 +75,6 @@ LINE_STYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1)), (0, (1, 1))
 LINE_WIDTHS = [1.8, 1.2, 2.4]
 DEFAULT_FONT_SCALE = 1.6
 DEFAULT_FIGURE_SCALE = 1.25
-DEFAULT_SAVE_DPI = 180
-BASE_PLOT_RC = {
-    "font.size": 11.0,
-    "axes.titlesize": 15.0,
-    "axes.labelsize": 13.0,
-    "xtick.labelsize": 12.0,
-    "ytick.labelsize": 12.0,
-    "legend.fontsize": 11.0,
-    "legend.title_fontsize": 12.0,
-    "figure.titlesize": 18.0,
-}
-
-
-def build_plot_rc(font_scale: float) -> dict[str, float]:
-    """Build matplotlib rcParams for readable high-DPI plots."""
-    scale = max(font_scale, 0.5)
-    return {key: value * scale for key, value in BASE_PLOT_RC.items()}
-
-
-def scale_figsize(width: float, height: float, figure_scale: float) -> tuple[float, float]:
-    """Scale a base figure size without repeating the math at each call site."""
-    scale = max(figure_scale, 0.5)
-    return width * scale, height * scale
 
 
 def legend_columns(num_series: int) -> int:

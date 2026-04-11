@@ -210,6 +210,8 @@ class LatentNormalization:
     mean: torch.Tensor
     std: torch.Tensor
     stats_path: str
+    scheme: str
+    version: int
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / self.std
@@ -247,20 +249,67 @@ def _is_readable(p: Path | None) -> bool:
 
 
 def load_latent_normalization(
-    *, stats_path: Path, latent_channels: int, device: torch.device
+    *,
+    stats_path: Path,
+    latent_channels: int,
+    latent_height: int,
+    latent_width: int,
+    device: torch.device,
 ) -> LatentNormalization:
     stats = _load_json(stats_path)
-    mean_v = stats.get("channel_mean")
-    std_v = stats.get("channel_std_clamped") or stats.get("channel_std")
+    mean_v = stats.get("component_mean")
+    std_v = stats.get("component_std_clamped") or stats.get("component_std")
     if mean_v is None or std_v is None:
-        raise ValueError(f"{stats_path}: must contain channel_mean and channel_std(_clamped)")
-    if len(mean_v) != latent_channels or len(std_v) != latent_channels:
-        raise ValueError("Latent stats channel count mismatch")
+        raise ValueError(
+            f"{stats_path}: missing component_mean/component_std(_clamped). "
+            "Channel-only latent stats are no longer supported; regenerate with "
+            "scripts/collect/encode_latents.py --stats-only."
+        )
+
+    expected_shape = (latent_channels, latent_height, latent_width)
+    mean_np = np.asarray(mean_v, dtype=np.float32)
+    std_np = np.asarray(std_v, dtype=np.float32)
+    if mean_np.shape != expected_shape or std_np.shape != expected_shape:
+        raise ValueError(
+            f"Latent component stats shape mismatch: expected {expected_shape}, "
+            f"got mean={mean_np.shape}, std={std_np.shape}"
+        )
+
+    scheme = str(stats.get("normalization_scheme", ""))
+    if scheme and scheme != "component_chw_shared_time":
+        raise ValueError(
+            f"Unsupported latent normalization scheme '{scheme}' in {stats_path}; "
+            "expected 'component_chw_shared_time'."
+        )
+
+    version_raw = stats.get("latent_stats_version")
+    if version_raw is None:
+        raise ValueError(
+            f"{stats_path}: missing latent_stats_version. Regenerate with "
+            "scripts/collect/encode_latents.py --stats-only."
+        )
+    version = int(version_raw)
+    if version < 2:
+        raise ValueError(
+            f"{stats_path}: latent_stats_version={version} is not supported. "
+            "Regenerate latent stats to version 2."
+        )
+
     eps = max(float(stats.get("std_epsilon", 1e-6)), 1e-6)
-    mean = torch.tensor(mean_v, dtype=torch.float32, device=device).view(1, latent_channels, 1, 1, 1)
-    std = torch.tensor(std_v, dtype=torch.float32, device=device).view(1, latent_channels, 1, 1, 1)
+    mean = torch.from_numpy(mean_np).to(device=device, dtype=torch.float32).view(
+        1, latent_channels, 1, latent_height, latent_width
+    )
+    std = torch.from_numpy(std_np).to(device=device, dtype=torch.float32).view(
+        1, latent_channels, 1, latent_height, latent_width
+    )
     std = torch.nan_to_num(std, nan=eps, posinf=eps, neginf=eps).clamp_min(eps)
-    return LatentNormalization(mean=mean, std=std, stats_path=str(stats_path))
+    return LatentNormalization(
+        mean=mean,
+        std=std,
+        stats_path=str(stats_path),
+        scheme="component_chw_shared_time",
+        version=version,
+    )
 
 
 def load_latent_stats_path(
@@ -665,10 +714,17 @@ def main() -> None:
     latent_normalization: LatentNormalization | None = None
     if latent_stats_path is not None:
         latent_normalization = load_latent_normalization(
-            stats_path=latent_stats_path, latent_channels=latent_channels, device=device
+            stats_path=latent_stats_path,
+            latent_channels=latent_channels,
+            latent_height=int(dataset.latent_height),
+            latent_width=int(dataset.latent_width),
+            device=device,
         )
         if accelerator.is_main_process:
-            console.print(f"[latents] Per-channel normalization from {latent_stats_path}")
+            console.print(
+                f"[latents] Component normalization ({latent_normalization.scheme}, "
+                f"v{latent_normalization.version}) from {latent_stats_path}"
+            )
             if latent_frame_height > 0 and latent_frame_width > 0:
                 console.print(
                     f"[latents] Source frames {latent_source_height}x{latent_source_width} -> "
@@ -847,6 +903,8 @@ def main() -> None:
                     "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
                     "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
                     "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
+                    "latent_stats_version": int(latent_normalization.version) if latent_normalization is not None else None,
+                    "latent_normalization_scheme": latent_normalization.scheme if latent_normalization is not None else None,
                 },
                 model={
                     "num_parameters": int(num_params),

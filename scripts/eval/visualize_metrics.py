@@ -2,28 +2,43 @@
 """Visualize training metrics from a checkpoint."""
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import torch
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-def load_metrics(checkpoint_dir: str) -> tuple[list[dict], dict]:
+from src.plot_style import apply_plot_style
+apply_plot_style()
+
+
+def load_metrics(checkpoint_dir: str, strict: bool = True) -> tuple[list[dict], dict] | None:
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.exists():
         # Try as a name under checkpoints/
         checkpoint_dir = Path("checkpoints") / checkpoint_dir
     if not checkpoint_dir.exists():
-        print(f"Error: checkpoint directory not found: {checkpoint_dir}")
-        sys.exit(1)
+        msg = f"checkpoint directory not found: {checkpoint_dir}"
+        if strict:
+            print(f"Error: {msg}")
+            sys.exit(1)
+        print(f"Warning: skipping {msg}")
+        return None
 
     ckpt_path = checkpoint_dir / "latest.pt"
     if not ckpt_path.exists():
-        print(f"Error: no latest.pt found in {checkpoint_dir}")
-        sys.exit(1)
+        msg = f"no latest.pt found in {checkpoint_dir}"
+        if strict:
+            print(f"Error: {msg}")
+            sys.exit(1)
+        print(f"Warning: skipping {msg}")
+        return None
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     metrics = ckpt.get("metrics", [])
@@ -40,6 +55,7 @@ def load_metrics(checkpoint_dir: str) -> tuple[list[dict], dict]:
 HW_METRICS = {"gpu_mem_pct", "samples_per_sec", "steps_per_sec", "throughput_mb_per_sec"}
 ALWAYS_SKIP = {"type", "step", "frame_size"}
 LOG_SCALE_PATTERNS = {"loss", "kl", "grad_norm"}
+MODEL_COLOR_PALETTE = list(plt.get_cmap("tab20").colors)
 
 
 def _is_lr_metric(name: str) -> bool:
@@ -63,6 +79,23 @@ def _make_label(name: str, config: dict) -> str:
     if "batch_size" in training_cfg:
         parts.append(f"bs={training_cfg['batch_size']}")
     return " | ".join(parts)
+
+
+def _model_color_key(name: str, config: dict) -> str:
+    """Stable key used to pick a deterministic color per run/model pair."""
+    model_name = str(config.get("model_name", ""))
+    run_name = str(name)
+    if model_name and model_name != run_name:
+        return f"{model_name}:{run_name}"
+    return run_name
+
+
+def _color_for_model(name: str, config: dict):
+    key = _model_color_key(name, config)
+    # Use a stable hash so colors don't change when run ordering changes.
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    idx = int(digest[:8], 16) % len(MODEL_COLOR_PALETTE)
+    return MODEL_COLOR_PALETTE[idx]
 
 
 def _discover_metrics(
@@ -130,7 +163,8 @@ def plot_metrics(
     title = _make_label(config.get("model_name", "unknown"), config)
 
     fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
-    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.suptitle(title, fontweight="bold")
+    run_color = _color_for_model(config.get("model_name", "unknown"), config)
 
     for idx, name in enumerate(numeric_metrics):
         ax = axes[idx // cols][idx % cols]
@@ -139,21 +173,21 @@ def plot_metrics(
         train_vals = [m[name] for m in train if name in m]
 
         if train_steps:
-            ax.plot(train_steps, train_vals, alpha=0.3, color="C0", linewidth=0.8, label="train")
+            ax.plot(train_steps, train_vals, alpha=0.3, color=run_color, linewidth=0.8, label="train")
             if smooth > 1 and len(train_vals) >= smooth:
-                ax.plot(train_steps, _smooth(train_vals, smooth), color="C0", linewidth=1.5, label=f"train (smooth={smooth})")
+                ax.plot(train_steps, _smooth(train_vals, smooth), color=run_color, linewidth=1.5, label=f"train (smooth={smooth})")
 
         eval_steps = [m["step"] for m in evals if name in m]
         eval_vals = [m[name] for m in evals if name in m]
         if eval_steps:
-            ax.plot(eval_steps, eval_vals, color="C1", linewidth=2, marker="o", markersize=4, label="eval")
+            ax.plot(eval_steps, eval_vals, color=run_color, linewidth=2, marker="o", markersize=4, linestyle="--", label="eval")
 
         ax.set_xlabel("step")
         ax.set_ylabel(name)
         ax.set_title(name)
         if _use_log_scale(name):
             ax.set_yscale("log")
-        ax.legend(fontsize=8)
+        ax.legend()
         ax.grid(True, alpha=0.3)
 
     for idx in range(n, rows * cols):
@@ -187,13 +221,13 @@ def plot_compare(
     rows = (n + cols - 1) // cols
 
     fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
-    fig.suptitle(f"Comparing {len(runs)} runs", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Comparing {len(runs)} runs", fontweight="bold")
 
     for idx, name in enumerate(numeric_metrics):
         ax = axes[idx // cols][idx % cols]
 
         for run_idx, (run_name, _, config) in enumerate(runs):
-            color = f"C{run_idx}"
+            color = _color_for_model(run_name, config)
             label = _make_label(run_name, config)
             train = all_train[run_idx]
             evals = all_evals[run_idx]
@@ -218,7 +252,7 @@ def plot_compare(
         ax.set_title(name)
         if _use_log_scale(name):
             ax.set_yscale("log")
-        ax.legend(fontsize=7)
+        ax.legend()
         ax.grid(True, alpha=0.3)
 
     for idx in range(n, rows * cols):
@@ -239,7 +273,11 @@ def main():
     args = parser.parse_args()
 
     if len(args.checkpoints) == 1:
-        metrics, config = load_metrics(args.checkpoints[0])
+        loaded = load_metrics(args.checkpoints[0], strict=True)
+        if loaded is None:
+            # strict=True exits, but keep type-checkers happy.
+            sys.exit(1)
+        metrics, config = loaded
         plot_metrics(
             metrics,
             config,
@@ -252,9 +290,17 @@ def main():
     else:
         runs = []
         for ckpt in args.checkpoints:
-            metrics, config = load_metrics(ckpt)
+            loaded = load_metrics(ckpt, strict=False)
+            if loaded is None:
+                continue
+            metrics, config = loaded
             run_name = Path(ckpt).name
             runs.append((run_name, metrics, config))
+
+        if not runs:
+            print("Error: no valid checkpoints to compare.")
+            sys.exit(1)
+
         plot_compare(
             runs,
             metric_names=args.metrics,

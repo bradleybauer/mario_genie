@@ -15,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-plt.style.use("dark_background")
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,6 +29,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 project_root_str = str(PROJECT_ROOT)
 if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
+
+from src.plot_style import apply_plot_style
+apply_plot_style()
 
 from src.data.audio_features import LogMelSpectrogram, frame_audio_to_waveform, mel_time_frequency_shape
 from src.config import AUDIO_FMAX, AUDIO_FMIN, AUDIO_HOP_LENGTH, AUDIO_N_FFT, AUDIO_N_MELS, AUDIO_SAMPLE_RATE
