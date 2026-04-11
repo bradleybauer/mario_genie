@@ -32,7 +32,6 @@ import time
 
 import numpy as np
 import pygame
-import pyglet.window.key as pkey
 import stable_retro as retro
 from nes_py._rom import ROM
 from nes_py.nes_env import NESEnv
@@ -628,6 +627,14 @@ def _draw_ram_panel(screen, font, ram, ram_renderer, layout, game_w, game_h,
 
 def _run_retro(name, path, scale=DEFAULT_SCALE):
     """Game loop using stable-retro's native viewer (pyglet) at given scale."""
+    try:
+        import pyglet.window.key as pkey
+    except ImportError as exc:
+        raise SystemExit(
+            "Retro viewer requires pyglet OpenGL dependencies (missing GLU). "
+            "Install system package libglu1-mesa (Ubuntu/Debian) and retry."
+        ) from exc
+
     # Pyglet key -> NES button name (same bindings as pygame KEY_MAP)
     PYGLET_KEY_MAP = {
         pkey.RIGHT: 'RIGHT', pkey.D: 'RIGHT',

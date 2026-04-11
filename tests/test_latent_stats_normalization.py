@@ -79,9 +79,29 @@ def test_load_latent_normalization_requires_component_schema(tmp_path: Path) -> 
     with old_stats_path.open("w") as f:
         json.dump(old_schema, f)
 
-    with pytest.raises(ValueError, match="Channel-only latent stats are no longer supported"):
+    with pytest.raises(ValueError, match="missing latent_stats_version"):
         train_dit.load_latent_normalization(
             stats_path=old_stats_path,
+            latent_channels=2,
+            latent_height=2,
+            latent_width=2,
+            device=torch.device("cpu"),
+        )
+
+    missing_clamped_schema = {
+        "latent_stats_version": 2,
+        "normalization_scheme": "component_chw_shared_time",
+        "std_epsilon": 1e-6,
+        "component_mean": [[[0.1, 0.2], [0.3, 0.4]], [[-0.1, -0.2], [-0.3, -0.4]]],
+        "component_std": [[[1.0, 2.0], [3.0, 4.0]], [[1.0, 2.0], [3.0, 4.0]]],
+    }
+    missing_clamped_path = tmp_path / "missing_clamped.json"
+    with missing_clamped_path.open("w") as f:
+        json.dump(missing_clamped_schema, f)
+
+    with pytest.raises(ValueError, match="missing component_mean/component_std_clamped"):
+        train_dit.load_latent_normalization(
+            stats_path=missing_clamped_path,
             latent_channels=2,
             latent_height=2,
             latent_width=2,
@@ -112,3 +132,18 @@ def test_load_latent_normalization_requires_component_schema(tmp_path: Path) -> 
     assert norm.std.shape == (1, 2, 1, 2, 2)
     assert norm.version == 2
     assert norm.scheme == "component_chw_shared_time"
+
+    unsupported_version_schema = dict(new_schema)
+    unsupported_version_schema["latent_stats_version"] = 3
+    unsupported_version_path = tmp_path / "unsupported_version.json"
+    with unsupported_version_path.open("w") as f:
+        json.dump(unsupported_version_schema, f)
+
+    with pytest.raises(ValueError, match="latent_stats_version=3 is not supported"):
+        train_dit.load_latent_normalization(
+            stats_path=unsupported_version_path,
+            latent_channels=2,
+            latent_height=2,
+            latent_width=2,
+            device=torch.device("cpu"),
+        )

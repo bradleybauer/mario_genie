@@ -2,7 +2,7 @@
 """Validate latent_stats.json schema and consistency.
 
 This validator enforces component-wise latent normalization stats:
-- latent_stats_version >= 2
+- latent_stats_version == 2
 - normalization_scheme == component_chw_shared_time
 - component_{mean,std,std_clamped} with shape (C, H, W)
 
@@ -21,7 +21,7 @@ import numpy as np
 
 
 REQUIRED_SCHEME = "component_chw_shared_time"
-MIN_VERSION = 2
+REQUIRED_VERSION = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,8 +55,10 @@ def _validate_stats_schema(stats: dict) -> tuple[list[str], tuple[int, int, int]
     else:
         try:
             version_int = int(version)
-            if version_int < MIN_VERSION:
-                errors.append(f"latent_stats_version must be >= {MIN_VERSION}, got {version_int}")
+            if version_int != REQUIRED_VERSION:
+                errors.append(
+                    f"latent_stats_version must be {REQUIRED_VERSION}, got {version_int}"
+                )
         except (TypeError, ValueError):
             errors.append(f"latent_stats_version must be an integer, got {version!r}")
 

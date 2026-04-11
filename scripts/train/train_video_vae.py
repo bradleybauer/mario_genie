@@ -474,6 +474,143 @@ def save_training_state(
     torch.save(state, path)
 
 
+def _optimizer_group_sizes(state: object) -> list[int]:
+    if not isinstance(state, dict):
+        return []
+    param_groups = state.get("param_groups")
+    if not isinstance(param_groups, list):
+        return []
+    sizes: list[int] = []
+    for group in param_groups:
+        if not isinstance(group, dict):
+            sizes.append(0)
+            continue
+        params = group.get("params")
+        sizes.append(len(params) if isinstance(params, list) else 0)
+    return sizes
+
+
+def _load_resume_training_config(resume_from: str) -> tuple[dict[str, object] | None, Path | None]:
+    cfg_path = Path(resume_from).resolve().parent / "config.json"
+    if not cfg_path.is_file():
+        return None, None
+    try:
+        with cfg_path.open() as handle:
+            cfg = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return None, cfg_path
+    training_cfg = cfg.get("training")
+    if isinstance(training_cfg, dict):
+        return training_cfg, cfg_path
+    return None, cfg_path
+
+
+def _format_resume_optimizer_mismatch(
+    *,
+    error: Exception,
+    resume_from: str,
+    optimizer: torch.optim.Optimizer,
+    checkpoint: dict[str, object],
+    args: argparse.Namespace,
+    next_frame_predictor: torch.nn.Module | None,
+    ram_align_head: torch.nn.Module | None,
+) -> str:
+    current_sizes = _optimizer_group_sizes(optimizer.state_dict())
+    checkpoint_sizes = _optimizer_group_sizes(checkpoint.get("optimizer"))
+    lines: list[str] = [
+        "[resume] Failed to load optimizer state.",
+        f"Reason: {error}",
+        f"Checkpoint: {resume_from}",
+        f"Current optimizer param_groups={len(current_sizes)} sizes={current_sizes}",
+        f"Checkpoint optimizer param_groups={len(checkpoint_sizes)} sizes={checkpoint_sizes}",
+        "This usually means the trainable parameter set changed since the checkpoint was created.",
+    ]
+
+    current_has_nfp = next_frame_predictor is not None
+    current_has_ram = ram_align_head is not None
+    checkpoint_has_nfp = "next_frame_predictor" in checkpoint
+    checkpoint_has_ram = "ram_align_head" in checkpoint
+    checkpoint_has_gan = "discriminator_optimizer" in checkpoint
+    lines.append(
+        "Current features: "
+        f"use_gan={bool(args.use_gan)}, "
+        f"next_frame_head={current_has_nfp}, "
+        f"ram_align_head={current_has_ram}, "
+        f"base_channels={int(args.base_channels)}, "
+        f"latent_channels={int(args.latent_channels)}, "
+        f"temporal_downsample={int(args.temporal_downsample)}, "
+        f"onehot_conv={bool(args.onehot_conv)}, "
+        f"global_bottleneck_attn={bool(args.global_bottleneck_attn)}"
+    )
+    lines.append(
+        "Checkpoint state keys: "
+        f"has_discriminator_optimizer={checkpoint_has_gan}, "
+        f"has_next_frame_predictor={checkpoint_has_nfp}, "
+        f"has_ram_align_head={checkpoint_has_ram}"
+    )
+
+    training_cfg, cfg_path = _load_resume_training_config(resume_from)
+    if training_cfg is not None:
+        tracked_keys = [
+            "use_gan",
+            "next_frame_weight",
+            "ram_align_weight",
+            "base_channels",
+            "latent_channels",
+            "temporal_downsample",
+            "onehot_conv",
+            "global_bottleneck_attn",
+            "global_bottleneck_attn_heads",
+            "num_actions",
+            "action_embed_dim",
+            "next_frame_hidden_dim",
+        ]
+        mismatch_notes: list[str] = []
+        for key in tracked_keys:
+            if not hasattr(args, key):
+                continue
+            current_value = getattr(args, key)
+            checkpoint_value = training_cfg.get(key)
+            if checkpoint_value is None:
+                continue
+            if current_value != checkpoint_value:
+                mismatch_notes.append(f"{key}: current={current_value} checkpoint={checkpoint_value}")
+        if mismatch_notes:
+            lines.append(f"Config mismatches from {cfg_path}:")
+            lines.extend(mismatch_notes)
+        else:
+            lines.append(f"Config file checked: {cfg_path} (no tracked mismatches found).")
+    elif cfg_path is not None:
+        lines.append(f"Config file could not be parsed for comparison: {cfg_path}")
+
+    lines.append("If you changed architecture/aux flags intentionally, start a new run without --resume-from.")
+    lines.append("If you intended to resume exactly, reuse the original flags from the checkpoint config.")
+    return "\n".join(lines)
+
+
+def _format_resume_discriminator_optimizer_mismatch(
+    *,
+    error: Exception,
+    resume_from: str,
+    discriminator_optimizer: torch.optim.Optimizer,
+    checkpoint: dict[str, object],
+    args: argparse.Namespace,
+) -> str:
+    current_sizes = _optimizer_group_sizes(discriminator_optimizer.state_dict())
+    checkpoint_sizes = _optimizer_group_sizes(checkpoint.get("discriminator_optimizer"))
+    lines: list[str] = [
+        "[resume] Failed to load discriminator optimizer state.",
+        f"Reason: {error}",
+        f"Checkpoint: {resume_from}",
+        f"Current discriminator optimizer param_groups={len(current_sizes)} sizes={current_sizes}",
+        f"Checkpoint discriminator optimizer param_groups={len(checkpoint_sizes)} sizes={checkpoint_sizes}",
+        "This usually means discriminator architecture or GAN settings changed.",
+        f"Current GAN flags: use_gan={bool(args.use_gan)}, gan_target_size={args.gan_target_size}, use_lecam={bool(args.use_lecam)}",
+        "Use the same GAN flags as the original run, or restart without --resume-from.",
+    ]
+    return "\n".join(lines)
+
+
 def main() -> None:
     args = parse_args()
     if args.use_lecam and not args.use_gan:
@@ -777,11 +914,40 @@ def main() -> None:
         with accelerator.main_process_first():
             checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
         load_model_state_dict(model, checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        if "optimizer" not in checkpoint:
+            raise RuntimeError(
+                f"[resume] Checkpoint is missing optimizer state: {args.resume_from}. "
+                "Cannot resume training state."
+            )
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError as exc:
+            raise RuntimeError(
+                _format_resume_optimizer_mismatch(
+                    error=exc,
+                    resume_from=args.resume_from,
+                    optimizer=optimizer,
+                    checkpoint=checkpoint,
+                    args=args,
+                    next_frame_predictor=next_frame_predictor,
+                    ram_align_head=ram_align_head,
+                )
+            ) from exc
         if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
             if "discriminator" in checkpoint and "discriminator_optimizer" in checkpoint:
                 load_model_state_dict(discriminator, checkpoint["discriminator"])
-                discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
+                try:
+                    discriminator_optimizer.load_state_dict(checkpoint["discriminator_optimizer"])
+                except ValueError as exc:
+                    raise RuntimeError(
+                        _format_resume_discriminator_optimizer_mismatch(
+                            error=exc,
+                            resume_from=args.resume_from,
+                            discriminator_optimizer=discriminator_optimizer,
+                            checkpoint=checkpoint,
+                            args=args,
+                        )
+                    ) from exc
             else:
                 if is_main_process:
                     console.print("[resume] Checkpoint has no discriminator state; GAN starts from scratch.")

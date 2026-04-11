@@ -5,6 +5,7 @@ Usage:
     python remote/provision.py up                  # search & provision
     python remote/provision.py up --disk-gb 200    # request a larger root disk
     python remote/provision.py up --sort dlperf    # sort by DL perf
+    python remote/provision.py up --sort dlperf_per_dollar  # sort by DL perf per dollar
     python remote/provision.py up --gpu RTX_5090   # filter by GPU type
     python remote/provision.py up --num-gpus 2     # require 2 GPUs per instance
     python remote/provision.py up --num-gpus any   # allow any GPU count
@@ -29,6 +30,8 @@ SORT_OPTIONS = {
     "price": ["dph_total", "asc"],
     "dlperf": ["dlperf", "desc"],
     "value": ["dlperf_per_dphtotal", "desc"],
+    "dlperf_per_dollar": ["dlperf_per_dphtotal", "desc"],
+    "dolar": ["dlperf_per_dphtotal", "desc"],
     "vram": ["gpu_ram", "desc"],
     "bw": ["gpu_mem_bw", "desc"],
 }
@@ -521,9 +524,11 @@ examples:
   provision.py update-config            Regenerate config.py from running instances
 
 sort keys (comma-separated):
-  price    Total $/hr ascending (default)
+    price    Total $/hr ascending
   dlperf   DL performance descending
-  value    DL perf per dollar descending
+    value    DL perf per dollar descending (default)
+    dlperf_per_dollar  DL perf per dollar descending (default)
+    dolar    Alias for DL perf per dollar descending
   vram     GPU memory descending
   bw       GPU memory bandwidth descending
 """,
@@ -543,8 +548,8 @@ sort keys (comma-separated):
     )
     up.add_argument("--image", default=IMAGE, help=f"Docker image (default: {IMAGE})")
     up.add_argument("--timeout", type=int, default=600, help="Seconds to wait for instances to become ready (default: 600)")
-    up.add_argument("--sort", default="price",
-                    help="Sort keys, comma-separated: price,dlperf,value,vram,bw (default: price)")
+    up.add_argument("--sort", default="dlperf_per_dollar",
+                    help="Sort keys, comma-separated: price,dlperf,value,dlperf_per_dollar,dolar,vram,bw (default: dlperf_per_dollar)")
     up.add_argument("--gpu", default=None, help="Filter by GPU type, e.g. RTX_5090, RTX_4090")
     up.add_argument("--num-gpus", type=_parse_num_gpus, default=FILTERS["num_gpus"]["eq"], help="Require this many GPUs per instance, or 'any' to disable the filter (default: 1)")
 

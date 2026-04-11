@@ -3,8 +3,8 @@
 
 Usage examples:
     python scripts/play_video_vae.py --checkpoint checkpoints/run/video_vae_best.pt
-    python scripts/play_video_vae.py --checkpoint checkpoints/run/video_vae_latest.pt --rom mario
-    python scripts/play_video_vae.py --checkpoint checkpoints/run/video_vae_best.pt --view side-by-side
+    python scripts/play_video_vae.py --checkpoint checkpoints/video_vae_20260410_134808 --rom mario
+    python scripts/play_video_vae.py --checkpoint checkpoints/run/video_vae_latest.pt --view side-by-side
 
 The script:
 1) reads NES observations from the emulator,
@@ -51,7 +51,9 @@ DEFAULT_FPS = 60
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play NES through Video VAE reconstruction.")
     parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to a checkpoint (.pt) from train_video_vae.py")
+                        help="Path to a checkpoint (.pt) or checkpoint directory")
+    parser.add_argument("--best", action="store_true",
+                        help="When --checkpoint is a directory, prefer best.pt over latest.pt")
     parser.add_argument("--config", type=str, default=None,
                         help="Optional config.json path. Defaults to sibling of --checkpoint if found.")
     parser.add_argument("--data-dir", type=str, default="data/normalized",
@@ -117,6 +119,22 @@ def _load_config(args: argparse.Namespace) -> dict:
         return json.load(handle)
 
 
+def _resolve_checkpoint_path(checkpoint: str, *, prefer_best: bool = False) -> Path:
+    path = Path(checkpoint)
+    if path.is_file():
+        return path
+    if path.is_dir():
+        names = ("best.pt", "latest.pt") if prefer_best else ("latest.pt", "best.pt")
+        for name in names:
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(
+            f"No checkpoint file found in {path}; expected one of: {', '.join(names)}"
+        )
+    raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+
 def _dtype_from_name(name: str) -> torch.dtype:
     mapping = {
         "float32": torch.float32,
@@ -124,6 +142,15 @@ def _dtype_from_name(name: str) -> torch.dtype:
         "bfloat16": torch.bfloat16,
     }
     return mapping[name]
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    mapping = {
+        torch.float32: "float32",
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+    }
+    return mapping.get(dtype, str(dtype))
 
 
 def _build_rgb_lut(palette_rgb: np.ndarray) -> np.ndarray:
@@ -427,9 +454,8 @@ def main() -> None:
     if args.fps < 1:
         raise SystemExit("--fps must be at least 1")
 
-    checkpoint_path = Path(args.checkpoint)
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint_path = _resolve_checkpoint_path(args.checkpoint, prefer_best=args.best).resolve()
+    args.checkpoint = str(checkpoint_path)
 
     palette_info = load_palette_info(args.data_dir)
     palette_rgb = np.asarray(palette_info["colors_rgb"], dtype=np.uint8)
@@ -455,13 +481,22 @@ def main() -> None:
     frame_height = int(args.frame_size or config_data.get("frame_height", CANONICAL_FRAME_HEIGHT))
     frame_width = int(args.frame_size or config_data.get("frame_width", CANONICAL_FRAME_WIDTH))
 
-    onehot_name = args.onehot_dtype or str(config_training.get("onehot_dtype", config.get("onehot_dtype", "float32")))
-    onehot_dtype = _dtype_from_name(onehot_name)
+    requested_onehot_name = args.onehot_dtype or str(
+        config_training.get("onehot_dtype", config.get("onehot_dtype", "float32"))
+    )
+    onehot_dtype = _dtype_from_name(requested_onehot_name)
 
     autocast_enabled = bool(args.autocast and device.type == "cuda")
     autocast_dtype = torch.bfloat16 if onehot_dtype == torch.bfloat16 else torch.float16
     if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         autocast_dtype = torch.float16
+
+    if not autocast_enabled and onehot_dtype != torch.float32:
+        onehot_dtype = torch.float32
+    elif autocast_enabled and onehot_dtype != torch.float32 and onehot_dtype != autocast_dtype:
+        onehot_dtype = autocast_dtype
+
+    onehot_name = _dtype_name(onehot_dtype)
 
     model = VideoVAE(
         num_colors=int(palette_rgb.shape[0]),
@@ -506,6 +541,11 @@ def main() -> None:
         f"temporal_downsample={temporal_downsample}, global_bottleneck_attn={global_bottleneck_attn}, "
         f"frame={frame_height}x{frame_width}, onehot_dtype={onehot_name}"
     )
+    if onehot_name != requested_onehot_name:
+        print(
+            f"Adjusted onehot_dtype from {requested_onehot_name} to {onehot_name} "
+            f"for compatibility with autocast={autocast_enabled}."
+        )
     print(f"Loading {name} (backend: {backend})")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")
 

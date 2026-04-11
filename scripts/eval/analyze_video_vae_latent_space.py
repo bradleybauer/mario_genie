@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import sys
@@ -134,6 +135,9 @@ def collect_latent_stats(
     num_clips: int,
     batch_size: int,
     seed: int,
+    use_amp: bool = False,
+    auto_batch_shrink: bool = True,
+    min_batch_size: int = 1,
 ) -> dict:
     """Encode clips and collect comprehensive latent statistics.
 
@@ -161,9 +165,15 @@ def collect_latent_stats(
     n_processed = 0
     t_start = time.time()
 
-    # Process in mini-batches
-    for batch_start in range(0, len(indices), batch_size):
-        batch_indices = indices[batch_start:batch_start + batch_size]
+    if min_batch_size < 1:
+        raise ValueError("min_batch_size must be >= 1")
+
+    # Process in mini-batches with optional OOM recovery by shrinking batch size.
+    effective_batch_size = max(batch_size, min_batch_size)
+    batch_start = 0
+    while batch_start < len(indices):
+        current_batch_size = min(effective_batch_size, len(indices) - batch_start)
+        batch_indices = indices[batch_start:batch_start + current_batch_size]
         batch_frames = []
         batch_file_idxs = []
 
@@ -172,54 +182,95 @@ def collect_latent_stats(
             batch_frames.append(sample["frames"])
             batch_file_idxs.append(sample.get("file_idx", -1))
 
-        # Stack into batch tensor
-        frames = torch.stack(batch_frames, dim=0).to(device)  # (B, T, H, W)
-        B = frames.shape[0]
+        frames = None
+        outputs = None
+        logits = None
+        mean = None
+        logvar = None
+        latents = None
+        kl = None
+        target = None
+        pred_logits = None
+        pred_classes = None
 
-        # Forward pass
-        outputs = model(frames.byte(), sample_posterior=True)
-        logits = outputs.logits             # (B, C, T, H, W)
-        mean = outputs.posterior_mean       # (B, Z, T_lat, H_lat, W_lat)
-        logvar = outputs.posterior_logvar
-        latents = outputs.latents
+        try:
+            # Stack into batch tensor
+            frames = torch.stack(batch_frames, dim=0).to(device)  # (B, T, H, W)
+            B = frames.shape[0]
 
-        # Per-element KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
-        kl = 0.5 * (mean.square() + logvar.exp() - 1.0 - logvar)
+            # Forward pass (AMP can significantly reduce VRAM usage on small GPUs)
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.float16)
+                if use_amp and device.type == "cuda"
+                else nullcontext()
+            )
+            with amp_ctx:
+                outputs = model(frames.byte(), sample_posterior=True)
+                logits = outputs.logits             # (B, C, T, H, W)
+                mean = outputs.posterior_mean       # (B, Z, T_lat, H_lat, W_lat)
+                logvar = outputs.posterior_logvar
+                latents = outputs.latents
 
-        # Reconstruction accuracy & loss (skip context frames)
-        target = frames[:, context_frames:].long()
-        pred_logits = logits[:, :, context_frames:]
-        pred_classes = pred_logits.argmax(dim=1)
-        for b in range(B):
-            acc = (pred_classes[b] == target[b]).float().mean().item()
-            loss = F.cross_entropy(
-                pred_logits[b].unsqueeze(0), target[b].unsqueeze(0)
-            ).item()
-            lat_norm = latents[b].norm().item()
+                # Per-element KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+                kl = 0.5 * (mean.square() + logvar.exp() - 1.0 - logvar)
 
-            all_accuracies.append(acc)
-            all_losses.append(loss)
-            all_latent_norms.append(lat_norm)
-            all_file_idxs.append(batch_file_idxs[b])
+            # Reconstruction accuracy & loss (skip context frames)
+            target = frames[:, context_frames:].long()
+            pred_logits = logits[:, :, context_frames:]
+            pred_classes = pred_logits.argmax(dim=1)
+            for b in range(B):
+                acc = (pred_classes[b] == target[b]).float().mean().item()
+                loss = F.cross_entropy(
+                    pred_logits[b].unsqueeze(0), target[b].unsqueeze(0)
+                ).item()
+                lat_norm = latents[b].norm().item()
 
-        # Store per-clip latent stats (move to CPU/numpy)
-        mean_np = mean.cpu().float().numpy()
-        logvar_np = logvar.cpu().float().numpy()
-        latents_np = latents.cpu().float().numpy()
-        kl_np = kl.cpu().float().numpy()
+                all_accuracies.append(acc)
+                all_losses.append(loss)
+                all_latent_norms.append(lat_norm)
+                all_file_idxs.append(batch_file_idxs[b])
 
-        for b in range(B):
-            all_means.append(mean_np[b])
-            all_logvars.append(logvar_np[b])
-            all_latents.append(latents_np[b])
-            all_kl.append(kl_np[b])
-            # Global average pooled latent
-            all_pooled.append(latents_np[b].mean(axis=(1, 2, 3)))  # (Z,)
+            # Store per-clip latent stats (move to CPU/numpy)
+            mean_np = mean.cpu().float().numpy()
+            logvar_np = logvar.cpu().float().numpy()
+            latents_np = latents.cpu().float().numpy()
+            kl_np = kl.cpu().float().numpy()
 
-        n_processed += B
-        elapsed = time.time() - t_start
-        rate = n_processed / elapsed if elapsed > 0 else 0
-        print(f"\r  Encoded {n_processed}/{len(indices)} clips ({rate:.1f} clips/s)", end="", flush=True)
+            for b in range(B):
+                all_means.append(mean_np[b])
+                all_logvars.append(logvar_np[b])
+                all_latents.append(latents_np[b])
+                all_kl.append(kl_np[b])
+                # Global average pooled latent
+                all_pooled.append(latents_np[b].mean(axis=(1, 2, 3)))  # (Z,)
+
+            n_processed += B
+            batch_start += B
+            elapsed = time.time() - t_start
+            rate = n_processed / elapsed if elapsed > 0 else 0
+            print(f"\r  Encoded {n_processed}/{len(indices)} clips ({rate:.1f} clips/s)", end="", flush=True)
+        except torch.OutOfMemoryError as exc:
+            if device.type != "cuda" or not auto_batch_shrink:
+                raise
+
+            if current_batch_size <= min_batch_size:
+                raise RuntimeError(
+                    f"CUDA OOM even at minimum batch size ({min_batch_size}). "
+                    "Try --device cpu, reducing --num-clips, or enabling --amp."
+                ) from exc
+
+            next_batch_size = max(min_batch_size, current_batch_size // 2)
+            if next_batch_size >= current_batch_size:
+                next_batch_size = current_batch_size - 1
+
+            print(
+                f"\n  CUDA OOM at batch_size={current_batch_size}; "
+                f"retrying with batch_size={next_batch_size}"
+            )
+            effective_batch_size = next_batch_size
+            torch.cuda.empty_cache()
+        finally:
+            del frames, outputs, logits, mean, logvar, latents, kl, target, pred_logits, pred_classes
 
     print()
 
@@ -1105,10 +1156,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", default=None, help="Dataset directory (default: from config)")
     p.add_argument("--num-clips", type=int, default=256, help="Number of clips to encode (default: 256)")
     p.add_argument("--batch-size", type=int, default=16, help="Batch size for encoding (default: 16)")
+    p.add_argument("--min-batch-size", type=int, default=1,
+                   help="Minimum batch size when auto-shrinking after CUDA OOM (default: 1)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     p.add_argument("--top-k", type=int, default=8, help="Top-K channels for distributions & traversals (default: 8)")
     p.add_argument("--output-dir", type=str, default=None, help="Save plots & summary to this directory (default: show interactively)")
     p.add_argument("--no-traversals", action="store_true", help="Skip latent traversals (faster)")
+    p.add_argument("--amp", action="store_true",
+                   help="Use CUDA AMP (float16) for model forward pass during encoding")
+    p.add_argument("--no-auto-batch-shrink", action="store_true",
+                   help="Disable automatic batch-size reduction on CUDA OOM")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                    help="Device (default: auto)")
     return p.parse_args()
@@ -1166,12 +1223,21 @@ def main() -> None:
 
     # --- Collect latent statistics ---
     print(f"\nEncoding {args.num_clips} clips …")
+    if device.type == "cuda":
+        print(
+            "  CUDA encode settings: "
+            f"batch_size={args.batch_size}, min_batch_size={args.min_batch_size}, "
+            f"amp={args.amp}, auto_batch_shrink={not args.no_auto_batch_shrink}"
+        )
     t0 = time.time()
     stats = collect_latent_stats(
         model, dataset, config, device,
         num_clips=args.num_clips,
         batch_size=args.batch_size,
         seed=args.seed,
+        use_amp=args.amp,
+        auto_batch_shrink=not args.no_auto_batch_shrink,
+        min_batch_size=args.min_batch_size,
     )
     encode_time = time.time() - t0
     Z, T_lat, H_lat, W_lat = stats["latent_shape"]

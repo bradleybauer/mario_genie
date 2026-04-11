@@ -257,12 +257,37 @@ def load_latent_normalization(
     device: torch.device,
 ) -> LatentNormalization:
     stats = _load_json(stats_path)
+    version_raw = stats.get("latent_stats_version")
+    if version_raw is None:
+        raise ValueError(
+            f"{stats_path}: missing latent_stats_version. Regenerate with "
+            "scripts/collect/encode_latents.py --stats-only."
+        )
+    try:
+        version = int(version_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{stats_path}: latent_stats_version must be an integer, got {version_raw!r}."
+        ) from exc
+    if version != 2:
+        raise ValueError(
+            f"{stats_path}: latent_stats_version={version} is not supported. "
+            "Expected version 2."
+        )
+
+    scheme = stats.get("normalization_scheme")
+    if scheme != "component_chw_shared_time":
+        raise ValueError(
+            f"Unsupported latent normalization scheme '{scheme}' in {stats_path}; "
+            "expected 'component_chw_shared_time'."
+        )
+
     mean_v = stats.get("component_mean")
-    std_v = stats.get("component_std_clamped") or stats.get("component_std")
+    std_v = stats.get("component_std_clamped")
     if mean_v is None or std_v is None:
         raise ValueError(
-            f"{stats_path}: missing component_mean/component_std(_clamped). "
-            "Channel-only latent stats are no longer supported; regenerate with "
+            f"{stats_path}: missing component_mean/component_std_clamped. "
+            "Legacy latent stats are no longer supported; regenerate with "
             "scripts/collect/encode_latents.py --stats-only."
         )
 
@@ -273,26 +298,6 @@ def load_latent_normalization(
         raise ValueError(
             f"Latent component stats shape mismatch: expected {expected_shape}, "
             f"got mean={mean_np.shape}, std={std_np.shape}"
-        )
-
-    scheme = str(stats.get("normalization_scheme", ""))
-    if scheme and scheme != "component_chw_shared_time":
-        raise ValueError(
-            f"Unsupported latent normalization scheme '{scheme}' in {stats_path}; "
-            "expected 'component_chw_shared_time'."
-        )
-
-    version_raw = stats.get("latent_stats_version")
-    if version_raw is None:
-        raise ValueError(
-            f"{stats_path}: missing latent_stats_version. Regenerate with "
-            "scripts/collect/encode_latents.py --stats-only."
-        )
-    version = int(version_raw)
-    if version < 2:
-        raise ValueError(
-            f"{stats_path}: latent_stats_version={version} is not supported. "
-            "Regenerate latent stats to version 2."
         )
 
     eps = max(float(stats.get("std_epsilon", 1e-6)), 1e-6)

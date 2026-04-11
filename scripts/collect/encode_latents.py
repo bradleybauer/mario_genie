@@ -64,12 +64,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-frames", type=int, default=64,
                         help="Number of frames to encode at once (temporal batch size).")
+    parser.add_argument("--min-batch-frames", type=int, default=1,
+                        help="Minimum frames per chunk when auto-shrinking after CUDA OOM.")
     parser.add_argument("--onehot-dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--autocast", action="store_true",
                         help="Use torch.autocast for encoding.")
     parser.add_argument("--autocast-dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16"])
+    parser.add_argument("--no-auto-batch-shrink", action="store_true",
+                        help="Disable automatic batch-frames reduction on CUDA OOM.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-encode files that already exist in output-dir.")
     parser.add_argument(
@@ -121,6 +125,7 @@ def load_video_vae(
     global_bottleneck_attn_heads = int(
         model_cfg.get("global_bottleneck_attn_heads", cfg.get("global_bottleneck_attn_heads", 8))
     )
+    onehot_conv = bool(model_cfg.get("onehot_conv", cfg.get("onehot_conv", False)))
     vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors)))
 
     if vae_num_colors != num_colors:
@@ -133,6 +138,7 @@ def load_video_vae(
         base_channels=base_channels,
         latent_channels=latent_channels,
         temporal_downsample=temporal_downsample,
+        onehot_conv=onehot_conv,
         global_bottleneck_attn=global_bottleneck_attn,
         global_bottleneck_attn_heads=global_bottleneck_attn_heads,
     )
@@ -150,6 +156,7 @@ def load_video_vae(
         "temporal_downsample": temporal_downsample,
         "global_bottleneck_attn": global_bottleneck_attn,
         "global_bottleneck_attn_heads": global_bottleneck_attn_heads,
+        "onehot_conv": onehot_conv,
         "num_colors": vae_num_colors,
     }
     return vae, summary
@@ -189,23 +196,76 @@ def encode_file(
     *,
     num_colors: int,
     batch_frames: int,
+    min_batch_frames: int,
     onehot_dtype: torch.dtype,
     device: torch.device,
     autocast_ctx,
+    auto_batch_shrink: bool,
+    use_onehot_conv: bool = False,
+    require_even_batch_frames: bool = False,
 ) -> np.ndarray:
     """Encode all frames from one recording, returning latents as float16 numpy."""
     total_frames = frames_np.shape[0]
     latent_chunks: list[np.ndarray] = []
 
-    for start in range(0, total_frames, batch_frames):
-        end = min(start + batch_frames, total_frames)
-        chunk = torch.from_numpy(frames_np[start:end]).to(device)
-        # VAE expects (B, C, T, H, W) — use batch=1 with T=chunk_len
-        one_hot = frames_to_one_hot(chunk.unsqueeze(0), num_colors, onehot_dtype)
-        with torch.inference_mode(), autocast_ctx:
-            mean, _ = vae.encode(one_hot)
-        # mean shape: (1, latent_ch, T, H', W')
-        latent_chunks.append(mean[0].cpu().to(torch.float16).numpy())
+    if batch_frames < 1:
+        raise ValueError("batch_frames must be >= 1")
+    if min_batch_frames < 1:
+        raise ValueError("min_batch_frames must be >= 1")
+    if require_even_batch_frames and (batch_frames % 2 != 0 or min_batch_frames % 2 != 0):
+        raise ValueError("batch_frames and min_batch_frames must be even when temporal downsampling is enabled")
+
+    effective_batch_frames = max(batch_frames, min_batch_frames)
+    start = 0
+    while start < total_frames:
+        current_batch_frames = min(effective_batch_frames, total_frames - start)
+        if require_even_batch_frames and current_batch_frames > 1 and current_batch_frames % 2 != 0:
+            current_batch_frames -= 1
+        end = min(start + current_batch_frames, total_frames)
+
+        chunk = None
+        one_hot = None
+        mean = None
+
+        try:
+            chunk = torch.from_numpy(frames_np[start:end]).to(device)
+            # VAE expects (B, C, T, H, W) — use batch=1 with T=chunk_len
+            if use_onehot_conv:
+                one_hot = chunk.unsqueeze(0).to(torch.uint8)
+            else:
+                one_hot = frames_to_one_hot(chunk.unsqueeze(0), num_colors, onehot_dtype)
+            with torch.inference_mode(), autocast_ctx:
+                mean, _ = vae.encode(one_hot)
+            # mean shape: (1, latent_ch, T, H', W')
+            latent_chunks.append(mean[0].cpu().to(torch.float16).numpy())
+            start = end
+        except torch.OutOfMemoryError as exc:
+            if device.type != "cuda" or not auto_batch_shrink:
+                raise
+
+            if current_batch_frames <= min_batch_frames:
+                raise RuntimeError(
+                    f"CUDA OOM even at minimum batch-frames ({min_batch_frames}). "
+                    "Try lowering --frame-size, enabling --autocast, or using CPU."
+                ) from exc
+
+            next_batch_frames = max(min_batch_frames, current_batch_frames // 2)
+            if require_even_batch_frames and next_batch_frames % 2 != 0:
+                next_batch_frames -= 1
+            if next_batch_frames >= current_batch_frames:
+                next_batch_frames = current_batch_frames - 1
+                if require_even_batch_frames and next_batch_frames % 2 != 0:
+                    next_batch_frames -= 1
+            next_batch_frames = max(min_batch_frames, next_batch_frames)
+
+            console.print(
+                f"[yellow][oom][/yellow] CUDA OOM at batch-frames={current_batch_frames}; "
+                f"retrying with batch-frames={next_batch_frames}"
+            )
+            effective_batch_frames = next_batch_frames
+            torch.cuda.empty_cache()
+        finally:
+            del chunk, one_hot, mean
 
     # Concatenate along temporal axis (dim 1 in (C, T, H', W'))
     return np.concatenate(latent_chunks, axis=1)
@@ -370,9 +430,6 @@ def main() -> None:
     if autocast_enabled and autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         console.print("[autocast] bfloat16 unsupported; falling back to float16.")
         autocast_dtype = torch.float16
-    if not autocast_enabled and onehot_dtype != torch.float32:
-        console.print("[encode] Non-autocast encoding requires float32 inputs; overriding --onehot-dtype to float32.")
-        onehot_dtype = torch.float32
 
     def make_autocast_ctx():
         if autocast_enabled:
@@ -393,12 +450,29 @@ def main() -> None:
     vae_checkpoint = Path(args.video_vae_checkpoint).resolve()
     vae_config = infer_vae_config_path(args)
     vae, vae_summary = load_video_vae(vae_checkpoint, vae_config, num_colors, device)
+    if vae_summary["onehot_conv"]:
+        if args.onehot_dtype != "float32":
+            console.print("[encode] onehot_conv enabled; --onehot-dtype is ignored.")
+    elif not autocast_enabled and onehot_dtype != torch.float32:
+        console.print("[encode] Non-autocast encoding requires float32 inputs; overriding --onehot-dtype to float32.")
+        onehot_dtype = torch.float32
+
     console.print(
         f"[vae] latent_channels={vae_summary['latent_channels']} "
-        f"temporal_downsample={vae_summary['temporal_downsample']}"
+        f"temporal_downsample={vae_summary['temporal_downsample']} "
+        f"onehot_conv={vae_summary['onehot_conv']}"
     )
     if vae_summary["temporal_downsample"] > 0 and args.batch_frames % 2 != 0:
         raise ValueError("--batch-frames must be even when the VAE uses temporal downsampling")
+    if vae_summary["temporal_downsample"] > 0 and args.min_batch_frames % 2 != 0:
+        raise ValueError("--min-batch-frames must be even when the VAE uses temporal downsampling")
+
+    if device.type == "cuda":
+        console.print(
+            "[encode] CUDA settings: "
+            f"batch_frames={args.batch_frames}, min_batch_frames={args.min_batch_frames}, "
+            f"autocast={autocast_enabled}, auto_batch_shrink={not args.no_auto_batch_shrink}"
+        )
 
     # Copy metadata files
     for meta_name in ["palette.json", "palette_distribution.json", "actions.json", "ram_addresses.json"]:
@@ -492,9 +566,13 @@ def main() -> None:
                     frames,
                     num_colors=num_colors,
                     batch_frames=args.batch_frames,
+                    min_batch_frames=args.min_batch_frames,
                     onehot_dtype=onehot_dtype,
                     device=device,
                     autocast_ctx=make_autocast_ctx(),
+                    auto_batch_shrink=not args.no_auto_batch_shrink,
+                    use_onehot_conv=bool(vae_summary["onehot_conv"]),
+                    require_even_batch_frames=vae_summary["temporal_downsample"] > 0,
                 )
                 latent_actions = downsample_actions(
                     actions,
