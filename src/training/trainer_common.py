@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import shlex
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -80,11 +82,14 @@ def build_trainer_config(
     model: dict[str, Any] | None = None,
     runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    argv = [str(part) for part in sys.argv]
     runtime_payload: dict[str, Any] = {
         "device": str(device),
         "mixed_precision": mixed_precision,
         "num_processes": int(num_processes),
         "timestamp": datetime.now().isoformat(),
+        "argv": argv,
+        "command": " ".join(shlex.quote(part) for part in argv),
     }
     if runtime is not None:
         runtime_payload.update(runtime)

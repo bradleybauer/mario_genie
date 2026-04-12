@@ -223,30 +223,32 @@ def test_mel_discriminator_returns_one_logit_per_sample() -> None:
 # ---------- OneHotConv3d tests ----------
 
 
+@torch.no_grad()
 def test_onehot_conv3d_matches_causal_conv3d() -> None:
     """OneHotConv3d on palette indices must produce the same output as CausalConv3d on one-hot."""
     num_classes, out_channels = 8, 12
-    causal = CausalConv3d(num_classes, out_channels, kernel_size=3)
-    onehot = OneHotConv3d.from_causal_conv3d(causal)
+    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
+    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
 
-    indices = torch.randint(0, num_classes, (2, 4, 32, 32))
-    one_hot = torch.zeros(2, num_classes, 4, 32, 32)
+    indices = torch.randint(0, num_classes, (2, 4, 32, 32), device="cuda")
+    one_hot = torch.zeros(2, num_classes, 4, 32, 32, device="cuda")
     one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
 
     expected = causal(one_hot)
     actual = onehot(indices)
 
     assert actual.shape == expected.shape
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-4)
 
 
+@torch.no_grad()
 def test_onehot_conv3d_uint8_matches_int64() -> None:
     """OneHotConv3d produces identical output for uint8 and int64 indices."""
     num_classes, out_channels = 8, 12
-    causal = CausalConv3d(num_classes, out_channels, kernel_size=3)
-    onehot = OneHotConv3d.from_causal_conv3d(causal)
+    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
+    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
 
-    indices_long = torch.randint(0, num_classes, (2, 4, 32, 32))
+    indices_long = torch.randint(0, num_classes, (2, 4, 32, 32), device="cuda")
     indices_byte = indices_long.byte()
 
     out_long = onehot(indices_long)
@@ -255,39 +257,64 @@ def test_onehot_conv3d_uint8_matches_int64() -> None:
     torch.testing.assert_close(out_byte, out_long, atol=1e-5, rtol=1e-5)
 
 
+@torch.no_grad()
 def test_onehot_conv3d_different_kernel_sizes() -> None:
     """OneHotConv3d matches CausalConv3d for non-cubic kernels too."""
     num_classes, out_channels = 6, 10
     for ks in [(1, 1, 1), (3, 1, 1), (1, 3, 3)]:
-        causal = CausalConv3d(num_classes, out_channels, kernel_size=ks)
-        onehot = OneHotConv3d.from_causal_conv3d(causal)
+        causal = CausalConv3d(num_classes, out_channels, kernel_size=ks).cuda()
+        onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
 
-        indices = torch.randint(0, num_classes, (1, 3, 16, 16))
-        one_hot = torch.zeros(1, num_classes, 3, 16, 16)
+        indices = torch.randint(0, num_classes, (1, 3, 16, 16), device="cuda")
+        one_hot = torch.zeros(1, num_classes, 3, 16, 16, device="cuda")
         one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
 
         expected = causal(one_hot)
         actual = onehot(indices)
 
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-4)
+
+
+def test_onehot_conv3d_backward_matches_causal_conv3d() -> None:
+    """OneHotConv3d weight and bias gradients must match dense CausalConv3d."""
+    num_classes, out_channels = 8, 12
+    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
+    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
+
+    indices = torch.randint(0, num_classes, (2, 4, 16, 16), device="cuda")
+    one_hot = torch.zeros(2, num_classes, 4, 16, 16, device="cuda")
+    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
+
+    dense_out = causal(one_hot)
+    sparse_out = onehot(indices)
+    grad = torch.randn_like(dense_out)
+
+    dense_out.backward(grad)
+    sparse_out.backward(grad)
+
+    torch.testing.assert_close(sparse_out, dense_out, atol=5e-4, rtol=1e-4)
+    torch.testing.assert_close(onehot.weight.grad, causal.conv.weight.grad, atol=5e-4, rtol=1e-4)
+    assert onehot.bias is not None
+    assert causal.conv.bias is not None
+    torch.testing.assert_close(onehot.bias.grad, causal.conv.bias.grad, atol=5e-4, rtol=1e-4)
 
 
 def test_video_vae_4d_indices_match_5d_onehot() -> None:
     """VideoVAE(onehot_conv=True) forward with 4D indices matches 5D one-hot."""
     num_colors = 8
     model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4, onehot_conv=True)
-    model.eval()
+    model.eval().cuda()
 
-    indices = torch.randint(0, num_colors, (2, 4, 32, 32))
-    one_hot = torch.zeros(2, num_colors, 4, 32, 32)
+    indices = torch.randint(0, num_colors, (2, 4, 32, 32), device="cuda")
+    one_hot = torch.zeros(2, num_colors, 4, 32, 32, device="cuda")
     one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
 
     with torch.no_grad():
         out_idx = model(indices, sample_posterior=False)
         out_oh = model(one_hot, sample_posterior=False)
 
-    torch.testing.assert_close(out_idx.logits, out_oh.logits, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(out_idx.posterior_mean, out_oh.posterior_mean, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out_idx.logits, out_oh.logits, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(out_idx.posterior_mean, out_oh.posterior_mean, atol=1e-3, rtol=1e-3)
 
 
 def test_video_vae_loads_old_checkpoint_keys() -> None:

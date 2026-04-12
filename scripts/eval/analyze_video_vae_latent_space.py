@@ -53,6 +53,7 @@ apply_plot_style()
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
 from src.data.video_frames import resize_palette_frames
 from src.models.video_vae import VideoVAE
+from src.training.palette_video_vae_training import frames_to_one_hot
 from src.training.training_utils import load_model_state_dict
 
 
@@ -205,7 +206,15 @@ def collect_latent_stats(
                 else nullcontext()
             )
             with amp_ctx:
-                outputs = model(frames.byte(), sample_posterior=True)
+                use_onehot_conv = tcfg.get("onehot_conv", False)
+                if use_onehot_conv:
+                    model_input = frames.byte()
+                else:
+                    dcfg = config["data"]
+                    onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
+                    oh_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(onehot_dtype_name, torch.float32)
+                    model_input = frames_to_one_hot(frames.long(), dcfg["num_colors"], dtype=oh_dtype)
+                outputs = model(model_input, sample_posterior=True)
                 logits = outputs.logits             # (B, C, T, H, W)
                 mean = outputs.posterior_mean       # (B, Z, T_lat, H_lat, W_lat)
                 logvar = outputs.posterior_logvar

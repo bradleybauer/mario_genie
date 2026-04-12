@@ -7,7 +7,7 @@ the weight heatmaps.
 
 Usage:
     python scripts/eval/view_class_weight_heatmap.py
-    python scripts/eval/view_class_weight_heatmap.py --data-dir data/normalized --soften 0.3
+    python scripts/eval/view_class_weight_heatmap.py --data-dir data/normalized --soften 0.1
     python scripts/eval/view_class_weight_heatmap.py --clip-frames 16 --frame-size 224
 """
 
@@ -99,9 +99,9 @@ def load_class_weights(data_dir: str, *, num_classes: int, soften: float) -> tor
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Visualize class weights as a heatmap on a random clip.")
     p.add_argument("--data-dir", type=str, default="data/normalized")
-    p.add_argument("--clip-frames", type=int, default=16)
+    p.add_argument("--clip-frames", type=int, default=160)
     p.add_argument("--frame-size", type=int, default=224)
-    p.add_argument("--soften", type=float, default=0.3,
+    p.add_argument("--soften", type=float, default=0.1,
                    help="Softening exponent for inverse-frequency weights (0=uniform, 1=full).")
     p.add_argument("--seed", type=int, default=None, help="Random seed (default: random).")
     p.add_argument("--fps", type=int, default=8, help="Playback speed in frames per second.")
@@ -154,10 +154,22 @@ def main() -> None:
     vmin, vmax = weights_np.min(), weights_np.max()
 
     # Pre-compute pooled maps; updated when radius/hardness/ema/boost sliders change.
-    state = {"playing": False, "radius": 0.0, "hardness": 5.0, "ema": 0.0,
-             "change_boost": 0.0,
+    state = {"playing": False, "radius": 3.0, "hardness": 20.0, "ema": 0.9,
+             "change_boost": 0.1,
              "rgb": rgb_frames, "raw": weight_maps, "pal": pal_frames,
              "pooled": weight_maps.copy()}
+
+    # Compute initial pooled state with non-zero defaults.
+    _init_combined = weight_maps.copy()
+    if state["change_boost"] > 0:
+        _ch = np.zeros_like(pal_frames[:1], dtype=np.float32)
+        _ch = np.concatenate([_ch, (pal_frames[1:] != pal_frames[:-1]).astype(np.float32)], axis=0)
+        _init_combined = _init_combined + state["change_boost"] * _ch
+    state["pooled"] = soft_max_pool(
+        _init_combined, state["radius"], state["hardness"],
+        temporal_alpha=state["ema"],
+    )
+    del _init_combined
 
     # Animated side-by-side viewer (RGB | heatmap) – equal-sized panels
     fh, fw = H, W
@@ -176,7 +188,7 @@ def main() -> None:
     style_image_axes(ax_rgb)
     ax_rgb.set_title("RGB", fontsize=10)
 
-    im_hm = ax_hm.imshow(weight_maps[0], interpolation="nearest",
+    im_hm = ax_hm.imshow(state["pooled"][0], interpolation="nearest",
                           cmap="inferno", vmin=vmin, vmax=vmax)
     ax_hm.set_axis_off()
     style_image_axes(ax_hm)
@@ -196,22 +208,22 @@ def main() -> None:
     enable_slider_scroll(slider)
 
     ax_radius = plt.axes([0.25, 0.055, 0.45, 0.03])
-    slider_radius = Slider(ax_radius, "Radius", 0, 20, valinit=0, valstep=0.5, valfmt="%.1f")
+    slider_radius = Slider(ax_radius, "Radius", 0, 20, valinit=3.0, valstep=0.5, valfmt="%.1f")
     style_widget(slider_radius)
     enable_slider_scroll(slider_radius)
 
     ax_hard = plt.axes([0.25, 0.015, 0.45, 0.03])
-    slider_hard = Slider(ax_hard, "Hardness", 0.5, 30, valinit=5.0, valstep=0.5, valfmt="%.1f")
+    slider_hard = Slider(ax_hard, "Hardness", 0.5, 30, valinit=20.0, valstep=0.5, valfmt="%.1f")
     style_widget(slider_hard)
     enable_slider_scroll(slider_hard)
 
     ax_ema = plt.axes([0.75, 0.015, 0.2, 0.03])
-    slider_ema = Slider(ax_ema, "EMA", 0.0, 0.99, valinit=0.0, valstep=0.01, valfmt="%.2f")
+    slider_ema = Slider(ax_ema, "EMA", 0.0, 0.99, valinit=0.9, valstep=0.01, valfmt="%.2f")
     style_widget(slider_ema)
     enable_slider_scroll(slider_ema)
 
     ax_boost = plt.axes([0.75, 0.055, 0.2, 0.03])
-    slider_boost = Slider(ax_boost, "Δ boost", 0.0, 10.0, valinit=0.0, valstep=0.25, valfmt="%.2f")
+    slider_boost = Slider(ax_boost, "Δ boost", 0.0, 10.0, valinit=.1, valstep=0.05, valfmt="%.2f")
     style_widget(slider_boost)
     enable_slider_scroll(slider_boost)
 
@@ -220,18 +232,20 @@ def main() -> None:
     style_widget(btn_pause)
 
     def _recompute():
-        pooled = soft_max_pool(
-            state["raw"], state["radius"], state["hardness"],
-            temporal_alpha=state["ema"],
-        )
-        # Apply temporal-change boost: pixels that differ from previous frame
-        # get weight *= (1 + boost).
+        # Add temporal-change boost to raw class weights, then spatially smooth.
+        # The boost is additive so that any pixel change is upweighted
+        # independently of the class weight magnitude.
+        combined = state["raw"].copy()
         boost = state["change_boost"]
         if boost > 0:
             pal = state["pal"]
             changed = np.zeros_like(pal[:1], dtype=np.float32)  # frame 0: no change
             changed = np.concatenate([changed, (pal[1:] != pal[:-1]).astype(np.float32)], axis=0)
-            pooled = pooled * (1.0 + boost * changed)
+            combined = combined + boost * changed
+        pooled = soft_max_pool(
+            combined, state["radius"], state["hardness"],
+            temporal_alpha=state["ema"],
+        )
         state["pooled"] = pooled
 
     def _update_frame(idx):

@@ -229,9 +229,20 @@ class GlobalBottleneckAttention3D(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         b, c, t, h, w = x.shape
+        spatial = h * w
         tokens = rearrange(x, "b c t h w -> b (t h w) c")
         attn_in = self.norm1(tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        # Causal mask: each token can attend to tokens at the same or earlier
+        # time step.  Tokens are laid out as (t0_hw, t1_hw, …), so the block
+        # index for token i is i // spatial.
+        seq_len = t * spatial
+        idx = torch.arange(seq_len, device=x.device)
+        time_idx = idx // spatial  # (seq_len,)
+        # attn_mask: True means *blocked*.  Block positions where query time < key time.
+        attn_mask = time_idx.unsqueeze(1) < time_idx.unsqueeze(0)  # (seq_len, seq_len)
+        attn_out, _ = self.attn(
+            attn_in, attn_in, attn_in, attn_mask=attn_mask, need_weights=False,
+        )
         tokens = tokens + attn_out
         tokens = tokens + self.mlp(self.norm2(tokens))
         return rearrange(tokens, "b (t h w) c -> b c t h w", t=t, h=h, w=w)

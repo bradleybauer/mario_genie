@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-frames", type=int, default=64,
                         help="Number of frames to encode at once (temporal batch size).")
-    parser.add_argument("--min-batch-frames", type=int, default=1,
+    parser.add_argument("--min-batch-frames", type=int, default=2,
                         help="Minimum frames per chunk when auto-shrinking after CUDA OOM.")
     parser.add_argument("--onehot-dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"])

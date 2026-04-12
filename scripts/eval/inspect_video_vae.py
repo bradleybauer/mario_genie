@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import matplotlib
@@ -51,6 +52,7 @@ from src.training.losses import (
     spatial_weight_map,
     temporal_change_weight,
 )
+from src.training.palette_video_vae_training import frames_to_one_hot
 from src.training.training_utils import load_model_state_dict
 
 
@@ -284,9 +286,20 @@ def _run_inspection(
     clip_frames, clip_info = sampler.sample(rng)
     frames = clip_frames.unsqueeze(0).to(device)  # (1, T, H, W) uint8
 
-    # Forward pass
-    model_input = frames.byte()
-    outputs = model(model_input, sample_posterior=False)
+    # Forward pass — match training: onehot_conv gets byte indices, dense gets scatter one-hot + autocast.
+    dcfg = config["data"]
+    use_onehot_conv = tcfg.get("onehot_conv", False)
+    onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
+    onehot_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(onehot_dtype_name, torch.float32)
+    mixed_precision = tcfg.get("mixed_precision", "no")
+    if use_onehot_conv:
+        model_input = frames.byte()
+    else:
+        model_input = frames_to_one_hot(frames.long(), dcfg["num_colors"], dtype=onehot_dtype)
+    autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mixed_precision)
+    amp_ctx = torch.autocast(device_type=device.type, dtype=autocast_dtype) if autocast_dtype and device.type == "cuda" else nullcontext()
+    with amp_ctx:
+        outputs = model(model_input, sample_posterior=False)
     logits = outputs.logits  # (1, C, T, H, W)
     recon_indices = logits.argmax(dim=1)  # (1, T, H, W)
     recon_logits = logits[:, :, context_frames:] if context_frames > 0 else logits
@@ -294,10 +307,10 @@ def _run_inspection(
 
     T = frames.shape[1]
     frames_cpu = frames[0].cpu()  # (T, H, W)
-    logits_cpu = logits[0].cpu()  # (C, T, H, W)
+    logits_cpu = logits[0].cpu().float()  # (C, T, H, W)
     recon_cpu = recon_indices[0].cpu()  # (T, H, W)
-    latent_mean = outputs.posterior_mean[0].cpu()  # (Z, T_lat, H_lat, W_lat)
-    latent_logvar = outputs.posterior_logvar[0].cpu()
+    latent_mean = outputs.posterior_mean[0].cpu().float()  # (Z, T_lat, H_lat, W_lat)
+    latent_logvar = outputs.posterior_logvar[0].cpu().float()
 
     # RGB arrays
     target_rgb = palette_u8[frames_cpu.numpy()]  # (T, H, W, 3)

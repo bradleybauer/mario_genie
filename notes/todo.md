@@ -29,11 +29,7 @@ The latent space is "smoother" than pixels? interesting.
 
 Pretty neat idea for vq-vae/lfq to overcome approximation error of the straight-through estimator x + (f(x) - x).detach(): https://github.com/cfifty/rotation_trick
 
-
-I've lost my vae checkpoint. Luckily I wanted to retrain anyway since I've had some ideas for how to improve the latent representation. Also I'm going to reimplement to use accelerator and possibly some implementation library for the vae components.
-
 Benchmark xformers or FlashAttention after revisiting the DiT action masking; if I remove the action mask, re-check whether the attention backend can be simplified and sped up.
-
 
 For the sake of computational cost I might have the DiT target a tick rate of 15hz. Meaning the DiT would predict chunks of 4 frames per tick since mario runs at 60hz.
 
@@ -50,8 +46,6 @@ big latent channels but heavily regularization to give the network lots of
 
 patchify on the encoder side? doesn't lose many parameters could boost flops
 
-predict next latent given action?
-
 neat idea is ram encoder with discrete codes
 
 
@@ -64,8 +58,7 @@ like, in every training run all the moving sprites are learned last. even tho th
 build a 'curriculum'?
 
 
-
-
+smooth delta weight, reduce class weight, increase focal loss, use p(correct) map?
 
 
 

@@ -29,9 +29,15 @@ class AcceleratorRuntime:
     is_main_process: bool
 
 
-def create_accelerator_runtime(*, output_dir: Path, mixed_precision: str) -> AcceleratorRuntime:
+def create_accelerator_runtime(
+    *,
+    output_dir: Path,
+    mixed_precision: str,
+    gradient_accumulation_steps: int = 1,
+) -> AcceleratorRuntime:
     accelerator = Accelerator(
         mixed_precision=mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         project_config=ProjectConfiguration(project_dir=str(output_dir)),
     )
     return AcceleratorRuntime(

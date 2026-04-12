@@ -116,6 +116,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fraction of total steps spent at --progressive-start-size before switching to --frame-size.",
     )
     parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before each optimizer step.",
+    )
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=2000, help="Linear warmup from 0 to --lr over this many steps (default: 2000)")
@@ -131,6 +137,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=1000)
     parser.add_argument("--checkpoint-interval", type=int, default=1000)
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=1.0,
+        help="Gradient clipping norm. Set <= 0 to disable clipping.",
+    )
     parser.add_argument("--base-channels", type=int, default=24)
     parser.add_argument("--latent-channels", type=int, default=16)
     parser.add_argument(
@@ -191,7 +203,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Compile the Video VAE with torch.compile.",
     )
-    parser.add_argument("--focal-gamma", type=float, default=1.0,
+    parser.add_argument("--focal-gamma", type=float, default=1.3,
                         help="Focal loss gamma (0 = standard cross-entropy, 2 = typical focal)")
     parser.add_argument(
         "--use-class-weights",
@@ -208,13 +220,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--class-weight-soften",
         type=float,
-        default=0.3,
+        default=0.1,
         help="Softening exponent for inverse-frequency weights (0=uniform, 1=full inverse-frequency).",
     )
     parser.add_argument(
         "--class-weight-radius",
         type=float,
-        default=2.0,
+        default=3.0,
         help="Spatial LogSumExp pooling radius for per-pixel class weights (0=disabled).",
     )
     parser.add_argument(
@@ -226,13 +238,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--class-weight-temporal-ema",
         type=float,
-        default=0.6,
+        default=0.9,
         help="Causal max-decay persistence for spatial weight map (0=disabled, 0.9=strong carry-over).",
     )
     parser.add_argument(
         "--temporal-change-boost",
         type=float,
-        default=1.0,
+        default=.1,
         help="Additive weight boost for pixels that changed from the previous frame (0=disabled).",
     )
     parser.add_argument(
@@ -316,7 +328,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ram-align-weight",
         type=float,
-        default=0.0,
+        default=0,
         help="Weight for RAM alignment loss (0=disabled).",
     )
     parser.add_argument(
@@ -341,6 +353,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--clip-frames must be > 0")
     if args.eval_batch_size is not None and args.eval_batch_size <= 0:
         parser.error("--eval-batch-size must be > 0")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient-accumulation-steps must be >= 1")
+    if args.max_grad_norm < 0:
+        parser.error("--max-grad-norm must be >= 0")
     if not (0.0 <= args.palette_aug_sample_prob <= 1.0):
         parser.error("--palette-aug-sample-prob must be in [0, 1]")
     if not (0.0 <= args.palette_aug_prob <= 1.0):
@@ -631,6 +647,7 @@ def main() -> None:
     runtime = create_accelerator_runtime(
         output_dir=output_dir,
         mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
     accelerator = runtime.accelerator
     device = runtime.device
@@ -882,7 +899,17 @@ def main() -> None:
     if args.temporal_smooth_weight > 0 and is_main_process:
         console.print(f"[aux] Temporal smoothness enabled, weight={args.temporal_smooth_weight}")
 
-    if args.compile:
+    # Compilation strategy:
+    # - Single-GPU: compile here before accelerator.prepare().
+    # - Multi-GPU: skip manual compile; use `accelerate launch --dynamo_backend inductor`
+    #   which applies torch.compile during accelerator.prepare() in the correct DDP order.
+    do_compile = args.compile and accelerator.num_processes == 1
+    if args.compile and accelerator.num_processes > 1 and is_main_process:
+        console.print(
+            "[compile] Multi-GPU: skipping manual torch.compile. "
+            "Use `--dynamo_backend inductor` in the accelerate launch command instead."
+        )
+    if do_compile:
         if is_main_process:
             console.print("[compile] Compiling the model with torch.compile()...")
         model = torch.compile(model)
@@ -1096,11 +1123,14 @@ def main() -> None:
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
         console.print(f"Model parameters: {num_parameters:,}")
-        if accelerator.num_processes > 1:
-            console.print(
-                f"Distributed training enabled with {accelerator.num_processes} processes "
-                f"(global batch={args.batch_size * accelerator.num_processes})."
-            )
+        dist_type = getattr(accelerator.distributed_type, "value", str(accelerator.distributed_type))
+        global_batch = args.batch_size * accelerator.num_processes
+        effective_batch = global_batch * args.gradient_accumulation_steps
+        console.print(
+            f"Distributed runtime: type={dist_type}, processes={accelerator.num_processes}, "
+            f"local_batch={args.batch_size}, global_batch={global_batch}, "
+            f"accum_steps={args.gradient_accumulation_steps}, effective_batch={effective_batch}"
+        )
 
     start_time = time.time()
     throughput_tracker = ThroughputTracker(window_steps=20)
@@ -1145,136 +1175,192 @@ def main() -> None:
                 bytes_per_sample = None
                 accelerator.wait_for_everyone()
 
-            batch = next(train_iter)
-            # Keep palette indices compact on-device for onehot_conv; convert to long only when needed.
-            frames = batch["frames"].to(device, non_blocking=True)
-            input_frames = frames
-            if palette_aug_probs is not None:
-                input_frames = apply_palette_index_augmentation(
-                    frames,
-                    sample_prob=args.palette_aug_sample_prob,
-                    replacement_prob=args.palette_aug_prob,
-                    replacement_probs=palette_aug_probs,
-                )
-            if use_onehot_conv:
-                input_frames = input_frames.byte()
-            else:
-                input_frames = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-                onehot_buffer = input_frames
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
             gan_real_logit_value = 0.0
             gan_fake_logit_value = 0.0
             gan_lecam_reg_value = 0.0
-            if bytes_per_sample is None:
-                _, time_steps, height, width = frames.shape
-                bytes_per_sample = (
-                    num_colors
-                    * time_steps
-                    * height
-                    * width
-                    * torch.tensor([], dtype=onehot_dtype).element_size()
-                )
-
-            optimizer.zero_grad(set_to_none=True)
-            with accelerator.autocast():
-                outputs = model(input_frames)
-            target_frames = frames.long()
-            recon_logits, recon_targets = split_context_targets(outputs.logits, target_frames, args.context_frames)
-
-            # Build per-pixel weight combining spatial pooling + temporal change boost.
-            pixel_weight = None
-            pw_parts: list[torch.Tensor] = []
-            if class_weight is not None and args.class_weight_radius >= 0.5:
-                pw_parts.append(spatial_weight_map(
-                    target_frames, class_weight,
-                    radius=args.class_weight_radius,
-                    hardness=args.class_weight_hardness,
-                    temporal_ema=args.class_weight_temporal_ema,
-                ))
-            if args.temporal_change_boost > 0:
-                pw_parts.append(temporal_change_weight(
-                    target_frames, boost=args.temporal_change_boost,
-                    context_frames=args.context_frames,
-                ))
-            if pw_parts:
-                pixel_weight = pw_parts[0]
-                if class_weight is not None and args.class_weight_radius >= 0.5:
-                    # Spatial map already includes class weights; strip them
-                    # from the per-class vector to avoid double-counting.
-                    pixel_weight = pw_parts[0]
-                    if args.temporal_change_boost > 0:
-                        # spatial map covers full T; strip context to match targets.
-                        spatial_pw = pixel_weight[:, args.context_frames:] if args.context_frames > 0 else pixel_weight
-                        pixel_weight = spatial_pw * pw_parts[1]
-                elif len(pw_parts) == 1:
-                    pixel_weight = pw_parts[0]
-
-            # Upcast to float32 for numerically stable loss computation.
-            # bf16 logvar.exp() can overflow and focal log_softmax loses precision.
-            recon_loss = focal_cross_entropy(
-                recon_logits.float(),
-                recon_targets,
-                gamma=args.focal_gamma,
-                class_weight=class_weight if args.class_weight_radius < 0.5 else None,
-                pixel_weight=pixel_weight,
-            )
-            kl_loss = model.kl_loss(outputs.posterior_mean.float(), outputs.posterior_logvar.float())
-            loss = recon_loss + args.kl_weight * kl_loss
-
-            # --- Auxiliary losses ---
             next_frame_loss_value = 0.0
             temporal_smooth_loss_value = 0.0
             ram_align_loss_value = 0.0
 
-            with accelerator.autocast():
-                if next_frame_predictor is not None:
-                    actions = batch["actions"].to(device, non_blocking=True)
-                    nf_pred, nf_target = next_frame_predictor(outputs.posterior_mean, actions)
-                    next_frame_loss = F.mse_loss(nf_pred, nf_target)
-                    loss = loss + args.next_frame_weight * next_frame_loss
-                    next_frame_loss_value = next_frame_loss.item()
-
-                if args.temporal_smooth_weight > 0:
-                    temporal_loss = temporal_smoothness_loss(outputs.posterior_mean)
-                    loss = loss + args.temporal_smooth_weight * temporal_loss
-                    temporal_smooth_loss_value = temporal_loss.item()
-
-                if ram_align_head is not None and frozen_ram_vae is not None:
-                    ram = batch["ram"].to(device, non_blocking=True)
-                    with torch.no_grad():
-                        ram_mean, _ = frozen_ram_vae.encode(ram)
-                    ram_loss = ram_align_head.loss(outputs.posterior_mean, ram_mean)
-                    loss = loss + args.ram_align_weight * ram_loss
-                    ram_align_loss_value = ram_loss.item()
-
+            # Accumulators for logging (averaged across micro-steps).
+            accum_steps = args.gradient_accumulation_steps
+            accum_loss_sum = 0.0
+            accum_recon_sum = 0.0
+            accum_kl_sum = 0.0
+            accum_nf_sum = 0.0
+            accum_ts_sum = 0.0
+            accum_ram_sum = 0.0
+            accum_gen_adv_sum = 0.0
+            grad_norm = 0.0
             fake_video_detached = None
             discriminator_real_inputs: torch.Tensor | None = None
-            if gan_active and discriminator is not None:
-                discriminator_real_inputs = frames_to_one_hot(
-                    target_frames,
-                    num_colors,
-                    dtype=onehot_dtype,
-                    out=onehot_buffer,
-                )
-                onehot_buffer = discriminator_real_inputs
-            if gan_active and discriminator is not None:
-                set_requires_grad(discriminator, False)
-                with accelerator.autocast():
-                    fake_video = outputs.logits.softmax(dim=1)
-                    gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
-                fake_video_detached = fake_video.detach()
-                gan_gen_loss_value = gen_adv_loss.item()
-                loss = loss + args.gan_weight * gen_adv_loss
-                del fake_video, gen_adv_loss
 
-            accelerator.backward(loss)
-            grad_norm = accelerator.clip_grad_norm_(all_params, max_norm=1.0).item()
-            optimizer.step()
+            for _accum_idx in range(accum_steps):
+                batch = next(train_iter)
+                # Keep palette indices compact on-device for onehot_conv; convert to long only when needed.
+                frames = batch["frames"].to(device, non_blocking=True)
+                input_frames = frames
+                if palette_aug_probs is not None:
+                    input_frames = apply_palette_index_augmentation(
+                        frames,
+                        sample_prob=args.palette_aug_sample_prob,
+                        replacement_prob=args.palette_aug_prob,
+                        replacement_probs=palette_aug_probs,
+                    )
+                if use_onehot_conv:
+                    input_frames = input_frames.byte()
+                else:
+                    input_frames = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+                    onehot_buffer = input_frames
+                if bytes_per_sample is None:
+                    _, time_steps, height, width = frames.shape
+                    bytes_per_sample = (
+                        num_colors
+                        * time_steps
+                        * height
+                        * width
+                        * torch.tensor([], dtype=onehot_dtype).element_size()
+                    )
+
+                with accelerator.accumulate(model):
+                    with accelerator.autocast():
+                        outputs = model(input_frames)
+                    target_frames = frames.long()
+                    recon_logits, recon_targets = split_context_targets(outputs.logits, target_frames, args.context_frames)
+
+                    # Build per-pixel weight combining class weights + temporal change boost,
+                    # then spatially smooth.  Temporal change boost is added independently
+                    # of class weight so that *any* pixel change is upweighted.
+                    pixel_weight = None
+                    if class_weight is not None or args.temporal_change_boost > 0:
+                        # Start with per-pixel class weights (or ones if no class weight).
+                        if class_weight is not None:
+                            raw_cw = class_weight.to(target_frames.device)[target_frames]  # (B, T, H, W)
+                        else:
+                            raw_cw = torch.ones_like(target_frames, dtype=torch.float32)
+
+                        # Add temporal change boost independently.
+                        if args.temporal_change_boost > 0:
+                            tc = temporal_change_weight(
+                                target_frames, boost=args.temporal_change_boost,
+                                context_frames=args.context_frames,
+                            )
+                            # tc is (B, T', H, W) where T' = T - context_frames
+                            if args.context_frames > 0:
+                                raw_cw = raw_cw[:, args.context_frames:]
+                            # tc has base 1 + boost*changed; extract just the delta
+                            # and add it to the class weights.
+                            raw_cw = raw_cw + args.temporal_change_boost * (tc - 1.0)
+
+                        # Spatially smooth the combined map.
+                        if class_weight is not None and args.class_weight_radius >= 0.5:
+                            # Reconstruct full-sequence weight if we trimmed context above,
+                            # since spatial_weight_map expects (B, T, H, W) aligned to targets.
+                            if args.context_frames > 0 and args.temporal_change_boost > 0:
+                                # Pad leading context frames with raw class weights (no boost).
+                                ctx_cw = class_weight.to(target_frames.device)[target_frames[:, :args.context_frames]]
+                                combined = torch.cat([ctx_cw, raw_cw], dim=1)
+                            else:
+                                combined = raw_cw
+                            pixel_weight = spatial_weight_map(
+                                target_frames, class_weight,
+                                radius=args.class_weight_radius,
+                                hardness=args.class_weight_hardness,
+                                temporal_ema=args.class_weight_temporal_ema,
+                                per_pixel_weight=combined,
+                            )
+                            # Strip context prefix for loss alignment.
+                            if args.context_frames > 0:
+                                pixel_weight = pixel_weight[:, args.context_frames:]
+                        else:
+                            pixel_weight = raw_cw
+
+                    # Upcast to float32 for numerically stable loss computation.
+                    recon_loss = focal_cross_entropy(
+                        recon_logits.float(),
+                        recon_targets,
+                        gamma=args.focal_gamma,
+                        class_weight=class_weight if args.class_weight_radius < 0.5 else None,
+                        pixel_weight=pixel_weight,
+                    )
+                    kl_loss = VideoVAE.kl_loss(outputs.posterior_mean.float(), outputs.posterior_logvar.float())
+                    loss = recon_loss + args.kl_weight * kl_loss
+
+                    # --- Auxiliary losses ---
+                    with accelerator.autocast():
+                        if next_frame_predictor is not None:
+                            actions = batch["actions"].to(device, non_blocking=True)
+                            nf_pred, nf_target = next_frame_predictor(outputs.posterior_mean, actions)
+                            next_frame_loss = F.mse_loss(nf_pred, nf_target)
+                            loss = loss + args.next_frame_weight * next_frame_loss
+
+                        if args.temporal_smooth_weight > 0:
+                            temporal_loss = temporal_smoothness_loss(outputs.posterior_mean)
+                            loss = loss + args.temporal_smooth_weight * temporal_loss
+
+                        if ram_align_head is not None and frozen_ram_vae is not None:
+                            ram = batch["ram"].to(device, non_blocking=True)
+                            with torch.no_grad():
+                                ram_mean, _ = frozen_ram_vae.encode(ram)
+                            ram_loss = ram_align_head.loss(outputs.posterior_mean, ram_mean)
+                            loss = loss + args.ram_align_weight * ram_loss
+
+                    # GAN generator adversarial loss.
+                    if gan_active and discriminator is not None:
+                        discriminator_real_inputs = frames_to_one_hot(
+                            target_frames,
+                            num_colors,
+                            dtype=onehot_dtype,
+                            out=onehot_buffer,
+                        )
+                        onehot_buffer = discriminator_real_inputs
+                        set_requires_grad(discriminator, False)
+                        with accelerator.autocast():
+                            fake_video = outputs.logits.softmax(dim=1)
+                            gen_adv_loss = hinge_generator_loss(discriminator(fake_video))
+                        fake_video_detached = fake_video.detach()
+                        loss = loss + args.gan_weight * gen_adv_loss
+                        accum_gen_adv_sum += gen_adv_loss.item()
+                        del fake_video, gen_adv_loss
+
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        if args.max_grad_norm > 0:
+                            grad_norm = accelerator.clip_grad_norm_(all_params, max_norm=args.max_grad_norm).item()
+
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                # Track per-micro-step scalars for logging (outside accumulate context).
+                accum_loss_sum += loss.item()
+                accum_recon_sum += recon_loss.item()
+                accum_kl_sum += kl_loss.item()
+                if next_frame_predictor is not None:
+                    accum_nf_sum += next_frame_loss.item()  # type: ignore[possibly-undefined]
+                if args.temporal_smooth_weight > 0:
+                    accum_ts_sum += temporal_loss.item()  # type: ignore[possibly-undefined]
+                if ram_align_head is not None:
+                    accum_ram_sum += ram_loss.item()  # type: ignore[possibly-undefined]
+
+                del outputs, recon_logits, recon_targets, target_frames
+
+            # --- End of micro-step loop ---
             scheduler.step()
-            del outputs, recon_logits, recon_targets, target_frames
 
+            # Compute averaged loss values for logging.
+            avg_loss = accum_loss_sum / accum_steps
+            avg_recon = accum_recon_sum / accum_steps
+            avg_kl = accum_kl_sum / accum_steps
+            next_frame_loss_value = accum_nf_sum / accum_steps
+            temporal_smooth_loss_value = accum_ts_sum / accum_steps
+            ram_align_loss_value = accum_ram_sum / accum_steps
+            gan_gen_loss_value = accum_gen_adv_sum / accum_steps
+
+            # GAN discriminator step (once per optimizer step, using last micro-batch data).
             if gan_active and discriminator is not None and discriminator_optimizer is not None:
                 set_requires_grad(discriminator, True)
                 discriminator_optimizer.zero_grad(set_to_none=True)
@@ -1287,7 +1373,8 @@ def main() -> None:
                         gan_lecam_reg_value = lecam_reg.item()
                         discr_loss = discr_loss + args.lecam_weight * lecam_reg
                 accelerator.backward(discr_loss)
-                accelerator.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                if args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(discriminator.parameters(), max_norm=args.max_grad_norm)
                 discriminator_optimizer.step()
 
                 if args.use_lecam and lecam_ema is not None:
@@ -1299,14 +1386,14 @@ def main() -> None:
                 del real_scores, fake_scores, discr_loss, fake_video_detached
 
             samples_per_second, steps_per_second = throughput_tracker.update(
-                samples=frames.shape[0] * accelerator.num_processes,
+                samples=args.batch_size * accelerator.num_processes * accum_steps,
             )
 
             if is_main_process:
                 status = (
                     f"res={current_frame_size} "
-                    f"loss={loss.item():.4f} recon={recon_loss.item():.4f} "
-                    f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                    f"loss={avg_loss:.4f} recon={avg_recon:.4f} "
+                    f"kl={avg_kl:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
                     f"gnorm={grad_norm:.2f} "
                     f"samp/s={samples_per_second:.0f} step/s={steps_per_second:.2f}"
                 )
@@ -1343,9 +1430,9 @@ def main() -> None:
                     "type": "train",
                     "step": step,
                     "frame_size": int(current_frame_size),
-                    "loss": loss.item(),
-                    "recon_loss": recon_loss.item(),
-                    "kl_loss": kl_loss.item(),
+                    "loss": avg_loss,
+                    "recon_loss": avg_recon,
+                    "kl_loss": avg_kl,
                     "grad_norm": grad_norm,
                     "lr": float(scheduler.get_last_lr()[0]),
                     "samples_per_sec": round(samples_per_second, 1),
@@ -1379,11 +1466,12 @@ def main() -> None:
                     (step - start_step + 1)
                     * args.batch_size
                     * accelerator.num_processes
+                    * accum_steps
                     / max(elapsed, 1e-6)
                 )
                 log_console.print(
-                    f"step={step:06d} loss={loss.item():.4f} recon={recon_loss.item():.4f} "
-                    f"kl={kl_loss.item():.4f} lr={scheduler.get_last_lr()[0]:.2e} "
+                    f"step={step:06d} loss={avg_loss:.4f} recon={avg_recon:.4f} "
+                    f"kl={avg_kl:.4f} lr={scheduler.get_last_lr()[0]:.2e} "
                     f"gnorm={grad_norm:.2f} ex/s={examples_per_second:.1f}"
                     + (
                         f" g_adv={gan_gen_loss_value:.4f} d={gan_discr_loss_value:.4f} "
@@ -1407,10 +1495,7 @@ def main() -> None:
                 accelerator.wait_for_everyone()
 
             eval_line: str | None = None
-            should_eval = (
-                eval_due
-                and is_main_process
-            )
+            should_eval = eval_due
             if should_eval:
                 if torch.cuda.is_available():
                     gc.collect()
@@ -1433,85 +1518,88 @@ def main() -> None:
                         class_weight_temporal_ema=args.class_weight_temporal_ema,
                         temporal_change_boost=args.temporal_change_boost,
                         accelerator=accelerator,
+                        aggregate_losses=True,
                     )
                 except torch.cuda.OutOfMemoryError:
-                    log_console.print("[eval][OOM] Eval pass OOM; skipping this eval window.")
+                    if is_main_process:
+                        log_console.print("[eval][OOM] Eval pass OOM; skipping this eval window.")
                     if torch.cuda.is_available():
                         gc.collect()
                         torch.cuda.empty_cache()
                 else:
-                    eval_metrics["type"] = "eval"
-                    eval_metrics["step"] = step
-                    eval_metrics["frame_size"] = int(current_frame_size)
-                    eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                    eval_metrics["train_grad_norm"] = grad_norm
-                    metrics.append(eval_metrics)
-                    save_metrics_json(output_dir / "metrics.json", metrics)
+                    if is_main_process:
+                        eval_metrics["type"] = "eval"
+                        eval_metrics["step"] = step
+                        eval_metrics["frame_size"] = int(current_frame_size)
+                        eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                        eval_metrics["train_grad_norm"] = grad_norm
+                        metrics.append(eval_metrics)
+                        save_metrics_json(output_dir / "metrics.json", metrics)
 
-                    eval_line = (
-                        f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
-                        f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
-                    )
-
-                    if preview is not None:
-                        save_video_preview(
-                            preview_path(output_dir, split="eval", step=step),
-                            preview[0],
-                            preview[1],
-                            palette,
-                            max_frames=total_clip_frames,
+                        eval_line = (
+                            f"eval step={step:06d} loss={eval_metrics['loss']:.4f} "
+                            f"recon={eval_metrics['recon_loss']:.4f} kl={eval_metrics['kl_loss']:.4f}"
                         )
 
-                    # Avoid desynchronizing data iteration across processes during distributed training.
-                    if accelerator.num_processes == 1:
-                        with torch.no_grad():
-                            try:
-                                train_batch = next(train_iter)
-                                train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
-                                if use_onehot_conv:
-                                    train_input = train_frames.byte()
-                                else:
-                                    train_input = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
-                                with accelerator.autocast():
-                                    train_outputs = model(train_input, sample_posterior=False)
-                                save_video_preview(
-                                    preview_path(output_dir, split="train", step=step),
-                                    train_frames.detach().cpu(),
-                                    train_outputs.logits.detach().cpu(),
-                                    palette,
-                                    max_frames=total_clip_frames,
-                                )
-                                del train_outputs, train_frames, train_batch
-                            except torch.cuda.OutOfMemoryError:
-                                log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
-                                if torch.cuda.is_available():
-                                    gc.collect()
-                                    torch.cuda.empty_cache()
+                        if preview is not None:
+                            save_video_preview(
+                                preview_path(output_dir, split="eval", step=step),
+                                preview[0],
+                                preview[1],
+                                palette,
+                                max_frames=total_clip_frames,
+                            )
+
+                        # Avoid desynchronizing data iteration across processes during distributed training.
+                        if accelerator.num_processes == 1:
+                            with torch.no_grad():
+                                try:
+                                    train_batch = next(train_iter)
+                                    train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
+                                    if use_onehot_conv:
+                                        train_input = train_frames.byte()
+                                    else:
+                                        train_input = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                                    with accelerator.autocast():
+                                        train_outputs = model(train_input, sample_posterior=False)
+                                    save_video_preview(
+                                        preview_path(output_dir, split="train", step=step),
+                                        train_frames.detach().cpu(),
+                                        train_outputs.logits.detach().cpu(),
+                                        palette,
+                                        max_frames=total_clip_frames,
+                                    )
+                                    del train_outputs, train_frames, train_batch
+                                except torch.cuda.OutOfMemoryError:
+                                    log_console.print("[eval][OOM] Train preview OOM; skipping preview image.")
+                                    if torch.cuda.is_available():
+                                        gc.collect()
+                                        torch.cuda.empty_cache()
+
+                        if eval_metrics["loss"] < best_eval:
+                            best_eval = eval_metrics["loss"]
+                            save_training_state(
+                                output_dir / "best.pt",
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                scheduler_metadata=scheduler_metadata,
+                                step=step,
+                                best_eval=best_eval,
+                                metrics=metrics,
+                                accelerator=accelerator,
+                                discriminator=discriminator,
+                                discriminator_optimizer=discriminator_optimizer,
+                                lecam_ema=lecam_ema,
+                                next_frame_predictor=next_frame_predictor,
+                                ram_align_head=ram_align_head,
+                            )
+                            eval_line += f" | best={best_eval:.6f}"
 
                     del preview
                     if torch.cuda.is_available():
                         gc.collect()
                         torch.cuda.empty_cache()
-
-                    if eval_metrics["loss"] < best_eval:
-                        best_eval = eval_metrics["loss"]
-                        save_training_state(
-                            output_dir / "best.pt",
-                            model=model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scheduler_metadata=scheduler_metadata,
-                            step=step,
-                            best_eval=best_eval,
-                            metrics=metrics,
-                            accelerator=accelerator,
-                            discriminator=discriminator,
-                            discriminator_optimizer=discriminator_optimizer,
-                            lecam_ema=lecam_ema,
-                            next_frame_predictor=next_frame_predictor,
-                            ram_align_head=ram_align_head,
-                        )
-                        eval_line += f" | best={best_eval:.6f}"
 
             if should_checkpoint and is_main_process:
                 if eval_line is not None:

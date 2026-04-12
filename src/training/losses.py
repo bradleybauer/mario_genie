@@ -112,6 +112,7 @@ def spatial_weight_map(
     radius: float,
     hardness: float = 5.0,
     temporal_ema: float = 0.0,
+    per_pixel_weight: Tensor | None = None,
 ) -> Tensor:
     """Spatially pool per-pixel class weights with LogSumExp (soft local max).
 
@@ -124,12 +125,19 @@ def spatial_weight_map(
             At each time step the accumulator is ``max(current, ema * previous)``,
             so high-weight regions persist and decay through subsequent frames
             (e.g. through star-power color cycling).  0 disables.
+        per_pixel_weight: optional ``(B, T, H, W)`` pre-built weight map.
+            When provided, this is used directly instead of looking up from
+            *class_weight* and *targets*.  Smoothing, temporal EMA, etc. are
+            still applied.
 
     Returns:
         Weight tensor of shape ``(B, T, H, W)``.
     """
-    # Look up per-pixel weight from class labels.
-    w = class_weight.to(targets.device)[targets.long()]  # (B, T, H, W)
+    # Look up per-pixel weight from class labels, or use the caller-provided map.
+    if per_pixel_weight is not None:
+        w = per_pixel_weight
+    else:
+        w = class_weight.to(targets.device)[targets.long()]  # (B, T, H, W)
     if radius < 0.5:
         return w
 

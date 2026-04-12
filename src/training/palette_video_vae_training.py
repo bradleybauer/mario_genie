@@ -9,6 +9,7 @@ from accelerate import Accelerator
 from PIL import Image
 from torch.utils.data import DataLoader
 
+from src.models.video_vae import VideoVAE
 from src.training.losses import focal_cross_entropy, spatial_weight_map, temporal_change_weight
 
 
@@ -133,6 +134,7 @@ def evaluate_video_vae(
     class_weight_temporal_ema: float = 0.0,
     temporal_change_boost: float = 0.0,
     accelerator: Accelerator | None = None,
+    aggregate_losses: bool = False,
     autocast_enabled: bool = False,
     autocast_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
@@ -162,24 +164,41 @@ def evaluate_video_vae(
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
 
             pixel_weight = None
-            pw_parts: list[torch.Tensor] = []
-            if class_weight is not None and class_weight_radius >= 0.5:
-                pw_parts.append(spatial_weight_map(
-                    frames, class_weight,
-                    radius=class_weight_radius,
-                    hardness=class_weight_hardness,
-                    temporal_ema=class_weight_temporal_ema,
-                ))
-            if temporal_change_boost > 0:
-                pw_parts.append(temporal_change_weight(
-                    frames, boost=temporal_change_boost,
-                    context_frames=context_frames,
-                ))
-            if pw_parts:
-                pixel_weight = pw_parts[0]
-                if class_weight is not None and class_weight_radius >= 0.5 and temporal_change_boost > 0:
-                    spatial_pw = pixel_weight[:, context_frames:] if context_frames > 0 else pixel_weight
-                    pixel_weight = spatial_pw * pw_parts[1]
+            if class_weight is not None or temporal_change_boost > 0:
+                # Start with per-pixel class weights (or ones).
+                if class_weight is not None:
+                    raw_cw = class_weight.to(frames.device)[frames]  # (B, T, H, W)
+                else:
+                    raw_cw = torch.ones_like(frames, dtype=torch.float32)
+
+                # Add temporal change boost independently of class weight.
+                if temporal_change_boost > 0:
+                    tc = temporal_change_weight(
+                        frames, boost=temporal_change_boost,
+                        context_frames=context_frames,
+                    )
+                    if context_frames > 0:
+                        raw_cw = raw_cw[:, context_frames:]
+                    raw_cw = raw_cw + temporal_change_boost * (tc - 1.0)
+
+                # Spatially smooth the combined map.
+                if class_weight is not None and class_weight_radius >= 0.5:
+                    if context_frames > 0 and temporal_change_boost > 0:
+                        ctx_cw = class_weight.to(frames.device)[frames[:, :context_frames]]
+                        combined = torch.cat([ctx_cw, raw_cw], dim=1)
+                    else:
+                        combined = raw_cw
+                    pixel_weight = spatial_weight_map(
+                        frames, class_weight,
+                        radius=class_weight_radius,
+                        hardness=class_weight_hardness,
+                        temporal_ema=class_weight_temporal_ema,
+                        per_pixel_weight=combined,
+                    )
+                    if context_frames > 0:
+                        pixel_weight = pixel_weight[:, context_frames:]
+                else:
+                    pixel_weight = raw_cw
 
             recon_loss = focal_cross_entropy(
                 recon_logits,
@@ -188,7 +207,7 @@ def evaluate_video_vae(
                 class_weight=class_weight if class_weight_radius < 0.5 else None,
                 pixel_weight=pixel_weight,
             )
-            kl_loss = model.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
+            kl_loss = VideoVAE.kl_loss(outputs.posterior_mean, outputs.posterior_logvar)
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
             if preview is None:
@@ -208,6 +227,16 @@ def evaluate_video_vae(
 
     mean_recon = float(np.mean(recon_losses))
     mean_kl = float(np.mean(kl_losses))
+    if aggregate_losses and accelerator is not None and accelerator.num_processes > 1:
+        local_stats = torch.tensor(
+            [float(np.sum(recon_losses)), float(np.sum(kl_losses)), float(len(recon_losses))],
+            device=device,
+            dtype=torch.float64,
+        )
+        reduced_stats = accelerator.reduce(local_stats, reduction="sum")
+        denom = max(float(reduced_stats[2].item()), 1.0)
+        mean_recon = float(reduced_stats[0].item() / denom)
+        mean_kl = float(reduced_stats[1].item() / denom)
     return {
         "recon_loss": mean_recon,
         "kl_loss": mean_kl,

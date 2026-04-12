@@ -127,11 +127,14 @@ def _discover_metrics(
     return numeric
 
 
-def _smooth(vals: list[float], window: int) -> list[float]:
-    out = []
-    for i in range(len(vals)):
-        start = max(0, i - window + 1)
-        out.append(sum(vals[start:i + 1]) / (i - start + 1))
+def _smooth(vals: list[float], window: int, passes: int = 1) -> list[float]:
+    out = vals
+    for _ in range(max(1, passes)):
+        smoothed = []
+        for i in range(len(out)):
+            start = max(0, i - window + 1)
+            smoothed.append(sum(out[start:i + 1]) / (i - start + 1))
+        out = smoothed
     return out
 
 
@@ -140,6 +143,7 @@ def plot_metrics(
     config: dict,
     metric_names: list[str] | None = None,
     smooth: int = 10,
+    smooth_passes: int = 1,
     show_hw: bool = False,
     show_eval: bool = False,
     show_lr: bool = False,
@@ -175,7 +179,13 @@ def plot_metrics(
         if train_steps:
             ax.plot(train_steps, train_vals, alpha=0.3, color=run_color, linewidth=0.8, label="train")
             if smooth > 1 and len(train_vals) >= smooth:
-                ax.plot(train_steps, _smooth(train_vals, smooth), color=run_color, linewidth=1.5, label=f"train (smooth={smooth})")
+                ax.plot(
+                    train_steps,
+                    _smooth(train_vals, smooth, smooth_passes),
+                    color=run_color,
+                    linewidth=1.5,
+                    label=f"train (smooth={smooth}, passes={smooth_passes})",
+                )
 
         eval_steps = [m["step"] for m in evals if name in m]
         eval_vals = [m[name] for m in evals if name in m]
@@ -201,6 +211,7 @@ def plot_compare(
     runs: list[tuple[str, list[dict], dict]],
     metric_names: list[str] | None = None,
     smooth: int = 10,
+    smooth_passes: int = 1,
     show_hw: bool = False,
     show_eval: bool = False,
     show_lr: bool = False,
@@ -238,7 +249,13 @@ def plot_compare(
             if train_steps:
                 ax.plot(train_steps, train_vals, alpha=0.15, color=color, linewidth=0.6)
                 if smooth > 1 and len(train_vals) >= smooth:
-                    ax.plot(train_steps, _smooth(train_vals, smooth), color=color, linewidth=1.5, label=label)
+                    ax.plot(
+                        train_steps,
+                        _smooth(train_vals, smooth, smooth_passes),
+                        color=color,
+                        linewidth=1.5,
+                        label=label,
+                    )
                 else:
                     ax.plot(train_steps, train_vals, color=color, linewidth=1.5, label=label)
 
@@ -267,10 +284,14 @@ def main():
     parser.add_argument("checkpoints", nargs="+", help="Checkpoint directories or run names (pass multiple to compare)")
     parser.add_argument("--metrics", nargs="+", help="Specific metrics to plot (default: all numeric metrics)")
     parser.add_argument("--smooth", type=int, default=10, help="Smoothing window size (default: 10)")
+    parser.add_argument("--smooth-passes", type=int, default=2, help="How many times to apply smoothing (default: 2)")
     parser.add_argument("--hw", action="store_true", help="Include hardware perf metrics (gpu_mem_pct, samples/steps per sec)")
     parser.add_argument("--eval", action="store_true", help="Include eval metrics")
     parser.add_argument("--show-lr", action="store_true", help="Include learning-rate metrics in auto-discovery")
     args = parser.parse_args()
+
+    if args.smooth_passes < 1:
+        parser.error("--smooth-passes must be >= 1")
 
     if len(args.checkpoints) == 1:
         loaded = load_metrics(args.checkpoints[0], strict=True)
@@ -283,6 +304,7 @@ def main():
             config,
             metric_names=args.metrics,
             smooth=args.smooth,
+            smooth_passes=args.smooth_passes,
             show_hw=args.hw,
             show_eval=getattr(args, "eval"),
             show_lr=args.show_lr,
@@ -305,6 +327,7 @@ def main():
             runs,
             metric_names=args.metrics,
             smooth=args.smooth,
+            smooth_passes=args.smooth_passes,
             show_hw=args.hw,
             show_eval=getattr(args, "eval"),
             show_lr=args.show_lr,

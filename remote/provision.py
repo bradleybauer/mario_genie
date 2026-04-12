@@ -7,6 +7,7 @@ Usage:
     python remote/provision.py up --sort dlperf    # sort by DL perf
     python remote/provision.py up --sort dlperf_per_dollar  # sort by DL perf per dollar
     python remote/provision.py up --gpu RTX_5090   # filter by GPU type
+    python remote/provision.py up --min-vram-gb 48 # require at least 48 GB VRAM
     python remote/provision.py up --num-gpus 2     # require 2 GPUs per instance
     python remote/provision.py up --num-gpus any   # allow any GPU count
     python remote/provision.py ls                  # show running instances
@@ -99,7 +100,14 @@ def _parse_num_gpus(value: str) -> int | None:
     return num_gpus
 
 
-def _search(api_key: str, disk: int, sort: str, gpu: str | None = None, num_gpus: int | None = 1) -> list[dict]:
+def _search(
+    api_key: str,
+    disk: int,
+    sort: str,
+    gpu: str | None = None,
+    num_gpus: int | None = 1,
+    min_vram_gb: int = 39,
+) -> list[dict]:
     body = {
         "limit": 10000,
         "type": "on-demand",
@@ -107,6 +115,7 @@ def _search(api_key: str, disk: int, sort: str, gpu: str | None = None, num_gpus
         "allocated_storage": disk,
         **FILTERS,
     }
+    body["gpu_ram"] = {"gte": min_vram_gb * 1000}
     if num_gpus is None:
         body.pop("num_gpus", None)
     else:
@@ -166,6 +175,8 @@ def _print_table(headers: tuple, rows: list[tuple]) -> None:
 def cmd_up(api_key: str, args: argparse.Namespace) -> None:
     if args.disk <= 0:
         sys.exit("Disk size must be a positive integer number of GB.")
+    if args.min_vram_gb <= 0:
+        sys.exit("Minimum VRAM must be a positive integer number of GB.")
     num_gpus = getattr(args, "num_gpus", FILTERS["num_gpus"]["eq"])
     if num_gpus is not None and num_gpus <= 0:
         sys.exit("GPU count must be a positive integer.")
@@ -173,12 +184,12 @@ def cmd_up(api_key: str, args: argparse.Namespace) -> None:
     gpu_msg = f", gpu: {args.gpu}" if args.gpu else ""
     cores = FILTERS.get("cpu_cores", {}).get("gte", "?")
     ram_gb = int(FILTERS.get("cpu_ram", {}).get("gte", 0) / 1000)
-    vram_gb = int(FILTERS.get("gpu_ram", {}).get("gt", FILTERS.get("gpu_ram", {}).get("gte", 0)) / 1000)
+    vram_gb = args.min_vram_gb
     inet = FILTERS.get("inet_down", {}).get("gte", "?")
     gpu_count_msg = "any GPU count" if num_gpus is None else f"{num_gpus} GPU(s)"
     print(f"Searching for offers (sort: {args.sort}{gpu_msg}) ...")
-    print(f"  Filters: {gpu_count_msg}, ≥{cores} cores, ≥{ram_gb} GB RAM, >{vram_gb} GB VRAM, ≥{inet} Mbps")
-    offers = _search(api_key, args.disk, args.sort, gpu=args.gpu, num_gpus=num_gpus)
+    print(f"  Filters: {gpu_count_msg}, ≥{cores} cores, ≥{ram_gb} GB RAM, ≥{vram_gb} GB VRAM, ≥{inet} Mbps")
+    offers = _search(api_key, args.disk, args.sort, gpu=args.gpu, num_gpus=num_gpus, min_vram_gb=args.min_vram_gb)
     if not offers:
         sys.exit("No matching offers found.")
 
@@ -514,6 +525,7 @@ examples:
   provision.py up                       Search & provision instances
     provision.py up --disk-gb 200         Request a 200 GB root disk
   provision.py up --gpu RTX_5090        Only show RTX 5090 offers
+    provision.py up --min-vram-gb 48      Only show offers with at least 48 GB VRAM
         provision.py up --num-gpus 2          Only show 2-GPU offers
         provision.py up --num-gpus any        Allow any GPU count
   provision.py up --sort dlperf         Sort by DL performance
@@ -551,6 +563,7 @@ sort keys (comma-separated):
     up.add_argument("--sort", default="dlperf_per_dollar",
                     help="Sort keys, comma-separated: price,dlperf,value,dlperf_per_dollar,dolar,vram,bw (default: dlperf_per_dollar)")
     up.add_argument("--gpu", default=None, help="Filter by GPU type, e.g. RTX_5090, RTX_4090")
+    up.add_argument("--min-vram-gb", type=int, default=39, metavar="GB", help="Minimum GPU VRAM in GB (default: 39)")
     up.add_argument("--num-gpus", type=_parse_num_gpus, default=FILTERS["num_gpus"]["eq"], help="Require this many GPUs per instance, or 'any' to disable the filter (default: 1)")
 
     sub.add_parser("ls", help="List instances",
