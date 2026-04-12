@@ -44,7 +44,7 @@ if project_root_str not in sys.path:
 from src.data.gamepad import GamepadState
 
 # --- Configuration ---
-ROM_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'nes')
+ROM_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'roms')
 DEFAULT_SCALE = 3
 FPS = 60
 # Mappers supported by nes_py's LaiNES core

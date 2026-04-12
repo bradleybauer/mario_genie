@@ -3,8 +3,8 @@
 
 - Accelerator replaces manual torch.autocast / GradScaler boilerplate.
     Pass --mixed-precision bf16 (default), fp16, or no.
-- Safetensors (.safetensors) for model-only checkpoints; accelerator.save_state()
-    for full training-state (optimizer + scheduler) checkpoints.
+- Single .pt checkpoint files (best.pt / latest.pt) containing model,
+    optimizer, scheduler, and metadata — matching the video VAE convention.
 - Optional shifted logit-normal timestep sampler (--timestep-sampler logit_normal)
     concentrates training on mid-range noise levels, which improves sample quality.
 """
@@ -31,7 +31,6 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from PIL import Image
 from rich.console import Console
-from safetensors.torch import load_file as safetensors_load, save_file as safetensors_save
 from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -64,7 +63,9 @@ from src.training.training_utils import (
     build_progress,
     build_replacement_train_loader,
     create_accelerator_runtime,
+    get_model_state_dict,
     infinite_batches,
+    load_model_state_dict,
     save_json,
     save_metrics_json,
     split_train_eval_dataset,
@@ -481,39 +482,28 @@ class ResidualErrorBuffer:
 # Checkpoint save / load (safetensors + JSON config)
 # ---------------------------------------------------------------------------
 
-def save_model_checkpoint(
+def save_training_state(
     path: Path,
     *,
     model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: LambdaLR,
     model_config: dict,
     step: int,
     best_eval: float,
     metrics: list,
+    accelerator: Accelerator | None = None,
 ) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    raw = unwrap_model(model)
-    safetensors_save(raw.state_dict(), path / "model.safetensors")
-
-    # Persist a native Diffusers bundle when using a ModelMixin backend.
-    if hasattr(raw, "save_pretrained"):
-        try:
-            raw.save_pretrained(path / "diffusers", safe_serialization=True)
-        except TypeError:
-            raw.save_pretrained(path / "diffusers")
-
-    meta = {
+    state = {
+        "model": get_model_state_dict(model, accelerator=accelerator),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
         "model_config": model_config,
         "step": step,
         "best_eval": best_eval,
+        "metrics": metrics,
     }
-    with (path / "meta.json").open("w") as fh:
-        json.dump(meta, fh, indent=2)
-    save_metrics_json(path / "metrics.json", metrics)
-
-
-def load_model_weights(model: torch.nn.Module, path: Path) -> None:
-    raw = unwrap_model(model)
-    raw.load_state_dict(safetensors_load(path / "model.safetensors"))
+    torch.save(state, path)
 
 
 # ---------------------------------------------------------------------------
@@ -565,15 +555,15 @@ def autoregressive_rollout(
     *seed_latents* provides the initial ``context_latents`` of real data.
     At each step, the last ``context_latents`` generated latents become the
     new history and ``future_latents`` are predicted via ODE integration.
-    *all_actions* must cover ``total_latents``; pad with the default action
-    for latents beyond the dataset clip.
+    *all_actions* must cover ``total_latents``.
     """
     generated = seed_latents  # (B, C, context_latents, H, W)
     while generated.shape[2] < total_latents:
-        step_future = min(future_latents, total_latents - generated.shape[2])
+        generated_latent_count = generated.shape[2]
+        step_future = min(future_latents, total_latents - generated_latent_count)
         history = generated[:, :, -context_latents:]
-        abs_start = generated.shape[2] - context_latents
-        abs_end = generated.shape[2] + step_future
+        abs_start = generated_latent_count - context_latents
+        abs_end = generated_latent_count + step_future
         step_actions = all_actions[:, abs_start:abs_end]
         pred = denoise_future_segment(
             model,
@@ -958,29 +948,17 @@ def main() -> None:
 
     if args.resume_from is not None:
         resume_path = Path(args.resume_from)
-        loaded_full_state = False
-        loaded_model_weights = False
-        if (resume_path / "training_state").is_dir():
-            accelerator.load_state(str(resume_path / "training_state"))
-            loaded_full_state = True
-        elif (resume_path / "model.safetensors").is_file():
-            load_model_weights(model, resume_path)
-            loaded_model_weights = True
-        meta_path = resume_path / "meta.json"
-        if meta_path.is_file():
-            meta = _load_json(meta_path)
-            start_step = int(meta.get("step", 0)) + 1
-            best_eval = float(meta.get("best_eval", float("inf")))
-        metrics_path = resume_path / "metrics.json"
-        if metrics_path.is_file():
-            metrics = _load_json(metrics_path)
+        with accelerator.main_process_first():
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        load_model_state_dict(model, checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        lr_scheduler.load_state_dict(checkpoint["scheduler"])
+        start_step = int(checkpoint.get("step", 0)) + 1
+        best_eval = float(checkpoint.get("best_eval", float("inf")))
+        metrics = checkpoint.get("metrics", [])
         if accelerator.is_main_process:
-            if loaded_full_state:
-                console.print(f"[resume] Loaded full training_state; resuming from step {start_step}")
-            elif loaded_model_weights:
-                console.print(f"[resume] Loaded model-only checkpoint; resuming from step {start_step}")
-            else:
-                console.print(f"[resume] Found metadata only; resuming from step {start_step}")
+            console.print(f"[resume] Loaded checkpoint from {resume_path}; resuming from step {start_step}")
+        del checkpoint
 
         if args.max_steps > 0 and start_step >= args.max_steps:
             if accelerator.is_main_process:
@@ -1071,12 +1049,15 @@ def main() -> None:
 
     train_iter = infinite_batches(train_loader)
 
-    # Cache a single preview batch so we don't desync the training
-    # iterator when running multi-GPU.
-    _preview_batch = next(train_iter) if (video_vae is not None and palette is not None) else None
-    if accelerator.is_main_process and _preview_batch is None:
+    # Identify episodes long enough for a full rollout preview.
+    _preview_length = args.context_latents + args.preview_rollout_latents
+    _preview_eligible = [
+        (fi, lc) for fi, lc in enumerate(dataset.latent_counts)
+        if lc >= _preview_length
+    ] if (video_vae is not None and palette is not None) else []
+    if not _preview_eligible and accelerator.is_main_process:
         console.print(
-            "[preview] Preview batch unavailable because preview prerequisites were not met",
+            f"[preview] No episode has {_preview_length} latents; rollout previews disabled",
             markup=False,
         )
 
@@ -1322,13 +1303,16 @@ def main() -> None:
                 is_new_best = eval_metrics["flow_loss"] < best_eval
                 if is_new_best:
                     best_eval = eval_metrics["flow_loss"]
-                    save_model_checkpoint(
-                        output_dir / "best",
+                    save_training_state(
+                        output_dir / "best.pt",
                         model=model,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
                         model_config=model_config,
                         step=step,
                         best_eval=best_eval,
                         metrics=metrics,
+                        accelerator=accelerator,
                     )
                     eval_line += f" | best={best_eval:.6f}"
 
@@ -1341,21 +1325,19 @@ def main() -> None:
             # Periodic checkpoint
             # ------------------------------------------------------------------
             if should_checkpoint and accelerator.is_main_process:
-                latest_dir = output_dir / "latest"
-                save_model_checkpoint(
-                    latest_dir,
+                save_training_state(
+                    output_dir / "latest.pt",
                     model=model,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
                     model_config=model_config,
                     step=step,
                     best_eval=best_eval,
                     metrics=metrics,
+                    accelerator=accelerator,
                 )
                 if eval_line is not None:
                     eval_line += " | saved latest"
-
-            # save_state is collective — all ranks call it together.
-            if should_checkpoint:
-                accelerator.save_state(str(output_dir / "latest" / "training_state"))
 
             if eval_line is not None and accelerator.is_main_process:
                 log_console.print(eval_line)
@@ -1363,89 +1345,74 @@ def main() -> None:
             # ------------------------------------------------------------------
             # Autoregressive rollout preview
             # ------------------------------------------------------------------
-            if preview_due and accelerator.is_main_process:
+            if preview_due and accelerator.is_main_process and _preview_eligible:
                 with torch.no_grad():
                     try:
-                        if video_vae is not None and palette is not None and _preview_batch is not None:
-                            t0_preview = time.perf_counter()
-                            prev_latents, prev_actions = prepare_batch(
-                                _preview_batch,
-                                device=device,
-                                default_action_index=default_action_index,
-                                latent_normalization=latent_normalization,
-                            )
-                            idx = random.randrange(prev_latents.shape[0])
-                            prev_latents = prev_latents[idx : idx + 1]
-                            prev_actions = prev_actions[idx : idx + 1]
+                        t0_preview = time.perf_counter()
+                        ctx = args.context_latents
+                        future_per_step = args.clip_latents - ctx
+                        n_pred = args.preview_rollout_latents
 
-                            ctx = min(args.context_latents, prev_latents.shape[2])
-                            future_per_step = max(int(args.clip_latents) - ctx, 1)
-                            rollout_total = ctx + max(args.preview_rollout_latents, future_per_step)
+                        # Sample a fresh clip of exactly the right length.
+                        fi, lc = random.choice(_preview_eligible)
+                        start = random.randint(0, lc - _preview_length)
+                        clip = dataset.get_clip(fi, start, _preview_length)
+                        prev_latents, prev_actions = prepare_batch(
+                            {"latents": clip["latents"].unsqueeze(0),
+                             "actions": clip["actions"].unsqueeze(0)},
+                            device=device,
+                            default_action_index=default_action_index,
+                            latent_normalization=latent_normalization,
+                        )
 
-                            # Pad actions to cover the full rollout
-                            clip_actions = prev_actions.shape[1]
-                            if clip_actions < rollout_total:
-                                pad = torch.full(
-                                    (1, rollout_total - clip_actions),
-                                    default_action_index,
-                                    device=prev_actions.device,
-                                    dtype=prev_actions.dtype,
-                                )
-                                prev_actions = torch.cat([prev_actions, pad], dim=1)
+                        seed = prev_latents[:, :, :ctx]
 
-                            seed = prev_latents[:, :, :ctx]
+                        t0_denoise = time.perf_counter()
+                        rollout_latents = autoregressive_rollout(
+                            model,
+                            seed_latents=seed,
+                            all_actions=prev_actions,
+                            context_latents=ctx,
+                            future_latents=future_per_step,
+                            total_latents=_preview_length,
+                            ode_steps=args.preview_ode_steps,
+                            accelerator=accelerator,
+                        )
+                        torch.cuda.synchronize()
+                        t_denoise = time.perf_counter() - t0_denoise
 
-                            t0_denoise = time.perf_counter()
-                            rollout_latents = autoregressive_rollout(
-                                model,
-                                seed_latents=seed,
-                                all_actions=prev_actions[:, :rollout_total],
-                                context_latents=ctx,
-                                future_latents=future_per_step,
-                                total_latents=rollout_total,
-                                ode_steps=args.preview_ode_steps,
-                                accelerator=accelerator,
-                            )
-                            torch.cuda.synchronize()
-                            t_denoise = time.perf_counter() - t0_denoise
+                        def maybe_denorm(x):
+                            return latent_normalization.denormalize(x) if latent_normalization else x
 
-                            gt_full = prev_latents[:, :, : min(rollout_total, prev_latents.shape[2])]
+                        t0_decode = time.perf_counter()
+                        sampled_frames = latents_to_frame_indices(
+                            video_vae, maybe_denorm(rollout_latents), accelerator=accelerator
+                        )
+                        gt_frames = latents_to_frame_indices(
+                            video_vae, maybe_denorm(prev_latents), accelerator=accelerator
+                        )
+                        torch.cuda.synchronize()
+                        t_decode = time.perf_counter() - t0_decode
 
-                            def maybe_denorm(x):
-                                return latent_normalization.denormalize(x) if latent_normalization else x
+                        t0_save = time.perf_counter()
+                        out_path = preview_path(output_dir, split="rollout", step=step)
+                        save_rollout_preview(
+                            out_path,
+                            frames_gt=gt_frames[0, ctx:],
+                            frames_pred=sampled_frames[0, ctx:],
+                            palette=palette,
+                        )
+                        t_save = time.perf_counter() - t0_save
 
-                            t0_decode = time.perf_counter()
-                            sampled_frames = latents_to_frame_indices(
-                                video_vae, maybe_denorm(rollout_latents), accelerator=accelerator
-                            )
-                            gt_frames = latents_to_frame_indices(
-                                video_vae, maybe_denorm(gt_full), accelerator=accelerator
-                            )
-                            torch.cuda.synchronize()
-                            t_decode = time.perf_counter() - t0_decode
-
-                            t0_save = time.perf_counter()
-                            out_path = preview_path(output_dir, split="rollout", step=step)
-                            n_pred = rollout_total - ctx
-                            pred_frames = sampled_frames[0, ctx:rollout_total]
-                            gt_pred = gt_frames[0, ctx:min(gt_frames.shape[1], rollout_total)]
-                            save_rollout_preview(
-                                out_path,
-                                frames_gt=gt_pred,
-                                frames_pred=pred_frames,
-                                palette=palette,
-                            )
-                            t_save = time.perf_counter() - t0_save
-
-                            t_preview = time.perf_counter() - t0_preview
-                            log_console.print(
-                                f"[rollout] {t_preview:.1f}s total "
-                                f"(latents={rollout_total} ctx={ctx} pred={n_pred} "
-                                f"denoise={t_denoise:.1f}s "
-                                f"decode={t_decode:.1f}s save={t_save:.1f}s) -> {out_path}",
-                                markup=False,
-                            )
-                            del rollout_latents, sampled_frames, gt_frames, gt_full, pred_frames, gt_pred
+                        t_preview = time.perf_counter() - t0_preview
+                        log_console.print(
+                            f"[rollout] {t_preview:.1f}s total "
+                            f"(latents={_preview_length} ctx={ctx} pred={n_pred} "
+                            f"denoise={t_denoise:.1f}s "
+                            f"decode={t_decode:.1f}s save={t_save:.1f}s) -> {out_path}",
+                            markup=False,
+                        )
+                        del rollout_latents, sampled_frames, gt_frames, prev_latents, prev_actions
                     except torch.cuda.OutOfMemoryError:
                         log_console.print("[rollout] Skipped due to CUDA OOM", markup=False)
                         gc.collect()
