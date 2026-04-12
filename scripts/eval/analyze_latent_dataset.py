@@ -223,13 +223,6 @@ def update_action_delta_stats(
     )
 
 
-def summarize_top_indices(values: np.ndarray, top_k: int, *, reverse: bool = True) -> list[int]:
-    order = np.argsort(values)
-    if reverse:
-        order = order[::-1]
-    return [int(idx) for idx in order[: min(top_k, len(order))]]
-
-
 def build_action_row(index: int, stats: dict[str, Any], action_values: list[int] | None) -> dict[str, Any]:
     frame_count = int(stats["frame_count"][index])
     delta_count = int(stats["delta_count"][index])

@@ -51,8 +51,8 @@ def visible_frames(frames, include_context=False, predicted_frames=DEFAULT_PREDI
     return frames[-predicted_frames:]
 
 
-def load_frames(path):
-    """Split a vertically-stacked grid PNG into individual frames."""
+def _load_stacked_frames(path):
+    """Split a vertically-stacked PNG into individual frames."""
     img = Image.open(path)
     w, h = img.size
     target = w // 2
@@ -61,7 +61,7 @@ def load_frames(path):
     if h % target == 0:
         frame_h = target
     else:
-        # Find the divisor of h closest to the target frame height
+        # Find the divisor of h closest to the target frame height.
         divisors = set()
         for i in range(1, int(h**0.5) + 1):
             if h % i == 0:
@@ -70,8 +70,28 @@ def load_frames(path):
         frame_h = min(divisors, key=lambda d: abs(d - target))
     n_frames = h // frame_h
     arr = np.array(img)
-    frames = [arr[i * frame_h:(i + 1) * frame_h] for i in range(n_frames)]
-    return frames
+    return [arr[i * frame_h:(i + 1) * frame_h] for i in range(n_frames)]
+
+
+def _load_rollout_frames(path):
+    """Decode rollout preview into per-timestep side-by-side frames (GT left, prediction right)."""
+    return _load_stacked_frames(path)
+
+
+def load_frames(path, *, frame_format="auto"):
+    """Load frames from either stacked previews or rollout preview grids."""
+    base = os.path.basename(path).lower()
+    if frame_format == "rollout" or (frame_format == "auto" and base.startswith("rollout_step_")):
+        return _load_rollout_frames(path)
+    return _load_stacked_frames(path)
+
+
+def _should_keep_full_frames(path, frame_format):
+    if frame_format == "rollout":
+        return True
+    if frame_format == "auto":
+        return os.path.basename(path).lower().startswith("rollout_step_")
+    return False
 
 
 def collect_images(path):
@@ -100,12 +120,35 @@ def find_subfolders_with_pngs(root):
     return subs
 
 
-def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
+def show_viewer(
+    folder_path,
+    fps,
+    scale,
+    include_context=False,
+    predicted_frames=DEFAULT_PREDICTED_FRAMES,
+    frame_format="auto",
+):
     """Show the reconstruction viewer for a single folder (no sidebar)."""
     image_paths = collect_images(folder_path)
     loaded = [
-        (p, visible_frames(load_frames(p), include_context=include_context, predicted_frames=predicted_frames))
+        (
+            p,
+            load_frames(p, frame_format=frame_format),
+        )
         for p in image_paths
+    ]
+    loaded = [
+        (
+            p,
+            frames
+            if _should_keep_full_frames(p, frame_format)
+            else visible_frames(
+                frames,
+                include_context=include_context,
+                predicted_frames=predicted_frames,
+            ),
+        )
+        for p, frames in loaded
     ]
     loaded = [(p, f) for p, f in loaded if f]
     if not loaded:
@@ -244,22 +287,41 @@ def show_viewer(folder_path, fps, scale, include_context=False, predicted_frames
 
 class _LazyRun:
     """Stores paths eagerly, loads/validates frames per-image on demand."""
-    __slots__ = ("paths", "include_context", "predicted_frames", "_frames")
+    __slots__ = (
+        "paths",
+        "include_context",
+        "predicted_frames",
+        "frame_format",
+        "_frames",
+    )
 
-    def __init__(self, paths, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
+    def __init__(
+        self,
+        paths,
+        include_context=False,
+        predicted_frames=DEFAULT_PREDICTED_FRAMES,
+        frame_format="auto",
+    ):
         self.paths = paths
         self.include_context = include_context
         self.predicted_frames = predicted_frames
+        self.frame_format = frame_format
         self._frames = [None] * len(paths)
 
     def _ensure_loaded(self, idx):
         if self._frames[idx] is None:
-            frames = load_frames(self.paths[idx]) or []
-            self._frames[idx] = visible_frames(
-                frames,
-                include_context=self.include_context,
-                predicted_frames=self.predicted_frames,
-            )
+            frames = load_frames(
+                self.paths[idx],
+                frame_format=self.frame_format,
+            ) or []
+            if _should_keep_full_frames(self.paths[idx], self.frame_format):
+                self._frames[idx] = frames
+            else:
+                self._frames[idx] = visible_frames(
+                    frames,
+                    include_context=self.include_context,
+                    predicted_frames=self.predicted_frames,
+                )
 
     def frames(self, idx):
         self._ensure_loaded(idx)
@@ -274,7 +336,13 @@ class _LazyRun:
         return None
 
 
-def _discover_run(root, name, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
+def _discover_run(
+    root,
+    name,
+    include_context=False,
+    predicted_frames=DEFAULT_PREDICTED_FRAMES,
+    frame_format="auto",
+):
     """Return a _LazyRun for a subfolder, or None if no valid PNGs."""
     folder = os.path.join(root, name)
     try:
@@ -283,10 +351,23 @@ def _discover_run(root, name, include_context=False, predicted_frames=DEFAULT_PR
         return None
     if not image_paths:
         return None
-    return _LazyRun(image_paths, include_context=include_context, predicted_frames=predicted_frames)
+    return _LazyRun(
+        image_paths,
+        include_context=include_context,
+        predicted_frames=predicted_frames,
+        frame_format=frame_format,
+    )
 
 
-def show_combined(root, subfolders, fps, scale, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
+def show_combined(
+    root,
+    subfolders,
+    fps,
+    scale,
+    include_context=False,
+    predicted_frames=DEFAULT_PREDICTED_FRAMES,
+    frame_format="auto",
+):
     """Single-window UI with run selector on the left and viewer on the right."""
     # Discover which subfolders have PNGs (cheap: just glob, no image loading)
     available = []
@@ -309,6 +390,7 @@ def show_combined(root, subfolders, fps, scale, include_context=False, predicted
                 name,
                 include_context=include_context,
                 predicted_frames=predicted_frames,
+                frame_format=frame_format,
             )
         return run_cache[name]
 
@@ -552,6 +634,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PREDICTED_FRAMES,
         help=f"Number of trailing predicted frames to show (default: {DEFAULT_PREDICTED_FRAMES})",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        choices=["auto", "stacked", "rollout"],
+        default="auto",
+        help=(
+            "Image layout format. 'auto' detects rollout_step_*.png as rollout grids; "
+            "otherwise uses stacked format."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -566,6 +658,7 @@ def main():
             args.scale,
             include_context=args.include_context,
             predicted_frames=args.predicted_frames,
+            frame_format=args.format,
         )
         return
 
@@ -582,6 +675,7 @@ def main():
         args.scale,
         include_context=args.include_context,
         predicted_frames=args.predicted_frames,
+        frame_format=args.format,
     )
 
 

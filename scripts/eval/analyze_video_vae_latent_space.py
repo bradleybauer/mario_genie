@@ -715,10 +715,6 @@ def analyze_spatial(stats: dict) -> dict:
     # Per-channel spatial energy
     channel_spatial_energy = latents.var(axis=(0, 2))  # (Z, H, W)
 
-    # Spatial autocorrelation: average correlation between adjacent positions
-    # Computed on the mean latent map averaged over time
-    mean_spatial = latents.mean(axis=2)  # (N, Z, H, W)
-
     return {
         "spatial_energy": energy,
         "channel_spatial_energy": channel_spatial_energy,

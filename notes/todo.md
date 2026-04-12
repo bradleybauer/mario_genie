@@ -31,7 +31,6 @@ Pretty neat idea for vq-vae/lfq to overcome approximation error of the straight-
 
 Benchmark xformers or FlashAttention after revisiting the DiT action masking; if I remove the action mask, re-check whether the attention backend can be simplified and sped up.
 
-For the sake of computational cost I might have the DiT target a tick rate of 15hz. Meaning the DiT would predict chunks of 4 frames per tick since mario runs at 60hz.
 
 VS. super mario bros and super mario bros the lost levels exist
 

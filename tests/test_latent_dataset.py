@@ -19,7 +19,7 @@ def test_latent_dataset_returns_temporal_windows(tmp_path: Path) -> None:
     actions = np.arange(8, dtype=np.uint8)
     np.savez_compressed(tmp_path / "sample.npz", latents=latents, actions=actions)
 
-    dataset = LatentSequenceDataset(tmp_path, clip_frames=4, include_actions=True)
+    dataset = LatentSequenceDataset(tmp_path, clip_latents=4, include_actions=True)
     sample = dataset[2]
 
     assert len(dataset) == 5
@@ -36,4 +36,4 @@ def test_latent_dataset_rejects_action_length_mismatch(tmp_path: Path) -> None:
     np.savez_compressed(tmp_path / "bad.npz", latents=latents, actions=actions)
 
     with pytest.raises(ValueError, match="latent steps"):
-        LatentSequenceDataset(tmp_path, clip_frames=4, include_actions=True)
+        LatentSequenceDataset(tmp_path, clip_latents=4, include_actions=True)

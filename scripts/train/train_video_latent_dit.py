@@ -51,6 +51,7 @@ from src.training.trainer_common import (
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
+    gpu_stats,
     is_periodic_event_due,
     make_output_dir,
     preview_path,
@@ -120,14 +121,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
 
-    parser.add_argument("--video-vae-checkpoint", type=str, default=None)
-    parser.add_argument("--video-vae-config", type=str, default=None)
-    parser.add_argument("--latent-stats", type=str, default=None)
     parser.add_argument("--disable-latent-normalization", action="store_true")
 
-    parser.add_argument("--clip-frames", type=int, default=20)
-    parser.add_argument("--context-frames", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--clip-latents", type=int, default=256)
+    parser.add_argument("--context-latents", type=int, default=255)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
 
     parser.add_argument("--max-steps", type=int, required=True)
@@ -150,7 +148,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--max-frames", type=int, default=256)
 
     parser.add_argument("--flow-loss", type=str, choices=["mse", "huber"], default="huber")
     parser.add_argument("--huber-delta", type=float, default=0.03)
@@ -160,15 +157,19 @@ def parse_args() -> argparse.Namespace:
                         default="uniform")
 
     parser.add_argument(
-        "--error-buffer-size", type=int, default=0,
+        "--error-buffer-size", type=int, default=1024,
         help="Residual clips retained for history perturbation.",
     )
-    parser.add_argument("--error-inject-prob", type=float, default=0.0)
+    parser.add_argument("--error-inject-prob", type=float, default=0.2)
     parser.add_argument("--error-inject-scale", type=float, default=0.05)
     parser.add_argument("--error-inject-start-step", type=int, default=20000)
     parser.add_argument("--error-buffer-clip", type=float, default=3.0)
 
     parser.add_argument("--preview-ode-steps", type=int, default=8)
+    parser.add_argument("--preview-interval", type=int, default=None,
+                        help="Steps between rollout previews (default: eval-interval).")
+    parser.add_argument("--preview-rollout-latents", type=int, default=64,
+                        help="Total latents to generate via autoregressive rollout.")
 
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -185,14 +186,12 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    if args.clip_frames < 2:
-        parser.error("--clip-frames must be >= 2")
-    if args.context_frames < 1:
-        parser.error("--context-frames must be >= 1")
-    if args.context_frames >= args.clip_frames:
-        parser.error("--context-frames must be smaller than --clip-frames")
-    if args.max_frames < args.clip_frames:
-        parser.error("--max-frames must be >= --clip-frames")
+    if args.clip_latents < 2:
+        parser.error("--clip-latents must be >= 2")
+    if args.context_latents < 1:
+        parser.error("--context-latents must be >= 1")
+    if args.context_latents >= args.clip_latents:
+        parser.error("--context-latents must be smaller than --clip-latents")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient-accumulation-steps must be >= 1")
 
@@ -326,15 +325,10 @@ def load_latent_normalization(
 
 
 def load_latent_stats_path(
-    args: argparse.Namespace, *, data_dir: Path, latent_meta: dict | None
+    *, data_dir: Path, latent_meta: dict | None, disable: bool = False
 ) -> Path | None:
-    if args.disable_latent_normalization:
+    if disable:
         return None
-    if args.latent_stats is not None:
-        p = _resolve_path(args.latent_stats, config_dir=data_dir)
-        if not _is_readable(p):
-            raise FileNotFoundError(f"Latent stats not found: {args.latent_stats}")
-        return p
     if latent_meta is not None:
         for key in ("latent_stats_path", "latent_stats_file"):
             v = latent_meta.get(key)
@@ -468,7 +462,7 @@ class ResidualErrorBuffer:
             self._bank.append(sample.unsqueeze(0))
 
     def sample(
-        self, batch_size: int, *, device: torch.device, dtype: torch.dtype, frames: int
+        self, batch_size: int, *, device: torch.device, dtype: torch.dtype, latents: int
     ) -> torch.Tensor | None:
         if len(self._bank) == 0:
             return None
@@ -476,10 +470,10 @@ class ResidualErrorBuffer:
         samples = [self._bank[i] for i in indices]
         out = torch.cat(samples, dim=0).to(device=device, dtype=dtype)
         B, C, T, H, W = out.shape
-        if T < frames:
-            out = out.repeat(1, 1, math.ceil(frames / T), 1, 1)[:, :, :frames]
-        elif T > frames:
-            out = out[:, :, :frames]
+        if T < latents:
+            out = out.repeat(1, 1, math.ceil(latents / T), 1, 1)[:, :, :latents]
+        elif T > latents:
+            out = out[:, :, :latents]
         return out
 
 
@@ -532,26 +526,65 @@ def denoise_future_segment(
     *,
     history_latents: torch.Tensor,
     actions: torch.Tensor,
-    future_frames: int,
+    future_latents: int,
     ode_steps: int,
     accelerator: Accelerator,
 ) -> torch.Tensor:
-    batch, channels, context_frames, height, width = history_latents.shape
-    future = torch.randn(batch, channels, future_frames, height, width,
+    batch, channels, context_latents, height, width = history_latents.shape
+    future = torch.randn(batch, channels, future_latents, height, width,
                          device=history_latents.device, dtype=history_latents.dtype)
 
     raw_model = accelerator.unwrap_model(model)
     with accelerator.autocast():
-        encoded = raw_model.encode_history(history_latents, actions[:, :context_frames])
+        encoded = raw_model.encode_history(history_latents, actions[:, :context_latents])
 
     dt = 1.0 / float(ode_steps)
     for step in range(ode_steps, 0, -1):
         t_val = (step - 0.5) / float(ode_steps)
         t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
         with accelerator.autocast():
-            velocity = raw_model.decode_future(future, actions, t, encoded, context_frames)
+            velocity = raw_model.decode_future(future, actions, t, encoded, context_latents)
         future = future - dt * velocity
     return future
+
+
+@torch.no_grad()
+def autoregressive_rollout(
+    model: torch.nn.Module,
+    *,
+    seed_latents: torch.Tensor,
+    all_actions: torch.Tensor,
+    context_latents: int,
+    future_latents: int,
+    total_latents: int,
+    ode_steps: int,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Autoregressively roll out latent timesteps.
+
+    *seed_latents* provides the initial ``context_latents`` of real data.
+    At each step, the last ``context_latents`` generated latents become the
+    new history and ``future_latents`` are predicted via ODE integration.
+    *all_actions* must cover ``total_latents``; pad with the default action
+    for latents beyond the dataset clip.
+    """
+    generated = seed_latents  # (B, C, context_latents, H, W)
+    while generated.shape[2] < total_latents:
+        step_future = min(future_latents, total_latents - generated.shape[2])
+        history = generated[:, :, -context_latents:]
+        abs_start = generated.shape[2] - context_latents
+        abs_end = generated.shape[2] + step_future
+        step_actions = all_actions[:, abs_start:abs_end]
+        pred = denoise_future_segment(
+            model,
+            history_latents=history,
+            actions=step_actions,
+            future_latents=step_future,
+            ode_steps=ode_steps,
+            accelerator=accelerator,
+        )
+        generated = torch.cat([generated, pred], dim=2)
+    return generated
 
 
 @torch.inference_mode()
@@ -581,6 +614,35 @@ def save_preview_image(
     Image.fromarray(np.concatenate(rows, axis=0)).save(path)
 
 
+def save_rollout_preview(
+    path: Path,
+    *,
+    frames_gt: torch.Tensor,
+    frames_pred: torch.Tensor,
+    palette: torch.Tensor,
+) -> None:
+    """Save a rollout preview: GT (left column) and prediction (right column).
+
+    Each row shows one predicted timestep with ground truth on the left and
+    the model's prediction on the right.  GT timesteps beyond the available
+    length are rendered as dark-gray placeholders.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pal = (palette.detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
+    gt = pal[frames_gt.cpu().numpy()]        # (T_gt, H, W, 3)
+    pred = pal[frames_pred.cpu().numpy()]    # (T, H, W, 3)
+    T = pred.shape[0]
+    T_gt = gt.shape[0]
+    H, W = pred.shape[1], pred.shape[2]
+    blank = np.full((H, W, 3), 32, dtype=np.uint8)
+
+    rows = []
+    for t in range(T):
+        gt_frame = gt[t] if t < T_gt else blank
+        rows.append(np.concatenate([gt_frame, pred[t]], axis=1))
+    Image.fromarray(np.concatenate(rows, axis=0)).save(path)
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -590,7 +652,7 @@ def evaluate(
     *,
     loader: DataLoader,
     device: torch.device,
-    context_frames: int,
+    context_latents: int,
     accelerator: Accelerator,
     default_action_index: int,
     loss_type: str,
@@ -612,13 +674,13 @@ def evaluate(
                 default_action_index=default_action_index,
                 latent_normalization=latent_normalization,
             )
-            history = latents[:, :, :context_frames]
-            future = latents[:, :, context_frames:]
+            history = latents[:, :, :context_latents]
+            future = latents[:, :, context_latents:]
             noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
             model_input = torch.cat((history, noisy_future), dim=2)
 
             with accelerator.autocast():
-                v_pred = raw_model(model_input, actions, t, context_frames)
+                v_pred = raw_model(model_input, actions, t, context_latents)
 
             flow_losses.append(
                 compute_flow_loss(v_pred, v_target, loss_type=loss_type, huber_delta=huber_delta).item()
@@ -676,7 +738,7 @@ def main() -> None:
     with accelerator.main_process_first():
         dataset = LatentSequenceDataset(
             data_dir=data_dir,
-            clip_frames=args.clip_frames,
+            clip_latents=args.clip_latents,
             include_actions=True,
             num_workers=args.num_workers,
             system_info=system_info,
@@ -706,7 +768,7 @@ def main() -> None:
     )
 
     if accelerator.is_main_process:
-        console.print(f"Found {len(dataset)} segments of {args.clip_frames} frames.")
+        console.print(f"Found {len(dataset)} segments of {args.clip_latents} latents.")
         if eval_dataset:
             console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train")
 
@@ -727,7 +789,10 @@ def main() -> None:
     # Latent normalization
     # ------------------------------------------------------------------
     latent_channels = int(dataset.latent_channels)
-    latent_stats_path = load_latent_stats_path(args, data_dir=data_dir, latent_meta=latent_meta)
+    latent_stats_path = load_latent_stats_path(
+        data_dir=data_dir, latent_meta=latent_meta,
+        disable=args.disable_latent_normalization,
+    )
     latent_normalization: LatentNormalization | None = None
     if latent_stats_path is not None:
         latent_normalization = load_latent_normalization(
@@ -763,11 +828,8 @@ def main() -> None:
             markup=False,
         )
 
-    vae_ckpt = args.video_vae_checkpoint
-    vae_cfg = args.video_vae_config
-    if latent_meta is not None:
-        vae_ckpt = vae_ckpt or latent_meta.get("video_vae_checkpoint")
-        vae_cfg = vae_cfg or latent_meta.get("video_vae_config_path")
+    vae_ckpt = latent_meta.get("video_vae_checkpoint") if latent_meta is not None else None
+    vae_cfg = latent_meta.get("video_vae_config_path") if latent_meta is not None else None
     vae_ckpt_path = _resolve_path(vae_ckpt, config_dir=data_dir)
     vae_cfg_path = _resolve_path(vae_cfg, config_dir=data_dir)
     if not _is_readable(vae_cfg_path) and _is_readable(vae_ckpt_path):
@@ -838,7 +900,7 @@ def main() -> None:
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
-        max_frames=args.max_frames,
+        max_latents=args.clip_latents,
     )
     model: torch.nn.Module = build_video_latent_dit(model_config=model_config).to(device)
     diffusers_version = str(diffusers.__version__)
@@ -952,8 +1014,8 @@ def main() -> None:
                     "latent_height": int(dataset.latent_height),
                     "latent_width": int(dataset.latent_width),
                     "num_actions": int(num_actions),
-                    "clip_frames": int(args.clip_frames),
-                    "context_frames": int(args.context_frames),
+                    "clip_latents": int(args.clip_latents),
+                    "context_latents": int(args.context_latents),
                     "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
                     "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
                     "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
@@ -1019,6 +1081,7 @@ def main() -> None:
         )
 
     use_live = sys.stdout.isatty() and accelerator.is_main_process
+    start_time = time.time()
     throughput_tracker = ThroughputTracker(window_steps=20)
     loss_window: deque[float] = deque(maxlen=100)
     train_log_path = output_dir / "train_log.jsonl"
@@ -1052,8 +1115,8 @@ def main() -> None:
                     latent_normalization=latent_normalization,
                 )
 
-                history = latents[:, :, :args.context_frames]
-                future = latents[:, :, args.context_frames:]
+                history = latents[:, :, :args.context_latents]
+                future = latents[:, :, args.context_latents:]
 
                 # Optional history perturbation
                 if (
@@ -1066,7 +1129,7 @@ def main() -> None:
                         batch_size=history.shape[0],
                         device=history.device,
                         dtype=history.dtype,
-                        frames=args.context_frames,
+                        latents=args.context_latents,
                     )
                     if perturb is not None:
                         history = history + args.error_inject_scale * perturb
@@ -1076,7 +1139,7 @@ def main() -> None:
 
                 with accelerator.accumulate(model):
                     with accelerator.autocast():
-                        v_pred = model(model_input, actions, t, args.context_frames)
+                        v_pred = model(model_input, actions, t, args.context_latents)
                         loss = compute_flow_loss(v_pred, v_target, loss_type=args.flow_loss, huber_delta=args.huber_delta)
 
                     if not torch.isfinite(loss):
@@ -1143,13 +1206,41 @@ def main() -> None:
 
             if should_log:
                 with torch.no_grad():
-                    v_pred_norm = accum_v_pred.detach().float().norm(dim=1).mean().item()
-                    v_target_norm = accum_v_target.detach().float().norm(dim=1).mean().item()
+                    vp = accum_v_pred.detach().float()
+                    vt = accum_v_target.detach().float()
+                    v_pred_norm = vp.norm(dim=1).mean().item()
+                    v_target_norm = vt.norm(dim=1).mean().item()
+
+                    # x0 reconstruction MSE (same formula as eval)
+                    x0_mse = F.mse_loss(accum_eps.detach().float() - vp, accum_future.detach().float()).item()
+
+                    # Cosine similarity between predicted and target velocity
+                    vp_flat = vp.flatten(start_dim=1)
+                    vt_flat = vt.flatten(start_dim=1)
+                    cos_sim = F.cosine_similarity(vp_flat, vt_flat, dim=1).mean().item()
+
+                    # Loss stratified by timestep third (early/mid/late)
+                    t_vals = accum_t.detach().float()
+                    loss_per_sample = (vp - vt).pow(2).flatten(start_dim=1).mean(dim=1)
+                    t_low = t_vals < 1.0 / 3.0
+                    t_mid = (t_vals >= 1.0 / 3.0) & (t_vals < 2.0 / 3.0)
+                    t_high = t_vals >= 2.0 / 3.0
+                    loss_t_early = loss_per_sample[t_low].mean().item() if t_low.any() else None
+                    loss_t_mid = loss_per_sample[t_mid].mean().item() if t_mid.any() else None
+                    loss_t_late = loss_per_sample[t_high].mean().item() if t_high.any() else None
+
+                elapsed_s = time.time() - start_time
                 train_entry: dict = {
                     "type": "train",
                     "step": step,
+                    "elapsed_s": round(elapsed_s, 1),
                     "loss": avg_loss,
                     "loss_smooth": float(np.mean(loss_window)) if loss_window else avg_loss,
+                    "x0_mse": x0_mse,
+                    "v_cos_sim": cos_sim,
+                    "loss_t_early": loss_t_early,
+                    "loss_t_mid": loss_t_mid,
+                    "loss_t_late": loss_t_late,
                     "grad_norm": grad_norm,
                     **{f"grad_norm_{k}": v for k, v in cgnorms.items()},
                     "lr": float(lr_scheduler.get_last_lr()[0]),
@@ -1157,9 +1248,11 @@ def main() -> None:
                     "t_std": float(accum_t.std().item()),
                     "v_pred_norm": v_pred_norm,
                     "v_target_norm": v_target_norm,
-                    "samples_per_sec": samples_per_second,
-                    "steps_per_sec": steps_per_second,
+                    "error_buffer_size": len(error_buffer),
+                    "samples_per_sec": round(samples_per_second, 1),
+                    "steps_per_sec": round(steps_per_second, 2),
                 }
+                train_entry.update(gpu_stats(device))
                 metrics.append(train_entry)
                 with train_log_path.open("a") as fh:
                     fh.write(json.dumps(train_entry) + "\n")
@@ -1183,7 +1276,13 @@ def main() -> None:
                 interval=args.checkpoint_interval,
                 max_steps=args.max_steps,
             )
-            if eval_due or should_checkpoint:
+            preview_interval = args.preview_interval or args.eval_interval
+            preview_due = is_periodic_event_due(
+                step,
+                interval=preview_interval,
+                max_steps=args.max_steps,
+            )
+            if eval_due or should_checkpoint or preview_due:
                 accelerator.wait_for_everyone()
 
             should_eval = eval_due and accelerator.is_main_process
@@ -1196,7 +1295,7 @@ def main() -> None:
                     model,
                     loader=eval_loader,
                     device=device,
-                    context_frames=args.context_frames,
+                    context_latents=args.context_latents,
                     accelerator=accelerator,
                     default_action_index=default_action_index,
                     loss_type=args.flow_loss,
@@ -1206,6 +1305,7 @@ def main() -> None:
                 )
                 eval_metrics["type"] = "eval"
                 eval_metrics["step"] = step
+                eval_metrics["elapsed_s"] = round(time.time() - start_time, 1)
                 eval_metrics["lr"] = float(lr_scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
                 eval_cgnorms = _component_gnorms(accelerator.unwrap_model(model))
@@ -1218,94 +1318,6 @@ def main() -> None:
                     f"gnorm={grad_norm:.2f} "
                     + " ".join(f"{k}={v:.2f}" for k, v in eval_cgnorms.items())
                 )
-
-                # Preview — uses a cached batch to avoid desynchronizing
-                # the data iterator across processes.
-                with torch.no_grad():
-                    try:
-                        if video_vae is not None and palette is not None and _preview_batch is not None:
-                            preview_max_frames = 16
-                            t0_preview = time.perf_counter()
-                            prev_latents, prev_actions = prepare_batch(
-                                _preview_batch,
-                                device=device,
-                                default_action_index=default_action_index,
-                                latent_normalization=latent_normalization,
-                            )
-                            idx = random.randrange(prev_latents.shape[0])
-                            prev_latents = prev_latents[idx:idx+1]
-                            prev_actions = prev_actions[idx:idx+1]
-
-                            preview_total_frames = min(
-                                preview_max_frames,
-                                int(args.clip_frames),
-                                int(prev_latents.shape[2]),
-                            )
-                            preview_context_frames = min(args.context_frames, preview_total_frames)
-                            preview_future_frames = max(preview_total_frames - preview_context_frames, 0)
-
-                            history_prev = prev_latents[:, :, :preview_context_frames]
-                            preview_actions = prev_actions[:, :preview_total_frames]
-                            raw_model = accelerator.unwrap_model(model)
-
-                            if preview_future_frames > 0:
-                                t0_denoise = time.perf_counter()
-                                sampled_future = denoise_future_segment(
-                                    raw_model,
-                                    history_latents=history_prev,
-                                    actions=preview_actions,
-                                    future_frames=preview_future_frames,
-                                    ode_steps=args.preview_ode_steps,
-                                    accelerator=accelerator,
-                                )
-                                torch.cuda.synchronize()
-                                t_denoise = time.perf_counter() - t0_denoise
-                                sampled_full = torch.cat((history_prev, sampled_future), dim=2)
-                            else:
-                                t_denoise = 0.0
-                                sampled_full = history_prev
-
-                            gt_full = prev_latents[:, :, :preview_total_frames]
-
-                            def maybe_denorm(x):
-                                return latent_normalization.denormalize(x) if latent_normalization else x
-
-                            t0_decode = time.perf_counter()
-                            sampled_frames = latents_to_frame_indices(
-                                video_vae, maybe_denorm(sampled_full), accelerator=accelerator
-                            )
-                            gt_frames = latents_to_frame_indices(
-                                video_vae, maybe_denorm(gt_full), accelerator=accelerator
-                            )
-                            torch.cuda.synchronize()
-                            t_decode = time.perf_counter() - t0_decode
-
-                            t0_save = time.perf_counter()
-                            save_preview_image(
-                                preview_path(output_dir, split="eval", step=step),
-                                frames_gt=gt_frames[0],
-                                frames_sample=sampled_frames[0],
-                                palette=palette,
-                            )
-                            t_save = time.perf_counter() - t0_save
-                            preview_file = preview_path(output_dir, split="eval", step=step)
-
-                            t_preview = time.perf_counter() - t0_preview
-                            log_console.print(
-                                f"[preview] {t_preview:.1f}s total "
-                                f"(frames={preview_total_frames} denoise={t_denoise:.1f}s "
-                                f"decode={t_decode:.1f}s save={t_save:.1f}s) -> {preview_file}",
-                                markup=False,
-                            )
-                        elif accelerator.is_main_process:
-                            log_console.print(
-                                "[preview] Skipped because preview prerequisites were not met",
-                                markup=False,
-                            )
-                    except torch.cuda.OutOfMemoryError:
-                        log_console.print("[preview] Skipped due to CUDA OOM", markup=False)
-                        gc.collect()
-                        torch.cuda.empty_cache()
 
                 is_new_best = eval_metrics["flow_loss"] < best_eval
                 if is_new_best:
@@ -1348,7 +1360,98 @@ def main() -> None:
             if eval_line is not None and accelerator.is_main_process:
                 log_console.print(eval_line)
 
-            if eval_due or should_checkpoint:
+            # ------------------------------------------------------------------
+            # Autoregressive rollout preview
+            # ------------------------------------------------------------------
+            if preview_due and accelerator.is_main_process:
+                with torch.no_grad():
+                    try:
+                        if video_vae is not None and palette is not None and _preview_batch is not None:
+                            t0_preview = time.perf_counter()
+                            prev_latents, prev_actions = prepare_batch(
+                                _preview_batch,
+                                device=device,
+                                default_action_index=default_action_index,
+                                latent_normalization=latent_normalization,
+                            )
+                            idx = random.randrange(prev_latents.shape[0])
+                            prev_latents = prev_latents[idx : idx + 1]
+                            prev_actions = prev_actions[idx : idx + 1]
+
+                            ctx = min(args.context_latents, prev_latents.shape[2])
+                            future_per_step = max(int(args.clip_latents) - ctx, 1)
+                            rollout_total = ctx + max(args.preview_rollout_latents, future_per_step)
+
+                            # Pad actions to cover the full rollout
+                            clip_actions = prev_actions.shape[1]
+                            if clip_actions < rollout_total:
+                                pad = torch.full(
+                                    (1, rollout_total - clip_actions),
+                                    default_action_index,
+                                    device=prev_actions.device,
+                                    dtype=prev_actions.dtype,
+                                )
+                                prev_actions = torch.cat([prev_actions, pad], dim=1)
+
+                            seed = prev_latents[:, :, :ctx]
+
+                            t0_denoise = time.perf_counter()
+                            rollout_latents = autoregressive_rollout(
+                                model,
+                                seed_latents=seed,
+                                all_actions=prev_actions[:, :rollout_total],
+                                context_latents=ctx,
+                                future_latents=future_per_step,
+                                total_latents=rollout_total,
+                                ode_steps=args.preview_ode_steps,
+                                accelerator=accelerator,
+                            )
+                            torch.cuda.synchronize()
+                            t_denoise = time.perf_counter() - t0_denoise
+
+                            gt_full = prev_latents[:, :, : min(rollout_total, prev_latents.shape[2])]
+
+                            def maybe_denorm(x):
+                                return latent_normalization.denormalize(x) if latent_normalization else x
+
+                            t0_decode = time.perf_counter()
+                            sampled_frames = latents_to_frame_indices(
+                                video_vae, maybe_denorm(rollout_latents), accelerator=accelerator
+                            )
+                            gt_frames = latents_to_frame_indices(
+                                video_vae, maybe_denorm(gt_full), accelerator=accelerator
+                            )
+                            torch.cuda.synchronize()
+                            t_decode = time.perf_counter() - t0_decode
+
+                            t0_save = time.perf_counter()
+                            out_path = preview_path(output_dir, split="rollout", step=step)
+                            n_pred = rollout_total - ctx
+                            pred_frames = sampled_frames[0, ctx:rollout_total]
+                            gt_pred = gt_frames[0, ctx:min(gt_frames.shape[1], rollout_total)]
+                            save_rollout_preview(
+                                out_path,
+                                frames_gt=gt_pred,
+                                frames_pred=pred_frames,
+                                palette=palette,
+                            )
+                            t_save = time.perf_counter() - t0_save
+
+                            t_preview = time.perf_counter() - t0_preview
+                            log_console.print(
+                                f"[rollout] {t_preview:.1f}s total "
+                                f"(latents={rollout_total} ctx={ctx} pred={n_pred} "
+                                f"denoise={t_denoise:.1f}s "
+                                f"decode={t_decode:.1f}s save={t_save:.1f}s) -> {out_path}",
+                                markup=False,
+                            )
+                            del rollout_latents, sampled_frames, gt_frames, gt_full, pred_frames, gt_pred
+                    except torch.cuda.OutOfMemoryError:
+                        log_console.print("[rollout] Skipped due to CUDA OOM", markup=False)
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+            if eval_due or should_checkpoint or preview_due:
                 accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:

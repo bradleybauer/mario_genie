@@ -17,10 +17,12 @@ Usage:
     python scripts/eval/inspect_video_vae.py checkpoints/video_vae_20260410_134808
     python scripts/eval/inspect_video_vae.py checkpoints/video_vae_20260410_134808 --seed 42
     python scripts/eval/inspect_video_vae.py checkpoints/video_vae_20260410_134808 --best
+    python scripts/eval/inspect_video_vae.py checkpoints/video_vae_20260410_134808 --predicted-frames 64
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import sys
 from contextlib import nullcontext
@@ -78,6 +80,67 @@ def _load_config(checkpoint_dir: Path) -> dict:
         return json.load(f)
 
 
+@dataclass
+class _LatentNormalization:
+    mean: torch.Tensor  # (Z, 1, H, W)
+    std: torch.Tensor   # (Z, 1, H, W)
+    stats_path: Path
+    warned_shape_mismatch: bool = False
+
+
+def _load_latent_normalization(latents_dir: Path) -> _LatentNormalization | None:
+    stats_path = latents_dir / "latent_stats.json"
+    if not stats_path.is_file():
+        return None
+    try:
+        with stats_path.open() as f:
+            stats = json.load(f)
+
+        version = int(stats.get("latent_stats_version"))
+        if version != 2:
+            print(f"  latent normalization: skipping {stats_path} (unsupported latent_stats_version={version})")
+            return None
+
+        scheme = stats.get("normalization_scheme")
+        if scheme != "component_chw_shared_time":
+            print(
+                "  latent normalization: "
+                f"skipping {stats_path} (unsupported normalization_scheme={scheme!r})"
+            )
+            return None
+
+        mean_v = stats.get("component_mean")
+        std_v = stats.get("component_std_clamped")
+        if mean_v is None or std_v is None:
+            print(
+                "  latent normalization: "
+                f"skipping {stats_path} (missing component_mean/component_std_clamped)"
+            )
+            return None
+
+        mean_np = np.asarray(mean_v, dtype=np.float32)
+        std_np = np.asarray(std_v, dtype=np.float32)
+        if mean_np.ndim != 3 or std_np.shape != mean_np.shape:
+            print(
+                "  latent normalization: "
+                f"skipping {stats_path} (invalid shapes mean={mean_np.shape}, std={std_np.shape})"
+            )
+            return None
+
+        eps = max(float(stats.get("std_epsilon", 1e-6)), 1e-6)
+        std_np = np.nan_to_num(std_np, nan=eps, posinf=eps, neginf=eps)
+        std_np = np.maximum(std_np, eps)
+
+        return _LatentNormalization(
+            mean=torch.from_numpy(mean_np).unsqueeze(1),
+            std=torch.from_numpy(std_np).unsqueeze(1),
+            stats_path=stats_path,
+        )
+    except Exception as exc:
+        print(f"  latent normalization: failed to load {stats_path}: {exc}")
+        return None
+
+
 def _load_class_weights(data_dir: str, *, num_classes: int, soften: float) -> torch.Tensor | None:
     dist_path = Path(data_dir) / "palette_distribution.json"
     if not dist_path.is_file():
@@ -111,6 +174,91 @@ def _load_checkpoint(model: VideoVAE, ckpt_path: Path, device: torch.device) -> 
     load_model_state_dict(model, ckpt["model"], strict=False)
     model.eval()
     return ckpt
+
+
+def _forward_video_vae_chunked(
+    model: VideoVAE,
+    frames: torch.Tensor,
+    config: dict,
+    device: torch.device,
+    *,
+    chunk_frames: int,
+    chunk_overlap: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run chunked temporal inference and stitch outputs on CPU.
+
+    Returns:
+        logits_cpu: (1, C, T, H, W)
+        mean_cpu: (1, Z, T_lat, H_lat, W_lat)
+        logvar_cpu: (1, Z, T_lat, H_lat, W_lat)
+    """
+    tcfg = config["training"]
+    dcfg = config["data"]
+    use_onehot_conv = tcfg.get("onehot_conv", False)
+    onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
+    onehot_dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }.get(onehot_dtype_name, torch.float32)
+    mixed_precision = tcfg.get("mixed_precision", "no")
+    autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mixed_precision)
+
+    total_frames = int(frames.shape[1])
+    chunk_frames = min(max(int(chunk_frames), 1), total_frames)
+    chunk_overlap = max(int(chunk_overlap), 0)
+    if chunk_frames <= 2 * chunk_overlap:
+        # Ensure each chunk contributes at least one new frame.
+        chunk_overlap = max(0, (chunk_frames - 1) // 2)
+    core_step = max(1, chunk_frames - 2 * chunk_overlap)
+
+    logits_parts: list[torch.Tensor] = []
+    mean_parts: list[torch.Tensor] = []
+    logvar_parts: list[torch.Tensor] = []
+
+    core_start = 0
+    while core_start < total_frames:
+        core_end = min(core_start + core_step, total_frames)
+        in_start = max(0, core_start - chunk_overlap)
+        in_end = min(total_frames, core_end + chunk_overlap)
+
+        frames_chunk = frames[:, in_start:in_end]
+        if use_onehot_conv:
+            model_input = frames_chunk.byte()
+        else:
+            model_input = frames_to_one_hot(frames_chunk.long(), dcfg["num_colors"], dtype=onehot_dtype)
+
+        amp_ctx = torch.autocast(device_type=device.type, dtype=autocast_dtype) if autocast_dtype and device.type == "cuda" else nullcontext()
+        with amp_ctx:
+            outputs = model(model_input, sample_posterior=False)
+
+        logits_chunk = outputs.logits.float().cpu()
+        mean_chunk = outputs.posterior_mean.float().cpu()
+        logvar_chunk = outputs.posterior_logvar.float().cpu()
+
+        keep_start = core_start - in_start
+        keep_end = keep_start + (core_end - core_start)
+        logits_parts.append(logits_chunk[:, :, keep_start:keep_end])
+
+        t_in = int(in_end - in_start)
+        t_lat = int(mean_chunk.shape[2])
+        lat_start = int(round(keep_start * t_lat / max(t_in, 1)))
+        lat_end = int(round(keep_end * t_lat / max(t_in, 1)))
+        if keep_end > keep_start:
+            lat_end = max(lat_end, lat_start + 1)
+        lat_start = max(0, min(lat_start, t_lat))
+        lat_end = max(lat_start, min(lat_end, t_lat))
+
+        mean_parts.append(mean_chunk[:, :, lat_start:lat_end])
+        logvar_parts.append(logvar_chunk[:, :, lat_start:lat_end])
+
+        core_start = core_end
+
+    return (
+        torch.cat(logits_parts, dim=2),
+        torch.cat(mean_parts, dim=2),
+        torch.cat(logvar_parts, dim=2),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +418,13 @@ def _run_inspection(
     sampler: _ClipSampler,
     palette_u8: np.ndarray,
     class_weight: torch.Tensor | None,
+    latent_norm: _LatentNormalization | None,
     config: dict,
     device: torch.device,
     rng: np.random.Generator,
+    *,
+    chunk_frames: int,
+    chunk_overlap: int,
 ) -> dict:
     """Sample a random clip, run the model, and compute all diagnostic arrays."""
     tcfg = config["training"]
@@ -286,31 +438,39 @@ def _run_inspection(
     clip_frames, clip_info = sampler.sample(rng)
     frames = clip_frames.unsqueeze(0).to(device)  # (1, T, H, W) uint8
 
-    # Forward pass — match training: onehot_conv gets byte indices, dense gets scatter one-hot + autocast.
-    dcfg = config["data"]
-    use_onehot_conv = tcfg.get("onehot_conv", False)
-    onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
-    onehot_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(onehot_dtype_name, torch.float32)
-    mixed_precision = tcfg.get("mixed_precision", "no")
-    if use_onehot_conv:
-        model_input = frames.byte()
-    else:
-        model_input = frames_to_one_hot(frames.long(), dcfg["num_colors"], dtype=onehot_dtype)
-    autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(mixed_precision)
-    amp_ctx = torch.autocast(device_type=device.type, dtype=autocast_dtype) if autocast_dtype and device.type == "cuda" else nullcontext()
-    with amp_ctx:
-        outputs = model(model_input, sample_posterior=False)
-    logits = outputs.logits  # (1, C, T, H, W)
-    recon_indices = logits.argmax(dim=1)  # (1, T, H, W)
-    recon_logits = logits[:, :, context_frames:] if context_frames > 0 else logits
+    logits_cpu, posterior_mean_cpu, posterior_logvar_cpu = _forward_video_vae_chunked(
+        model,
+        frames,
+        config,
+        device,
+        chunk_frames=chunk_frames,
+        chunk_overlap=chunk_overlap,
+    )
+    recon_indices = logits_cpu.argmax(dim=1)  # (1, T, H, W)
+    recon_logits = logits_cpu[:, :, context_frames:] if context_frames > 0 else logits_cpu
     recon_targets = frames.long()[:, context_frames:] if context_frames > 0 else frames.long()
 
     T = frames.shape[1]
     frames_cpu = frames[0].cpu()  # (T, H, W)
-    logits_cpu = logits[0].cpu().float()  # (C, T, H, W)
+    logits_cpu = logits_cpu[0].float()  # (C, T, H, W)
     recon_cpu = recon_indices[0].cpu()  # (T, H, W)
-    latent_mean = outputs.posterior_mean[0].cpu().float()  # (Z, T_lat, H_lat, W_lat)
-    latent_logvar = outputs.posterior_logvar[0].cpu().float()
+    latent_mean = posterior_mean_cpu[0].float()  # (Z, T_lat, H_lat, W_lat)
+    latent_logvar = posterior_logvar_cpu[0].float()
+    latent_standardized = False
+
+    if latent_norm is not None:
+        latent_shape = (latent_mean.shape[0], latent_mean.shape[2], latent_mean.shape[3])
+        stats_shape = (latent_norm.mean.shape[0], latent_norm.mean.shape[2], latent_norm.mean.shape[3])
+        if latent_shape == stats_shape:
+            latent_mean = (latent_mean - latent_norm.mean) / latent_norm.std
+            latent_standardized = True
+        elif not latent_norm.warned_shape_mismatch:
+            print(
+                "  latent normalization: shape mismatch; "
+                f"model latent (Z,H,W)={latent_shape} vs stats={stats_shape} from {latent_norm.stats_path}. "
+                "Using raw latent means."
+            )
+            latent_norm.warned_shape_mismatch = True
 
     # RGB arrays
     target_rgb = palette_u8[frames_cpu.numpy()]  # (T, H, W, 3)
@@ -392,6 +552,7 @@ def _run_inspection(
         "T_lat": T_lat,
         "per_frame_acc": per_frame_acc,
         "per_frame_loss": per_frame_loss,
+        "latent_standardized": latent_standardized,
         "context_frames": context_frames,
         "clip_info": clip_info,
     }
@@ -406,12 +567,24 @@ def _show_viewer(
     sampler: _ClipSampler,
     palette_u8: np.ndarray,
     class_weight: torch.Tensor | None,
+    latent_norm: _LatentNormalization | None,
     config: dict,
     device: torch.device,
     args: argparse.Namespace,
 ) -> None:
     rng = np.random.default_rng(args.seed)
-    data = _run_inspection(model, sampler, palette_u8, class_weight, config, device, rng)
+    data = _run_inspection(
+        model,
+        sampler,
+        palette_u8,
+        class_weight,
+        latent_norm,
+        config,
+        device,
+        rng,
+        chunk_frames=args.chunk_frames,
+        chunk_overlap=args.chunk_overlap,
+    )
 
     T = data["T"]
     ctx = data["context_frames"]
@@ -426,9 +599,9 @@ def _show_viewer(
 
     fig = plt.figure(figsize=(fig_w, fig_h))
     gs = fig.add_gridspec(
-        2, 4, width_ratios=[1, 1, 1, 0.04],
+        2, 3,
         wspace=0.08, hspace=0.15,
-        left=0.02, right=0.93, top=0.88, bottom=0.18,
+        left=0.02, right=0.98, top=0.88, bottom=0.18,
     )
 
     ax_tgt = fig.add_subplot(gs[0, 0])
@@ -437,7 +610,6 @@ def _show_viewer(
     ax_conf = fig.add_subplot(gs[1, 0])
     ax_cw = fig.add_subplot(gs[1, 1])
     ax_lat = fig.add_subplot(gs[1, 2])
-    ax_cb = fig.add_subplot(gs[:, 3])
 
     for ax in [ax_tgt, ax_rec, ax_err, ax_conf, ax_cw, ax_lat]:
         ax.set_axis_off()
@@ -448,7 +620,6 @@ def _show_viewer(
     im_err = ax_err.imshow(data["error_rgb"][0], interpolation="nearest")
     im_conf = ax_conf.imshow(data["confidence"][0], interpolation="nearest",
                              cmap="RdYlGn", vmin=0, vmax=1)
-    fig.colorbar(im_conf, cax=ax_cb, label="P(correct)")
 
     if data["weight_map"] is not None:
         cw_vmin = data["weight_map"].min()
@@ -469,9 +640,14 @@ def _show_viewer(
     ax_tgt.set_title("Target", fontsize=9)
     ax_rec.set_title("Recon", fontsize=9)
     ax_err.set_title("Error", fontsize=9)
-    ax_conf.set_title("P(correct)", fontsize=9)
+    ax_conf.set_title("Correct Probability", fontsize=9)
     ax_cw.set_title("Loss Weight", fontsize=9)
-    ax_lat.set_title("Latent μ", fontsize=9)
+    def _latent_panel_title(d: dict) -> str:
+        if d.get("latent_standardized", False):
+            return "Standardized Latent μ (z-score)"
+        return "Raw Latent μ"
+
+    ax_lat.set_title(_latent_panel_title(data), fontsize=9)
 
     state = {"playing": False, "data": data, "frame": 0}
 
@@ -535,8 +711,20 @@ def _show_viewer(
     slider.on_changed(on_slider)
 
     def _resample():
-        d = _run_inspection(model, sampler, palette_u8, class_weight, config, device, rng)
+        d = _run_inspection(
+            model,
+            sampler,
+            palette_u8,
+            class_weight,
+            latent_norm,
+            config,
+            device,
+            rng,
+            chunk_frames=args.chunk_frames,
+            chunk_overlap=args.chunk_overlap,
+        )
         state["data"] = d
+        ax_lat.set_title(_latent_panel_title(d), fontsize=9)
         # Update slider range if clip length changed (unlikely but safe)
         slider.valmax = d["T"]
         slider.set_val(1)
@@ -605,6 +793,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best", action="store_true", help="Load best.pt instead of latest.pt")
     p.add_argument("--data-dir", default="data/normalized", help="Dataset directory (default: data/normalized)")
     p.add_argument("--seed", type=int, default=None, help="Random seed (default: random)")
+    p.add_argument(
+        "--predicted-frames",
+        type=int,
+        default=None,
+        help=(
+            "Number of predicted frames to inspect (default: checkpoint config value). "
+            "Total sampled frames are context_frames + predicted_frames."
+        ),
+    )
+    p.add_argument(
+        "--chunk-frames",
+        type=int,
+        default=64,
+        help="Temporal chunk size used for VAE forward pass (default: 64)",
+    )
+    p.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=8,
+        help="Overlap between temporal chunks in frames (default: 8)",
+    )
     p.add_argument("--fps", type=int, default=8, help="Playback FPS (default: 8)")
     p.add_argument("--scale", type=float, default=3.0, help="Display scale multiplier (default: 3.0)")
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
@@ -649,13 +858,30 @@ def main() -> None:
 
     # Lightweight clip sampler (mmap, no full dataset load)
     context_frames = tcfg.get("context_frames", 0)
-    clip_frames = dcfg["clip_frames"] + context_frames
+    predicted_frames = int(args.predicted_frames) if args.predicted_frames is not None else int(dcfg["clip_frames"])
+    if predicted_frames <= 0:
+        raise SystemExit("--predicted-frames must be > 0")
+    if args.chunk_frames <= 0:
+        raise SystemExit("--chunk-frames must be > 0")
+    if args.chunk_overlap < 0:
+        raise SystemExit("--chunk-overlap must be >= 0")
+    if args.chunk_frames <= 2 * args.chunk_overlap:
+        raise SystemExit("--chunk-frames must be greater than 2 * --chunk-overlap")
+    clip_frames = predicted_frames + context_frames
     frame_size = dcfg.get("frame_height", dcfg.get("frame_size", 224))
-    print(f"  Indexing clips: {args.data_dir}, clip_frames={clip_frames} ({context_frames} context + {dcfg['clip_frames']} predicted), frame_size={frame_size}")
+    print(
+        "  Indexing clips: "
+        f"{args.data_dir}, clip_frames={clip_frames} "
+        f"({context_frames} context + {predicted_frames} predicted), frame_size={frame_size}"
+    )
     sampler = _ClipSampler(args.data_dir, clip_frames=clip_frames, frame_size=frame_size)
     print(f"  {len(sampler._valid_files)} files indexed ({len(sampler.npz_files)} total)")
 
-    _show_viewer(model, sampler, palette_u8, class_weight, config, device, args)
+    latent_norm = _load_latent_normalization(PROJECT_ROOT / "data" / "latents")
+    if latent_norm is not None:
+        print(f"  latent normalization: loaded {latent_norm.stats_path}")
+
+    _show_viewer(model, sampler, palette_u8, class_weight, latent_norm, config, device, args)
 
 
 if __name__ == "__main__":

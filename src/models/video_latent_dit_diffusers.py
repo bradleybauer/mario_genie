@@ -216,7 +216,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        max_frames: int = 64,
+        max_latents: int = 64,
     ) -> None:
         super().__init__()
         if latent_channels <= 0:
@@ -225,12 +225,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError("num_actions must be positive")
         if action_dim <= 0:
             raise ValueError("action_dim must be positive")
-        if max_frames <= 0:
-            raise ValueError("max_frames must be positive")
+        if max_latents <= 0:
+            raise ValueError("max_latents must be positive")
 
         self.latent_channels = latent_channels
         self.num_actions = num_actions
-        self.max_frames = max_frames
+        self.max_latents = max_latents
         self.d_model = d_model
         self.num_heads = num_heads
 
@@ -263,7 +263,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         self.action_to_model = nn.Linear(action_dim, d_model)
 
         self.spatial_coord_proj = nn.Linear(2, d_model)
-        self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, d_model))
+        self.temporal_pos = nn.Parameter(torch.zeros(1, max_latents, d_model))
 
         self.time_proj = Timesteps(
             num_channels=d_model,
@@ -317,12 +317,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         height: int,
         width: int,
         *,
-        start_frame: int,
-        num_frames: int,
+        start_latent: int,
+        num_latents: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
-        temporal = self.temporal_pos[:, start_frame : start_frame + num_frames].to(dtype=dtype)
+        temporal = self.temporal_pos[:, start_latent : start_latent + num_latents].to(dtype=dtype)
         spatial_coords = self._spatial_coords(height, width, device=device, dtype=dtype)
         spatial = self.spatial_coord_proj(spatial_coords)
         positional = spatial.unsqueeze(0).unsqueeze(2) + temporal.unsqueeze(1)
@@ -370,16 +370,16 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError(
                 f"Expected history_latents (B, C, T, H, W), got {tuple(history_latents.shape)}"
             )
-        batch, channels, context_frames, height, width = history_latents.shape
+        batch, channels, context_latents, height, width = history_latents.shape
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
-        if history_actions.shape != (batch, context_frames):
+        if history_actions.shape != (batch, context_latents):
             raise ValueError(
-                f"history_actions must be (B={batch}, context_frames={context_frames}), "
+                f"history_actions must be (B={batch}, context_latents={context_latents}), "
                 f"got {tuple(history_actions.shape)}"
             )
-        if context_frames > self.max_frames:
-            raise ValueError(f"context_frames ({context_frames}) exceeds max_frames ({self.max_frames})")
+        if context_latents > self.max_latents:
+            raise ValueError(f"context_latents ({context_latents}) exceeds max_latents ({self.max_latents})")
 
         self._validate_actions(history_actions)
 
@@ -388,8 +388,8 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         tokens = tokens + self._positional_encoding(
             height,
             width,
-            start_frame=0,
-            num_frames=context_frames,
+            start_latent=0,
+            num_latents=context_latents,
             device=history_latents.device,
             dtype=tokens.dtype,
         )
@@ -407,24 +407,24 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         actions: Tensor,
         timesteps: Tensor,
         encoded_history: Tensor,
-        context_frames: int,
+        context_latents: int,
     ) -> Tensor:
         if noisy_future.ndim != 5:
             raise ValueError(
-                f"Expected noisy_future (B, C, future_frames, H, W), got {tuple(noisy_future.shape)}"
+                f"Expected noisy_future (B, C, future_latents, H, W), got {tuple(noisy_future.shape)}"
             )
-        batch, channels, future_frames, height, width = noisy_future.shape
-        total_frames = context_frames + future_frames
+        batch, channels, future_latents, height, width = noisy_future.shape
+        total_latents = context_latents + future_latents
 
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
-        if actions.shape != (batch, total_frames):
+        if actions.shape != (batch, total_latents):
             raise ValueError(
-                f"actions must be (B={batch}, context+future={total_frames}), "
+                f"actions must be (B={batch}, context+future={total_latents}), "
                 f"got {tuple(actions.shape)}"
             )
-        if total_frames > self.max_frames:
-            raise ValueError(f"total_frames ({total_frames}) exceeds max_frames ({self.max_frames})")
+        if total_latents > self.max_latents:
+            raise ValueError(f"total_latents ({total_latents}) exceeds max_latents ({self.max_latents})")
 
         if timesteps.ndim == 0:
             timesteps = timesteps.unsqueeze(0)
@@ -442,8 +442,8 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         tokens = tokens + self._positional_encoding(
             height,
             width,
-            start_frame=context_frames,
-            num_frames=future_frames,
+            start_latent=context_latents,
+            num_latents=future_latents,
             device=noisy_future.device,
             dtype=tokens.dtype,
         )
@@ -451,12 +451,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         action_tokens = self._encode_actions(actions, dtype=tokens.dtype)
         spatial_tokens = height * width
         query_steps_abs = (
-            torch.arange(future_frames, device=noisy_future.device).repeat(spatial_tokens)
-            + context_frames
+            torch.arange(future_latents, device=noisy_future.device).repeat(spatial_tokens)
+            + context_latents
         )
         action_mask = self._causal_action_mask(
             query_absolute_steps=query_steps_abs,
-            num_action_steps=total_frames,
+            num_action_steps=total_latents,
             device=noisy_future.device,
         )
         action_bias = self._to_attention_bias(
@@ -485,27 +485,27 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         tokens = tokens * (1.0 + scale) + shift
 
         pred = self.output_proj(tokens)
-        return rearrange(pred, "b (h w t) c -> b c t h w", h=height, w=width, t=future_frames)
+        return rearrange(pred, "b (h w t) c -> b c t h w", h=height, w=width, t=future_latents)
 
     def forward(
         self,
         latents: Tensor,
         actions: Tensor,
         timesteps: Tensor,
-        context_frames: int,
+        context_latents: int,
     ) -> Tensor:
         if latents.ndim != 5:
             raise ValueError(f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}")
         if actions.ndim != 2:
             raise ValueError(f"Expected actions (B, T), got {tuple(actions.shape)}")
-        _, _, total_frames, _, _ = latents.shape
-        if context_frames < 1 or context_frames >= total_frames:
+        _, _, total_latents, _, _ = latents.shape
+        if context_latents < 1 or context_latents >= total_latents:
             raise ValueError(
-                f"context_frames must be in [1, T-1], got {context_frames} with T={total_frames}"
+                f"context_latents must be in [1, T-1], got {context_latents} with T={total_latents}"
             )
 
-        clean_history = latents[:, :, :context_frames]
-        noisy_future = latents[:, :, context_frames:]
+        clean_history = latents[:, :, :context_latents]
+        noisy_future = latents[:, :, context_latents:]
 
-        encoded_history = self.encode_history(clean_history, actions[:, :context_frames])
-        return self.decode_future(noisy_future, actions, timesteps, encoded_history, context_frames)
+        encoded_history = self.encode_history(clean_history, actions[:, :context_latents])
+        return self.decode_future(noisy_future, actions, timesteps, encoded_history, context_latents)
