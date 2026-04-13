@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Train VideoLatentDiT (Diffusers backend) with Accelerate.
+"""Train VideoLatentDiTUnified (bidirectional, Matrix-Game style) with Accelerate.
+
+Same training flow as the encoder-decoder DiT trainer, but uses a unified
+bidirectional architecture where history and noisy future tokens are processed
+jointly in a single self-attention stack.
 
 - Accelerator replaces manual torch.autocast / GradScaler boilerplate.
     Pass --mixed-precision bf16 (default), fp16, or no.
 - Single .pt checkpoint files (best.pt / latest.pt) containing model,
-    optimizer, scheduler, and metadata — matching the video VAE convention.
-- Optional shifted logit-normal timestep sampler (--timestep-sampler logit_normal)
-    concentrates training on mid-range noise levels, which improves sample quality.
+    optimizer, scheduler, and metadata.
+- Optional shifted logit-normal timestep sampler (--timestep-sampler logit_normal).
 """
 
 from __future__ import annotations
@@ -43,14 +46,13 @@ from src.data.latent_dataset import LatentSequenceDataset
 from src.data.normalized_dataset import load_palette_tensor
 from src.models.latent_utils import (
     LatentNormalization,
-    denoise_future_segment as _denoise_future_segment,
     is_readable as _is_readable,
     load_json as _load_json,
     load_latent_normalization,
     load_latent_stats_path as _load_latent_stats_path,
     load_video_vae,
 )
-from src.models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
+from src.models.video_latent_dit_unified import VideoLatentDiTUnified
 from src.path_utils import resolve_workspace_path
 from src.system_info import collect_system_info, print_system_info
 from src.training.trainer_common import (
@@ -92,10 +94,7 @@ class UniformTimestepSampler:
 
 
 class LogitNormalTimestepSampler:
-    """Shifted logit-normal sampler that concentrates on mid-range noise levels.
-
-    Ported from LTX-2/packages/ltx-trainer/src/ltx_trainer/timestep_samplers.py.
-    """
+    """Shifted logit-normal sampler that concentrates on mid-range noise levels."""
 
     def __init__(self, std: float = 1.0, eps: float = 1e-3, uniform_prob: float = 0.1) -> None:
         self.std = std
@@ -124,7 +123,7 @@ class LogitNormalTimestepSampler:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train VideoLatentDiT with Accelerate.")
+    parser = argparse.ArgumentParser(description="Train unified bidirectional VideoLatentDiT with Accelerate.")
     parser.add_argument("--data-dir", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -149,10 +148,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--action-dim", type=int, default=32)
-    parser.add_argument("--num-layers", type=int, default=6,
-                        help="Sets encoder and decoder layers to half this value each.")
-    parser.add_argument("--num-encoder-layers", type=int, default=None)
-    parser.add_argument("--num-decoder-layers", type=int, default=None)
+    parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -202,16 +198,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-latents must be smaller than --clip-latents")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient-accumulation-steps must be >= 1")
-
-    default_half = (args.num_layers // 2)
-    if args.num_encoder_layers is None:
-        args.num_encoder_layers = default_half
-    if args.num_decoder_layers is None:
-        args.num_decoder_layers = default_half
-    if args.num_encoder_layers <= 0:
-        parser.error("--num-encoder-layers must be > 0")
-    if args.num_decoder_layers <= 0:
-        parser.error("--num-decoder-layers must be > 0")
+    if args.num_layers <= 0:
+        parser.error("--num-layers must be > 0")
 
     return args
 
@@ -288,12 +276,12 @@ def compute_flow_loss(
     return F.smooth_l1_loss(pred, target, beta=huber_delta)
 
 
-def build_video_latent_dit(*, model_config: dict) -> torch.nn.Module:
-    return VideoLatentDiTDiffusers(**model_config)
+def build_unified_dit(*, model_config: dict) -> torch.nn.Module:
+    return VideoLatentDiTUnified(**model_config)
 
 
 # ---------------------------------------------------------------------------
-# Residual error buffer (unchanged from original)
+# Residual error buffer
 # ---------------------------------------------------------------------------
 
 class ResidualErrorBuffer:
@@ -338,7 +326,7 @@ class ResidualErrorBuffer:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint save / load (safetensors + JSON config)
+# Checkpoint save / load
 # ---------------------------------------------------------------------------
 
 def save_training_state(
@@ -366,8 +354,42 @@ def save_training_state(
 
 
 # ---------------------------------------------------------------------------
-# Inference utilities
+# Inference utilities (unified — no cached encoding)
 # ---------------------------------------------------------------------------
+
+def denoise_future_segment_unified(
+    model: torch.nn.Module,
+    *,
+    history_latents: torch.Tensor,
+    actions: torch.Tensor,
+    future_latents: int,
+    ode_steps: int,
+    autocast_ctx=None,
+) -> torch.Tensor:
+    """Denoise future latents via midpoint ODE integration (unified model).
+
+    Unlike the encoder-decoder variant, history is reprocessed at every ODE
+    step since the unified model has no separate encoding pass.
+    """
+    batch, channels, ctx, height, width = history_latents.shape
+    future = torch.randn(
+        batch, channels, future_latents, height, width,
+        device=history_latents.device, dtype=history_latents.dtype,
+    )
+
+    dt = 1.0 / float(ode_steps)
+    for step in range(ode_steps, 0, -1):
+        t_val = (step - 0.5) / float(ode_steps)
+        t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
+        model_input = torch.cat((history_latents, future), dim=2)
+        if autocast_ctx is not None:
+            with autocast_ctx():
+                velocity = model(model_input, actions, t, ctx)
+        else:
+            velocity = model(model_input, actions, t, ctx)
+        future = future - dt * velocity
+    return future
+
 
 def denoise_future_segment(
     model: torch.nn.Module,
@@ -378,7 +400,7 @@ def denoise_future_segment(
     ode_steps: int,
     accelerator: Accelerator,
 ) -> torch.Tensor:
-    return _denoise_future_segment(
+    return denoise_future_segment_unified(
         accelerator.unwrap_model(model),
         history_latents=history_latents,
         actions=actions,
@@ -400,13 +422,7 @@ def autoregressive_rollout(
     ode_steps: int,
     accelerator: Accelerator,
 ) -> torch.Tensor:
-    """Autoregressively roll out latent timesteps.
-
-    *seed_latents* provides the initial ``context_latents`` of real data.
-    At each step, the last ``context_latents`` generated latents become the
-    new history and ``future_latents`` are predicted via ODE integration.
-    *all_actions* must cover ``total_latents``.
-    """
+    """Autoregressively roll out latent timesteps."""
     generated = seed_latents  # (B, C, context_latents, H, W)
     while generated.shape[2] < total_latents:
         generated_latent_count = generated.shape[2]
@@ -461,16 +477,11 @@ def save_rollout_preview(
     frames_pred: torch.Tensor,
     palette: torch.Tensor,
 ) -> None:
-    """Save a rollout preview: GT (left column) and prediction (right column).
-
-    Each row shows one predicted timestep with ground truth on the left and
-    the model's prediction on the right.  GT timesteps beyond the available
-    length are rendered as dark-gray placeholders.
-    """
+    """Save a rollout preview: GT (left column) and prediction (right column)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     pal = (palette.detach().cpu().clamp(0, 1).numpy() * 255).astype(np.uint8)
-    gt = pal[frames_gt.cpu().numpy()]        # (T_gt, H, W, 3)
-    pred = pal[frames_pred.cpu().numpy()]    # (T, H, W, 3)
+    gt = pal[frames_gt.cpu().numpy()]
+    pred = pal[frames_pred.cpu().numpy()]
     T = pred.shape[0]
     T_gt = gt.shape[0]
     H, W = pred.shape[1], pred.shape[2]
@@ -500,8 +511,6 @@ def evaluate(
     latent_normalization: LatentNormalization | None,
     t_sampler: UniformTimestepSampler | LogitNormalTimestepSampler,
 ) -> dict[str, float]:
-    # Unwrap to avoid DDP collective ops (broadcast_buffers) that would
-    # deadlock when only rank 0 runs evaluation.
     raw_model = accelerator.unwrap_model(model)
     raw_model.eval()
     flow_losses: list[float] = []
@@ -547,7 +556,7 @@ def main() -> None:
         output_dir=args.output_dir,
         resume_from=args.resume_from,
         run_name=args.run_name,
-        default_prefix="video_latent_dit",
+        default_prefix="unified_dit",
         resume_parent=False,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -735,24 +744,19 @@ def main() -> None:
         action_dim=args.action_dim,
         action_values=action_values,
         d_model=args.d_model,
-        num_encoder_layers=args.num_encoder_layers,
-        num_decoder_layers=args.num_decoder_layers,
+        num_layers=args.num_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
         max_latents=args.clip_latents,
     )
-    model: torch.nn.Module = build_video_latent_dit(model_config=model_config).to(device)
+    model: torch.nn.Module = build_unified_dit(model_config=model_config).to(device)
     diffusers_version = str(diffusers.__version__)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if accelerator.is_main_process:
-        console.print(f"[model] backend=diffusers diffusers={diffusers_version}")
+        console.print(f"[model] unified bidirectional DiT, diffusers={diffusers_version}")
         console.print(f"[model] {num_params:,} trainable parameters")
 
-    # Compilation strategy:
-    # - Single-GPU: compile here before accelerator.prepare().
-    # - Multi-GPU: skip manual compile; use `accelerate launch --dynamo_backend inductor`
-    #   which applies torch.compile during accelerator.prepare() in the correct DDP order.
     do_compile = args.compile and accelerator.num_processes == 1
     if args.compile and accelerator.num_processes > 1 and accelerator.is_main_process:
         console.print(
@@ -782,10 +786,6 @@ def main() -> None:
     # ------------------------------------------------------------------
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
-    # Disable buffer broadcasting — the only buffer (action_bit_lut) is a
-    # constant lookup table identical on every rank.  DDP broadcasts buffers
-    # on each forward pass, which causes NCCL deadlocks when rank-0-only
-    # code (eval/checkpoint) runs between forward calls.
     if hasattr(model, "broadcast_buffers"):
         model.broadcast_buffers = False
 
@@ -832,7 +832,7 @@ def main() -> None:
         save_json(
             output_dir / "config.json",
             build_trainer_config(
-                model_name="video_latent_dit",
+                model_name="unified_dit",
                 args=args,
                 device=device,
                 mixed_precision=args.mixed_precision,
@@ -869,23 +869,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     def _component_gnorms(raw_model: torch.nn.Module) -> dict[str, float]:
         groups: dict[str, list[torch.Tensor]] = {
-            "enc_attn": [
-                p for b in raw_model.encoder_blocks
+            "blk_attn": [
+                p for b in raw_model.blocks
                 for name, p in b.named_parameters()
                 if "attn" in name and p.grad is not None
             ],
-            "dec_attn": [
-                p for b in raw_model.decoder_blocks
-                for name, p in b.named_parameters()
-                if "attn" in name and p.grad is not None
-            ],
-            "enc_mlp": [
-                p for b in raw_model.encoder_blocks
-                for name, p in b.named_parameters()
-                if "mlp" in name and p.grad is not None
-            ],
-            "dec_mlp": [
-                p for b in raw_model.decoder_blocks
+            "blk_mlp": [
+                p for b in raw_model.blocks
                 for name, p in b.named_parameters()
                 if "mlp" in name and p.grad is not None
             ],
@@ -899,7 +889,6 @@ def main() -> None:
 
     train_iter = infinite_batches(train_loader)
 
-    # Identify episodes long enough for a full rollout preview.
     _preview_length = args.context_latents + args.preview_rollout_latents
     _preview_eligible = [
         (fi, lc) for fi, lc in enumerate(dataset.latent_counts)
@@ -1040,15 +1029,12 @@ def main() -> None:
                     v_pred_norm = vp.norm(dim=1).mean().item()
                     v_target_norm = vt.norm(dim=1).mean().item()
 
-                    # x0 reconstruction MSE (same formula as eval)
                     x0_mse = F.mse_loss(accum_eps.detach().float() - vp, accum_future.detach().float()).item()
 
-                    # Cosine similarity between predicted and target velocity
                     vp_flat = vp.flatten(start_dim=1)
                     vt_flat = vt.flatten(start_dim=1)
                     cos_sim = F.cosine_similarity(vp_flat, vt_flat, dim=1).mean().item()
 
-                    # Loss stratified by timestep third (early/mid/late)
                     t_vals = accum_t.detach().float()
                     loss_per_sample = (vp - vt).pow(2).flatten(start_dim=1).mean(dim=1)
                     t_low = t_vals < 1.0 / 3.0

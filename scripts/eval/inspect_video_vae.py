@@ -22,7 +22,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import json
 import sys
 from contextlib import nullcontext
@@ -47,6 +46,7 @@ apply_plot_style()
 from src.data.dataset_index import load_index
 from src.data.normalized_dataset import load_palette_tensor
 from src.data.video_frames import resize_palette_frames
+from src.models.latent_utils import LatentNormalization, load_json, load_latent_normalization
 from src.models.video_vae import VideoVAE
 from src.training.losses import (
     focal_cross_entropy,
@@ -80,61 +80,26 @@ def _load_config(checkpoint_dir: Path) -> dict:
         return json.load(f)
 
 
-@dataclass
-class _LatentNormalization:
-    mean: torch.Tensor  # (Z, 1, H, W)
-    std: torch.Tensor   # (Z, 1, H, W)
-    stats_path: Path
-    warned_shape_mismatch: bool = False
-
-
-def _load_latent_normalization(latents_dir: Path) -> _LatentNormalization | None:
+def _load_latent_normalization(latents_dir: Path, device: torch.device = torch.device("cpu")) -> LatentNormalization | None:
     stats_path = latents_dir / "latent_stats.json"
     if not stats_path.is_file():
         return None
     try:
-        with stats_path.open() as f:
-            stats = json.load(f)
-
-        version = int(stats.get("latent_stats_version"))
-        if version != 2:
-            print(f"  latent normalization: skipping {stats_path} (unsupported latent_stats_version={version})")
-            return None
-
-        scheme = stats.get("normalization_scheme")
-        if scheme != "component_chw_shared_time":
-            print(
-                "  latent normalization: "
-                f"skipping {stats_path} (unsupported normalization_scheme={scheme!r})"
-            )
-            return None
-
+        stats = load_json(stats_path)
         mean_v = stats.get("component_mean")
-        std_v = stats.get("component_std_clamped")
-        if mean_v is None or std_v is None:
-            print(
-                "  latent normalization: "
-                f"skipping {stats_path} (missing component_mean/component_std_clamped)"
-            )
+        if mean_v is None:
+            print(f"  latent normalization: skipping {stats_path} (missing component_mean)")
             return None
-
-        mean_np = np.asarray(mean_v, dtype=np.float32)
-        std_np = np.asarray(std_v, dtype=np.float32)
-        if mean_np.ndim != 3 or std_np.shape != mean_np.shape:
-            print(
-                "  latent normalization: "
-                f"skipping {stats_path} (invalid shapes mean={mean_np.shape}, std={std_np.shape})"
-            )
+        shape = np.asarray(mean_v, dtype=np.float32).shape
+        if len(shape) != 3:
+            print(f"  latent normalization: skipping {stats_path} (invalid mean shape {shape})")
             return None
-
-        eps = max(float(stats.get("std_epsilon", 1e-6)), 1e-6)
-        std_np = np.nan_to_num(std_np, nan=eps, posinf=eps, neginf=eps)
-        std_np = np.maximum(std_np, eps)
-
-        return _LatentNormalization(
-            mean=torch.from_numpy(mean_np).unsqueeze(1),
-            std=torch.from_numpy(std_np).unsqueeze(1),
+        return load_latent_normalization(
             stats_path=stats_path,
+            latent_channels=shape[0],
+            latent_height=shape[1],
+            latent_width=shape[2],
+            device=device,
         )
     except Exception as exc:
         print(f"  latent normalization: failed to load {stats_path}: {exc}")
@@ -418,7 +383,7 @@ def _run_inspection(
     sampler: _ClipSampler,
     palette_u8: np.ndarray,
     class_weight: torch.Tensor | None,
-    latent_norm: _LatentNormalization | None,
+    latent_norm: LatentNormalization | None,
     config: dict,
     device: torch.device,
     rng: np.random.Generator,
@@ -459,18 +424,20 @@ def _run_inspection(
     latent_standardized = False
 
     if latent_norm is not None:
+        # latent_norm.mean is (1, Z, 1, H, W); squeeze to (Z, 1, H, W) for broadcasting
+        norm_mean = latent_norm.mean[0]   # (Z, 1, H, W)
+        norm_std = latent_norm.std[0]     # (Z, 1, H, W)
         latent_shape = (latent_mean.shape[0], latent_mean.shape[2], latent_mean.shape[3])
-        stats_shape = (latent_norm.mean.shape[0], latent_norm.mean.shape[2], latent_norm.mean.shape[3])
+        stats_shape = (norm_mean.shape[0], norm_mean.shape[2], norm_mean.shape[3])
         if latent_shape == stats_shape:
-            latent_mean = (latent_mean - latent_norm.mean) / latent_norm.std
+            latent_mean = (latent_mean - norm_mean) / norm_std
             latent_standardized = True
-        elif not latent_norm.warned_shape_mismatch:
+        else:
             print(
                 "  latent normalization: shape mismatch; "
                 f"model latent (Z,H,W)={latent_shape} vs stats={stats_shape} from {latent_norm.stats_path}. "
                 "Using raw latent means."
             )
-            latent_norm.warned_shape_mismatch = True
 
     # RGB arrays
     target_rgb = palette_u8[frames_cpu.numpy()]  # (T, H, W, 3)
@@ -567,7 +534,7 @@ def _show_viewer(
     sampler: _ClipSampler,
     palette_u8: np.ndarray,
     class_weight: torch.Tensor | None,
-    latent_norm: _LatentNormalization | None,
+    latent_norm: LatentNormalization | None,
     config: dict,
     device: torch.device,
     args: argparse.Namespace,

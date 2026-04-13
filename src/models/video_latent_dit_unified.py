@@ -1,3 +1,11 @@
+"""Unified bidirectional video-latent DiT for flow-matching future prediction.
+
+Matrix-Game 3.0 style: history and noisy future tokens are concatenated
+into a single sequence and processed jointly via self-attention.  This
+removes the encoder-decoder information bottleneck at the cost of
+reprocessing history at every ODE step during inference.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -42,13 +50,8 @@ def _init_zero_ff_out(ff: FeedForward) -> None:
             nn.init.zeros_(final_linear.bias)
 
 
-class UnifiedDiffusersBlock(nn.Module):
-    """Single-stack DiT block over full clip tokens.
-
-    The block performs bidirectional self-attention across all spatiotemporal
-    tokens, then causal action cross-attention, followed by a timestep-
-    conditioned MLP.
-    """
+class UnifiedDiTBlock(nn.Module):
+    """Bidirectional block: all tokens (history + noisy future) share self-attention."""
 
     def __init__(
         self,
@@ -64,6 +67,7 @@ class UnifiedDiffusersBlock(nn.Module):
 
         head_dim = d_model // num_heads
         hidden_dim = int(d_model * mlp_ratio)
+
         self.norm1 = AdaLayerNorm(d_model)
         self.self_attn = Attention(
             query_dim=d_model,
@@ -72,7 +76,9 @@ class UnifiedDiffusersBlock(nn.Module):
             dropout=dropout,
             bias=True,
             out_bias=True,
+            qk_norm="rms_norm",
         )
+
         self.norm2 = nn.LayerNorm(d_model)
         self.action_cross_attn = Attention(
             query_dim=d_model,
@@ -84,6 +90,7 @@ class UnifiedDiffusersBlock(nn.Module):
             out_bias=True,
             qk_norm="rms_norm",
         )
+
         self.norm3 = AdaLayerNorm(d_model)
         self.mlp = FeedForward(d_model, inner_dim=hidden_dim, dropout=dropout)
 
@@ -97,7 +104,7 @@ class UnifiedDiffusersBlock(nn.Module):
         *,
         action_tokens: Tensor,
         cond: Tensor,
-        action_attn_bias: Tensor | None,
+        action_attn_mask: Tensor | None,
     ) -> Tensor:
         h = self.norm1(tokens, cond)
         tokens = tokens + self.self_attn(h)
@@ -106,7 +113,7 @@ class UnifiedDiffusersBlock(nn.Module):
         tokens = tokens + self.action_cross_attn(
             q,
             encoder_hidden_states=action_tokens,
-            attention_mask=action_attn_bias,
+            attention_mask=action_attn_mask,
         )
 
         tokens = tokens + self.mlp(self.norm3(tokens, cond))
@@ -114,17 +121,11 @@ class UnifiedDiffusersBlock(nn.Module):
 
 
 class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
-    """Unsplit video-latent DiT for flow-matching future prediction.
+    """Unified bidirectional video-latent DiT for flow-matching future prediction.
 
-    Unlike the encoder/decoder variant, this model processes clean history and
-    noisy future tokens together in one bidirectional transformer stack.
-
-    forward() interface:
-        latents        : (B, C, T, H, W)  clean history + noisy future
-        actions        : (B, T)
-        timesteps      : (B,)
-        context_frames : int
-        returns        : (B, C, future_frames, H, W)
+    History and noisy future tokens are concatenated and processed jointly
+    through a single stack of self-attention blocks.  The loss target covers
+    only the future portion of the output.
     """
 
     @register_to_config
@@ -136,11 +137,11 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
         action_dim: int = 32,
         action_values: list[int] | None = None,
         d_model: int = 512,
-        num_layers: int = 12,
+        num_layers: int = 6,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
-        max_frames: int = 64,
+        max_latents: int = 64,
     ) -> None:
         super().__init__()
         if latent_channels <= 0:
@@ -149,16 +150,13 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
             raise ValueError("num_actions must be positive")
         if action_dim <= 0:
             raise ValueError("action_dim must be positive")
-        if num_layers <= 0:
-            raise ValueError("num_layers must be positive")
-        if max_frames <= 0:
-            raise ValueError("max_frames must be positive")
+        if max_latents <= 0:
+            raise ValueError("max_latents must be positive")
 
         self.latent_channels = latent_channels
         self.num_actions = num_actions
-        self.max_frames = max_frames
+        self.max_latents = max_latents
         self.d_model = d_model
-        self.action_dim = action_dim
         self.num_heads = num_heads
 
         self.input_proj = nn.Linear(latent_channels, d_model)
@@ -188,8 +186,9 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
             nn.SiLU(),
         )
         self.action_to_model = nn.Linear(action_dim, d_model)
+
         self.spatial_coord_proj = nn.Linear(2, d_model)
-        self.temporal_pos = nn.Parameter(torch.zeros(1, max_frames, d_model))
+        self.temporal_pos = nn.Parameter(torch.zeros(1, max_latents, d_model))
 
         self.time_proj = Timesteps(
             num_channels=d_model,
@@ -204,7 +203,7 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
 
         self.blocks = nn.ModuleList(
             [
-                UnifiedDiffusersBlock(
+                UnifiedDiTBlock(
                     d_model=d_model,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -220,7 +219,9 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
         nn.init.zeros_(self.final_mod.bias)
 
     @staticmethod
-    def _spatial_coords(height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    def _spatial_coords(
+        height: int, width: int, *, device: torch.device, dtype: torch.dtype
+    ) -> Tensor:
         ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
         xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
         grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
@@ -231,11 +232,12 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
         height: int,
         width: int,
         *,
-        num_frames: int,
+        start_latent: int,
+        num_latents: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Tensor:
-        temporal = self.temporal_pos[:, :num_frames].to(dtype=dtype)
+        temporal = self.temporal_pos[:, start_latent : start_latent + num_latents].to(dtype=dtype)
         spatial_coords = self._spatial_coords(height, width, device=device, dtype=dtype)
         spatial = self.spatial_coord_proj(spatial_coords)
         positional = spatial.unsqueeze(0).unsqueeze(2) + temporal.unsqueeze(1)
@@ -282,26 +284,49 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
         latents: Tensor,
         actions: Tensor,
         timesteps: Tensor,
-        context_frames: int,
+        context_latents: int,
     ) -> Tensor:
+        """Forward pass through the unified bidirectional DiT.
+
+        Parameters
+        ----------
+        latents:
+            ``(B, C, T, H, W)`` — concatenation of clean history and noisy
+            future latents along the temporal dimension.
+        actions:
+            ``(B, T)`` — action indices for all ``T`` timesteps.
+        timesteps:
+            ``(B,)`` — diffusion timestep for the future portion.
+        context_latents:
+            Number of leading temporal positions that are clean history.
+
+        Returns
+        -------
+        Tensor of shape ``(B, C, future_T, H, W)`` — velocity prediction
+        for the future portion only.
+        """
         if latents.ndim != 5:
             raise ValueError(f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}")
         if actions.ndim != 2:
             raise ValueError(f"Expected actions (B, T), got {tuple(actions.shape)}")
 
-        batch, channels, total_frames, height, width = latents.shape
+        batch, channels, total_latents, height, width = latents.shape
+        future_latents = total_latents - context_latents
+
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
-        if actions.shape != (batch, total_frames):
+        if context_latents < 1 or context_latents >= total_latents:
             raise ValueError(
-                f"actions must be (B={batch}, T={total_frames}), got {tuple(actions.shape)}"
+                f"context_latents must be in [1, T-1], got {context_latents} with T={total_latents}"
             )
-        if context_frames < 1 or context_frames >= total_frames:
+        if actions.shape != (batch, total_latents):
             raise ValueError(
-                f"context_frames must be in [1, T-1], got {context_frames} with T={total_frames}"
+                f"actions must be (B={batch}, T={total_latents}), got {tuple(actions.shape)}"
             )
-        if total_frames > self.max_frames:
-            raise ValueError(f"total_frames ({total_frames}) exceeds max_frames ({self.max_frames})")
+        if total_latents > self.max_latents:
+            raise ValueError(
+                f"total_latents ({total_latents}) exceeds max_latents ({self.max_latents})"
+            )
 
         if timesteps.ndim == 0:
             timesteps = timesteps.unsqueeze(0)
@@ -314,22 +339,27 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
 
         self._validate_actions(actions)
 
+        # Project all latents (history + noisy future) into token space.
         tokens = rearrange(latents, "b c t h w -> b (h w t) c")
         tokens = self.input_proj(tokens)
         tokens = tokens + self._positional_encoding(
             height,
             width,
-            num_frames=total_frames,
+            start_latent=0,
+            num_latents=total_latents,
             device=latents.device,
             dtype=tokens.dtype,
         )
 
+        # Action tokens and causal mask for all timesteps.
         action_tokens = self._encode_actions(actions, dtype=tokens.dtype)
         spatial_tokens = height * width
-        query_steps_abs = torch.arange(total_frames, device=latents.device).repeat(spatial_tokens)
+        query_steps_abs = torch.arange(
+            total_latents, device=latents.device
+        ).repeat(spatial_tokens)
         action_mask = self._causal_action_mask(
             query_absolute_steps=query_steps_abs,
-            num_action_steps=total_frames,
+            num_action_steps=total_latents,
             device=latents.device,
         )
         action_bias = self._to_attention_bias(
@@ -340,22 +370,28 @@ class VideoLatentDiTUnified(ModelMixin, ConfigMixin):
             dtype=tokens.dtype,
         )
 
-        t_proj = self.time_proj(timesteps.float()).to(device=latents.device, dtype=tokens.dtype)
+        # Timestep conditioning.
+        t_proj = self.time_proj(timesteps.float()).to(
+            device=latents.device, dtype=tokens.dtype
+        )
         cond = self.time_embedding(t_proj).to(dtype=tokens.dtype)
 
+        # Process all tokens jointly through the unified stack.
         for block in self.blocks:
             tokens = block(
                 tokens,
                 action_tokens=action_tokens,
                 cond=cond,
-                action_attn_bias=action_bias,
+                action_attn_mask=action_bias,
             )
 
+        # Final modulated norm + output projection.
         tokens = self.final_norm(tokens)
         shift_scale = self.final_mod(cond).unsqueeze(1)
         shift, scale = shift_scale.chunk(2, dim=-1)
         tokens = tokens * (1.0 + scale) + shift
-
         pred = self.output_proj(tokens)
-        pred = rearrange(pred, "b (h w t) c -> b c t h w", h=height, w=width, t=total_frames)
-        return pred[:, :, context_frames:]
+
+        # Reshape back and return only the future portion.
+        pred = rearrange(pred, "b (h w t) c -> b c t h w", h=height, w=width, t=total_latents)
+        return pred[:, :, context_latents:]

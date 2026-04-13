@@ -59,6 +59,8 @@ build a 'curriculum'?
 
 smooth delta weight, reduce class weight, increase focal loss, use p(correct) map?
 
+fix video vae train/inferemce mismatch when used in dit training.
+
 
 
 

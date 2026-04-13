@@ -53,9 +53,13 @@ def load_metrics(checkpoint_dir: str, strict: bool = True) -> tuple[list[dict], 
 
 
 HW_METRICS = {"gpu_mem_pct", "samples_per_sec", "steps_per_sec", "throughput_mb_per_sec"}
-ALWAYS_SKIP = {"type", "step", "frame_size"}
+ALWAYS_SKIP = {"type", "step", "frame_size", "elapsed_s", "error_buffer_size"}
 LOG_SCALE_PATTERNS = {"loss", "kl", "grad_norm"}
 MODEL_COLOR_PALETTE = list(plt.get_cmap("tab20").colors)
+
+
+def _is_numeric_metric_value(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _is_lr_metric(name: str) -> bool:
@@ -120,11 +124,16 @@ def _discover_metrics(
         if not show_lr and _is_lr_metric(name):
             continue
         for entries in all_entries:
-            sample = next((m[name] for m in entries if name in m), None)
-            if isinstance(sample, (int, float)):
+            sample = next((m[name] for m in entries if name in m and _is_numeric_metric_value(m[name])), None)
+            if _is_numeric_metric_value(sample):
                 numeric.append(name)
                 break
     return numeric
+
+
+def _numeric_series(entries: list[dict], name: str) -> tuple[list[int], list[float]]:
+    points = [(m["step"], m[name]) for m in entries if name in m and _is_numeric_metric_value(m[name])]
+    return [step for step, _ in points], [value for _, value in points]
 
 
 def _smooth(vals: list[float], window: int, passes: int = 1) -> list[float]:
@@ -173,22 +182,22 @@ def plot_metrics(
     for idx, name in enumerate(numeric_metrics):
         ax = axes[idx // cols][idx % cols]
 
-        train_steps = [m["step"] for m in train if name in m]
-        train_vals = [m[name] for m in train if name in m]
+        train_steps, train_vals = _numeric_series(train, name)
 
         if train_steps:
-            ax.plot(train_steps, train_vals, alpha=0.3, color=run_color, linewidth=0.8, label="train")
             if smooth > 1 and len(train_vals) >= smooth:
+                ax.plot(train_steps, train_vals, alpha=0.3, color=run_color, linewidth=0.8)
                 ax.plot(
                     train_steps,
                     _smooth(train_vals, smooth, smooth_passes),
                     color=run_color,
                     linewidth=1.5,
-                    label=f"train (smooth={smooth}, passes={smooth_passes})",
+                    label="train",
                 )
+            else:
+                ax.plot(train_steps, train_vals, color=run_color, linewidth=1.5, label="train")
 
-        eval_steps = [m["step"] for m in evals if name in m]
-        eval_vals = [m[name] for m in evals if name in m]
+        eval_steps, eval_vals = _numeric_series(evals, name)
         if eval_steps:
             ax.plot(eval_steps, eval_vals, color=run_color, linewidth=2, marker="o", markersize=4, linestyle="--", label="eval")
 
@@ -243,8 +252,7 @@ def plot_compare(
             train = all_train[run_idx]
             evals = all_evals[run_idx]
 
-            train_steps = [m["step"] for m in train if name in m]
-            train_vals = [m[name] for m in train if name in m]
+            train_steps, train_vals = _numeric_series(train, name)
 
             if train_steps:
                 ax.plot(train_steps, train_vals, alpha=0.15, color=color, linewidth=0.6)
@@ -259,8 +267,7 @@ def plot_compare(
                 else:
                     ax.plot(train_steps, train_vals, color=color, linewidth=1.5, label=label)
 
-            eval_steps = [m["step"] for m in evals if name in m]
-            eval_vals = [m[name] for m in evals if name in m]
+            eval_steps, eval_vals = _numeric_series(evals, name)
             if eval_steps:
                 ax.plot(eval_steps, eval_vals, color=color, linewidth=2, marker="o", markersize=4, linestyle="--", label=f"{label} (eval)")
 

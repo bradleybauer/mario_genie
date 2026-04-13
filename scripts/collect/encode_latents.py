@@ -39,6 +39,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.models.video_vae import VideoVAE
+from src.models.latent_utils import load_json
 from src.data.video_frames import SUPPORTED_FRAME_SIZES, resize_palette_frames
 from src.path_utils import serialize_project_path
 
@@ -87,11 +88,6 @@ def parse_args() -> argparse.Namespace:
     if not args.stats_only and not args.video_vae_checkpoint:
         parser.error("--video-vae-checkpoint is required unless --stats-only is set")
     return args
-
-
-def load_json(path: Path) -> dict:
-    with path.open() as f:
-        return json.load(f)
 
 
 def infer_vae_config_path(args: argparse.Namespace) -> Path:

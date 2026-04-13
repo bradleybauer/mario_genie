@@ -18,6 +18,7 @@ import random
 import sys
 from pathlib import Path
 
+import matplotlib.cm as _cm
 import numpy as np
 import pygame
 import torch
@@ -48,6 +49,49 @@ from scripts.eval.play_nes import GamepadController
 # ---------------------------------------------------------------------------
 DEFAULT_SCALE = 3
 DEFAULT_ODE_STEPS = 8
+
+
+# ---------------------------------------------------------------------------
+# Latent visualization helpers
+# ---------------------------------------------------------------------------
+
+def _latent_channel_grid(latent: np.ndarray, sep: int = 1) -> np.ndarray:
+    """Arrange (C, H, W) latent channels into a rectangular grid image.
+
+    *sep* pixels of NaN are inserted between channels so that the colormap
+    renders them as a visible separator line.
+    """
+    C, H, W = latent.shape
+    cols = 8
+    rows = (C + cols - 1) // cols
+    pad = rows * cols - C
+    if pad > 0:
+        latent = np.concatenate([latent, np.full((pad, H, W), np.nan, dtype=latent.dtype)], axis=0)
+    latent = latent.reshape(rows, cols, H, W)
+    cell_h = H + sep
+    cell_w = W + sep
+    grid = np.full((rows * cell_h - sep, cols * cell_w - sep), np.nan, dtype=latent.dtype)
+    for r in range(rows):
+        for c in range(cols):
+            y = r * cell_h
+            x = c * cell_w
+            grid[y:y + H, x:x + W] = latent[r, c]
+    return grid
+
+
+def _latent_grid_to_surface(latent: np.ndarray, target_height: int) -> pygame.Surface:
+    """Render a (C, H, W) latent as a colormapped pygame surface scaled to *target_height*."""
+    grid = _latent_channel_grid(latent)
+    normalized = np.clip((grid + 3.0) / 6.0, 0.0, 1.0)
+    cmap = _cm.get_cmap("coolwarm")
+    rgba = cmap(normalized)
+    rgb = (rgba[:, :, :3] * 255).astype(np.uint8)
+    nan_mask = np.isnan(grid)
+    rgb[nan_mask] = [8, 8, 12]
+    surface = pygame.surfarray.make_surface(np.swapaxes(rgb, 0, 1))
+    gh, gw = grid.shape
+    scaled_w = max(1, int(target_height * gw / gh))
+    return pygame.transform.scale(surface, (scaled_w, target_height))
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +263,10 @@ class WorldModelPlayer:
         self._action_history = actions.cpu().tolist()
         self.dream_steps = 0
 
+    def get_current_latent(self) -> np.ndarray:
+        """Return the last latent in history as (C, H, W) numpy array."""
+        return self._latent_history[0, :, -1].cpu().float().numpy()
+
     def nes_byte_to_action_index(self, byte: int) -> int:
         return self._byte_to_action_idx.get(byte, self.default_action_index)
 
@@ -289,7 +337,14 @@ def run_game_loop(
     panel_w = frame_width * scale
     panel_h = frame_height * scale
     hud_h = 22
-    win_w = panel_w
+    gap = 4
+
+    # Compute latent panel width from initial latent shape
+    init_lat = player.get_current_latent()
+    lat_grid_shape = _latent_channel_grid(init_lat).shape
+    lat_panel_w = max(1, int(panel_h * lat_grid_shape[1] / lat_grid_shape[0]))
+
+    win_w = panel_w + gap + lat_panel_w
     win_h = panel_h + hud_h
 
     pygame.init()
@@ -322,6 +377,10 @@ def run_game_loop(
         dream_surface = _frame_to_surface(current_rgb, (panel_w, panel_h))
         screen.blit(dream_surface, (0, 0))
 
+        # Latent visualization panel
+        lat_surface = _latent_grid_to_surface(player.get_current_latent(), panel_h)
+        screen.blit(lat_surface, (panel_w + gap, 0))
+
         fps_frame += 1
         if fps_frame >= 30:
             fps_val = clock.get_fps()
@@ -330,8 +389,10 @@ def run_game_loop(
 
         label = f"DREAM  step {player.dream_steps}"
         label_surface = hud_font.render(label, True, (220, 220, 220))
+        lat_label = hud_font.render("LATENT \u03bc", True, (180, 180, 220))
         hud_y = panel_h
         screen.blit(label_surface, (4, hud_y + 2))
+        screen.blit(lat_label, (panel_w + gap, hud_y + 2))
         screen.blit(fps_surface, (win_w - fps_surface.get_width() - 4, hud_y + 2))
 
         pygame.display.flip()

@@ -36,6 +36,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.plot_style import apply_plot_style
+from src.models.latent_utils import load_json
 apply_plot_style()
 console = Console()
 
@@ -121,11 +122,6 @@ def parse_args() -> argparse.Namespace:
     if args.top_k <= 0:
         parser.error("--top-k must be > 0")
     return args
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    with path.open() as handle:
-        return json.load(handle)
 
 
 def resolve_data_dir(args: argparse.Namespace) -> Path:
