@@ -16,6 +16,7 @@
 - [Audio Data Exploration](#audio-data-exploration)
 - [Initial Video Only World Model Training](#initial-video-only-world-model-training)
 - [Video VAE Latents](#video-vae-latents)
+- [World Model Example Generation](#world-model-example-generation)
 
 <br>
 
@@ -473,7 +474,46 @@ Several engineering strategies were considered to improve the learnability of th
 
 TODO
 
+<br>
+<br>
 
+# World Model Example Generation
+
+**Context:**
+
+This is the first generation from the world model. The DiT was trained on a Video VAE that was both severely under-trained and under-regularized. I stopped VAE training early — just after it started producing decent reconstructions — and the KL weight was low. The VAE also did not use any of the available data augmentation (e.g. pixel palette perturbation), which likely hurt the encoder's robustness.
+
+The previous VAE iteration did not include temporal smoothness regularization, and the latent space was noticeably chaotic — you could watch features jump erratically between channels over the time dimension. The current VAE does use temporal smoothness (cosine-similarity penalty on consecutive posterior means), which helps a lot, but is still under-regularized overall.
+
+There is also a significant train/inference distribution mismatch: the VAE was trained on sequences of length 16 but is run on sequences of length 60 at inference time. With a 16-frame window, a Game Over screen or main menu would typically fill most or all of the context — the model learned to handle these as near-homogeneous sequences. At inference with 60 frames, large contiguous blocks of the context window are occupied by visually distinct regimes (e.g. 30 frames of the black Game Over screen followed by 30 frames of active gameplay). The causal temporal convolutions never saw that kind of within-sequence heterogeneity during training, and it shows — the blackness of the Game Over screen bleeds into the main menu reconstruction.
+
+**Approach:**
+
+The current DiT uses the encoder–decoder split architecture (`VideoLatentDiTDiffusers`): the encoder runs once on the context history, and the decoder uses cross-attention to read those encoded features at every diffusion timestep. This is much faster than a unified architecture because the encoder forward pass is amortized across all denoising steps, but it means the encoded history features are static — they never see the diffusion timestep conditioning.
+
+Two latent-space improvements were made for this run:
+
+1. **Per-component normalization** — Latent standardization was switched from per-channel (one mean/std per channel, shared across all spatial positions) to per-component (one mean/std per `(C, H, W)` element, shared across time). This gives the flow-matching interpolation $x_t = (1 - t)x_0 + t\epsilon$ a more uniform scale across the full latent tensor.
+
+2. **Temporal smoothness regularization** — A cosine-similarity loss on the VAE posterior mean encourages consecutive latent frames to be similar, penalizing $1 - \text{mean}(\cos(z_t, z_{t+1}))$. This is scale-invariant so it doesn't fight with the KL term. The difference versus the previous VAE without this penalty is stark — the latent dynamics are far less chaotic.
+
+**Result:**
+
+![alt text](hmm.gif)
+
+The generated video shows that the model has learned something — it produces recognizable Mario scenes — but there are clear issues:
+
+- **Weak action conditioning.** Generation is not well conditioned on the player's actions. Actions are currently injected via cross-attention: each NES controller byte is decomposed into 8 bits, passed through a 2-layer MLP (`8 → action_dim=32 → 32`), projected to `d_model`, and then cross-attended to by the latent tokens with a causal mask. The diffusion timestep, by contrast, uses FiLM-style modulation (AdaLayerNorm) which directly scales and shifts every token at every layer. The action signal may be too weak relative to the timestep conditioning — cross-attention lets the model learn to ignore it. Potential improvements include using FiLM for actions as well (or in addition), increasing `action_dim`, adding action tokens to the self-attention sequence rather than a separate cross-attention path, or using additive action embeddings directly on the latent tokens.
+
+- **Train/inference distribution mismatch in the VAE.** The VAE trained on 16-frame sequences but runs on 60-frame sequences at inference. The causal temporal convolutions see input patterns they've never encountered, and it shows — especially around scene transitions like Game Over → main menu.
+
+- **Under-trained and under-regularized VAE.** Early stopping plus no data augmentation means the VAE doesn't reconstruct reliably, which compounds the DiT's prediction difficulty since it's predicting latents that are already imprecise.
+
+One thing I'm interested in trying is training the VAE to convergence with a much higher KL weight, temporal smoothness, and potentially adding per-frame dense (fully-connected) layers to both the encoder and decoder that mix spatial information across the 7×7 grid — the idea being to push the encoder toward encoding more semantic features rather than purely spatial ones. Intuition says semantic latents may be more predictable for the DiT, though it's not certain — spatial structure in the latent grid does carry useful inductive bias.
+
+Another idea I'm considering is **two-phase autoencoder training**. In phase 1, train a balanced encoder and decoder (roughly matched in parameter count) with full latent-space regularization (high KL weight, temporal smoothness, data augmentation) to convergence. A modestly-sized decoder can't compensate for a weak encoder, so the encoder is forced to learn semantically meaningful latents. In phase 2, freeze the encoder and swap in a much larger decoder trained to produce pixel-perfect reconstructions from the already-learned latents. The key insight is that training with the big decoder from the start would let it compensate for a lazy encoder — reconstructing well even from poorly structured latents — removing the pressure on the encoder to learn good representations.
+
+Setting the project aside for a few days due to repetitive strain injury. Using speech-to-text software to write these notes, which is not very effective.
 
 <!-- Template -->
 

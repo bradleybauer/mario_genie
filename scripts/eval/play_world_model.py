@@ -10,6 +10,7 @@ Usage examples:
     python scripts/eval/play_world_model.py --dit-checkpoint checkpoints/video_latent_dit_20260412_201206
     python scripts/eval/play_world_model.py --dit-checkpoint checkpoints/video_latent_dit_20260412_201206 --ode-steps 4
     python scripts/eval/play_world_model.py --dit-checkpoint checkpoints/video_latent_dit_20260412_201206 --episode 0 --start 100
+    python scripts/eval/play_world_model.py --dit-checkpoint checkpoints/video_latent_dit_20260412_201206 --record-gif run.gif
 """
 from __future__ import annotations
 
@@ -22,6 +23,7 @@ import matplotlib.cm as _cm
 import numpy as np
 import pygame
 import torch
+from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 project_root_str = str(PROJECT_ROOT)
@@ -42,13 +44,30 @@ from src.models.video_vae import VideoVAE
 from src.path_utils import resolve_workspace_path
 from src.data.video_frames import CANONICAL_FRAME_HEIGHT, CANONICAL_FRAME_WIDTH
 
-from scripts.eval.play_nes import GamepadController
+from scripts.eval.play_nes import GamepadController, BUTTON_BITS
+from scripts.eval.play_raw_recording import draw_controller
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+# play_nes.py byte layout:   A=0, B=1, SELECT=2, START=3, UP=4, DOWN=5, LEFT=6, RIGHT=7
+# Mesen DataCollector layout: UP=0, DOWN=1, LEFT=2, RIGHT=3, START=4, SELECT=5, B=6, A=7
+# The model was trained on Mesen-format bytes; GamepadController returns play_nes bytes.
+_MESEN_BITS = {'UP': 0, 'DOWN': 1, 'LEFT': 2, 'RIGHT': 3, 'START': 4, 'SELECT': 5, 'B': 6, 'A': 7}
+
+# Build a 256-entry lookup table: play_nes byte -> Mesen byte
+_PLAYNES_TO_MESEN = np.zeros(256, dtype=np.uint8)
+for _i in range(256):
+    _m = 0
+    for _name, _pbit in BUTTON_BITS.items():
+        if _i & (1 << _pbit):
+            _m |= (1 << _MESEN_BITS[_name])
+    _PLAYNES_TO_MESEN[_i] = _m
 DEFAULT_SCALE = 3
 DEFAULT_ODE_STEPS = 8
+DEFAULT_RECORD_FPS = 20
+GENERATIVE_FPS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +137,13 @@ def parse_args() -> argparse.Namespace:
                         help="Starting latent index within the episode (default: 0)")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                         help="Execution device (default: auto)")
+    parser.add_argument("--record-gif", type=str, default=None,
+                        help="Optional output GIF path. Records the rendered window until quit.")
+    parser.add_argument("--record-fps", type=int, default=DEFAULT_RECORD_FPS,
+                        help=(
+                            f"GIF playback FPS in generative time (default: {DEFAULT_RECORD_FPS}). "
+                            "Recording is based on 60 generated frames/sec, not wall-clock runtime."
+                        ))
     return parser.parse_args()
 
 
@@ -226,6 +252,7 @@ class WorldModelPlayer:
         action_values: list[int],
         default_action_index: int,
         context_latents: int,
+        latent_frame_stride: int,
         ode_steps: int,
         device: torch.device,
         autocast_dtype: torch.dtype,
@@ -237,6 +264,7 @@ class WorldModelPlayer:
         self.action_values = action_values
         self.default_action_index = default_action_index
         self.context_latents = context_latents
+        self.latent_frame_stride = max(1, int(latent_frame_stride))
         self.ode_steps = ode_steps
         self.device = device
         self.autocast_dtype = autocast_dtype
@@ -248,8 +276,12 @@ class WorldModelPlayer:
         self._latent_history: torch.Tensor | None = None
         # Action history (action indices)
         self._action_history: list[int] = []
+        # Decoded generated frames for the most recent predicted latent.
+        self._decoded_future_frames: list[np.ndarray] = []
         # Step counter
         self.dream_steps = 0
+        # Generated frame counter (can be > latent steps when temporal stride > 1).
+        self.generated_frames = 0
 
     def seed(self, latents: torch.Tensor, actions: torch.Tensor) -> None:
         """Initialize from pre-encoded latents (1, C, T, H, W) and actions (T,)."""
@@ -261,7 +293,9 @@ class WorldModelPlayer:
             actions = actions[-self.context_latents:]
         self._latent_history = latents
         self._action_history = actions.cpu().tolist()
+        self._decoded_future_frames = []
         self.dream_steps = 0
+        self.generated_frames = 0
 
     def get_current_latent(self) -> np.ndarray:
         """Return the last latent in history as (C, H, W) numpy array."""
@@ -273,45 +307,80 @@ class WorldModelPlayer:
     def decode_current_frame(self) -> np.ndarray:
         """Decode the last latent in history to an RGB frame for display."""
         last = self._latent_history[:, :, -1:]  # (1, C, 1, H', W')
-        denormed = self.latent_norm.denormalize(last) if self.latent_norm is not None else last
+        decoded = self._decode_latent_to_rgb(last)
+        return decoded[-1]
+
+    def _decode_latent_to_rgb(self, latents: torch.Tensor) -> list[np.ndarray]:
+        """Decode latent tensor (1, C, T, H', W') into a list of RGB frames."""
+        denormed = self.latent_norm.denormalize(latents) if self.latent_norm is not None else latents
         with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype):
             logits = self.vae.decode(denormed)
-        indices = logits[:, :, -1].argmax(dim=1)[0].cpu().numpy()
-        return self.palette_rgb[indices]
+        frame_indices = logits[0].argmax(dim=0).cpu().numpy()  # (T_out, H, W)
+        return [self.palette_rgb[frame_indices[t]] for t in range(frame_indices.shape[0])]
+
+    def _decode_new_latent_frames(self, pred: torch.Tensor) -> list[np.ndarray]:
+        """Decode a newly predicted latent with temporal context from history.
+
+        Passes the previous latent alongside the new one so the VAE temporal
+        upsampler has proper context, then returns only the frames that
+        correspond to the new latent (the last ``latent_frame_stride`` frames).
+        """
+        stride = self.latent_frame_stride
+        if stride <= 1:
+            # No temporal upsampling — decode the single latent directly.
+            return self._decode_latent_to_rgb(pred)
+
+        # Decode [prev_latent, new_latent] together so both output frames
+        # for the new latent have temporal context from the previous one.
+        prev = self._latent_history[:, :, -1:]  # already updated; -1 is pred
+        if self._latent_history.shape[2] >= 2:
+            prev = self._latent_history[:, :, -2:-1]
+        pair = torch.cat([prev, pred], dim=2)  # (1, C, 2, H', W')
+        all_frames = self._decode_latent_to_rgb(pair)
+        # Take only the last `stride` frames (those belonging to the new latent).
+        return all_frames[-stride:]
 
     def step(self, action_idx: int) -> np.ndarray:
-        """Predict the next frame given an action index. Returns RGB frame."""
-        ctx = self._latent_history.shape[2]
-        hist_actions = list(self._action_history)
+        """Predict (when needed) and return the next generated RGB frame."""
+        if not self._decoded_future_frames:
+            # The player's action_idx was pressed while viewing the last
+            # history frame.  In training's causal-shift convention this
+            # action appears at shifted[ctx] (the future position):
+            #   shifted = [default, hist[0], ..., hist[ctx-2], action_idx]
+            # We also overwrite the last history action so that when the
+            # window slides, subsequent steps see the player's real input
+            # rather than the stale seed action.
+            self._action_history[-1] = action_idx
+            hist_actions = list(self._action_history)
+            shifted_actions = [self.default_action_index] + hist_actions
+            actions_t = torch.tensor([shifted_actions], dtype=torch.long, device=self.device)
 
-        # Causal shift: shifted[0]=default, shifted[i]=original[i-1]
-        # original = hist_actions + [action_idx], length = ctx + 1
-        # shifted = [default] + hist_actions, length = ctx + 1
-        shifted_actions = [self.default_action_index] + hist_actions
-        actions_t = torch.tensor([shifted_actions], dtype=torch.long, device=self.device)
+            pred = denoise_future_segment(
+                self.dit,
+                history_latents=self._latent_history,
+                actions=actions_t,
+                future_latents=1,
+                ode_steps=self.ode_steps,
+                autocast_ctx=lambda: torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype),
+            )  # (1, C, 1, H', W')
 
-        pred = denoise_future_segment(
-            self.dit,
-            history_latents=self._latent_history,
-            actions=actions_t,
-            future_latents=1,
-            ode_steps=self.ode_steps,
-            autocast_ctx=lambda: torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype),
-        )  # (1, C, 1, H', W')
+            # Slide context window once per latent prediction (before decode
+            # so _decode_new_latent_frames can access the previous latent).
+            self._latent_history = torch.cat([self._latent_history[:, :, 1:], pred], dim=2)
+            self._action_history.pop(0)
+            # Append a placeholder for the predicted latent's action slot.
+            # It will be overwritten with the player's real input on the
+            # next call to step().
+            self._action_history.append(self.default_action_index)
+            self.dream_steps += 1
 
-        # Decode predicted latent
-        denormed = self.latent_norm.denormalize(pred) if self.latent_norm is not None else pred
-        with torch.inference_mode(), torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype):
-            logits = self.vae.decode(denormed)
-        indices = logits[:, :, -1].argmax(dim=1)[0].cpu().numpy()
-        dream_rgb = self.palette_rgb[indices]
+            decoded_frames = self._decode_new_latent_frames(pred)
+            if not decoded_frames:
+                raise RuntimeError("VAE decode returned zero frames for predicted latent")
+            self._decoded_future_frames = decoded_frames
 
-        # Slide context window
-        self._latent_history = torch.cat([self._latent_history[:, :, 1:], pred], dim=2)
-        self._action_history.pop(0)
-        self._action_history.append(action_idx)
-        self.dream_steps += 1
-
+        dream_rgb = self._decoded_future_frames.pop(0)
+        self.generated_frames += 1
         return dream_rgb
 
 
@@ -326,6 +395,24 @@ def _frame_to_surface(frame_rgb: np.ndarray, out_size: tuple[int, int]) -> pygam
     return surface
 
 
+def _capture_surface_rgb(surface: pygame.Surface) -> np.ndarray:
+    return np.swapaxes(pygame.surfarray.array3d(surface), 0, 1).copy()
+
+
+def _save_recording(frames: list[np.ndarray], durations_ms: list[int], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pil_frames = [Image.fromarray(frame) for frame in frames]
+    pil_frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=durations_ms,
+        loop=0,
+        optimize=False,
+        disposal=2,
+    )
+
+
 def run_game_loop(
     *,
     player: WorldModelPlayer,
@@ -333,10 +420,13 @@ def run_game_loop(
     frame_height: int,
     frame_width: int,
     scale: int,
+    record_gif: Path | None = None,
+    record_fps: int = DEFAULT_RECORD_FPS,
 ) -> None:
     panel_w = frame_width * scale
     panel_h = frame_height * scale
     hud_h = 22
+    ctrl_h = 86  # height for NES controller display
     gap = 4
 
     # Compute latent panel width from initial latent shape
@@ -345,7 +435,7 @@ def run_game_loop(
     lat_panel_w = max(1, int(panel_h * lat_grid_shape[1] / lat_grid_shape[0]))
 
     win_w = panel_w + gap + lat_panel_w
-    win_h = panel_h + hud_h
+    win_h = panel_h + hud_h + ctrl_h
 
     pygame.init()
     screen = pygame.display.set_mode((win_w, win_h))
@@ -359,6 +449,54 @@ def run_game_loop(
 
     fps_surface = hud_font.render("-- FPS", True, (100, 255, 100))
     fps_frame = 0
+    recorded_frames: list[np.ndarray] = []
+    recorded_durations_ms: list[int] = []
+    # Record against generated-frame progression, not real-time inference speed.
+    record_every_n = max(1, int(round(GENERATIVE_FPS / max(record_fps, 1))))
+    effective_record_fps = GENERATIVE_FPS / record_every_n
+    frame_duration_ms = max(1, int(round(1000.0 / effective_record_fps)))
+
+    ctrl_font = pygame.font.SysFont("monospace", 12, bold=True)
+    current_action_byte = 0
+
+    def _present_frame(rgb: np.ndarray) -> None:
+        """Render one generated frame to the screen and flip."""
+        screen.fill((8, 8, 12))
+        dream_surface = _frame_to_surface(rgb, (panel_w, panel_h))
+        screen.blit(dream_surface, (0, 0))
+
+        # Latent visualization panel
+        lat_surface = _latent_grid_to_surface(player.get_current_latent(), panel_h)
+        screen.blit(lat_surface, (panel_w + gap, 0))
+
+        nonlocal fps_frame, fps_surface
+        fps_frame += 1
+        if fps_frame >= 30:
+            fps_val = clock.get_fps()
+            fps_surface = hud_font.render(f"{fps_val:.0f} FPS", True, (100, 255, 100))
+            fps_frame = 0
+
+        label = f"DREAM frame {player.generated_frames}  latent {player.dream_steps}"
+        label_surface = hud_font.render(label, True, (220, 220, 220))
+        lat_label = hud_font.render("LATENT \u03bc", True, (180, 180, 220))
+        hud_y = panel_h
+        screen.blit(label_surface, (4, hud_y + 2))
+        screen.blit(lat_label, (panel_w + gap, hud_y + 2))
+        screen.blit(fps_surface, (win_w - fps_surface.get_width() - 4, hud_y + 2))
+
+        # NES controller input display
+        draw_controller(screen, ctrl_font, current_action_byte, 4, hud_y + hud_h)
+
+        pygame.display.flip()
+        # Enforce minimum visibility per frame.  clock.tick() alone won't
+        # sleep after a long inference because it only caps *average* FPS.
+        pygame.time.delay(1000 // GENERATIVE_FPS)
+        clock.tick()  # update clock for FPS measurement
+
+        if record_gif is not None:
+            if ((player.generated_frames - 1) % record_every_n) == 0:
+                recorded_frames.append(_capture_surface_rgb(screen))
+                recorded_durations_ms.append(frame_duration_ms)
 
     running = True
     while running:
@@ -370,35 +508,36 @@ def run_game_loop(
             controller.process_event(event)
 
         action_byte = controller.get_action()
-        action_idx = player.nes_byte_to_action_index(action_byte)
+        mesen_byte = int(_PLAYNES_TO_MESEN[action_byte])
+        current_action_byte = mesen_byte  # draw_controller expects Mesen layout
+        action_idx = player.nes_byte_to_action_index(mesen_byte)
+
+        # step() may decode multiple frames from one latent (e.g. 2 when
+        # temporal_downsample=1).  Present each frame individually so none
+        # are skipped due to slow inference dominating the timing.
         current_rgb = player.step(action_idx)
+        _present_frame(current_rgb)
 
-        screen.fill((8, 8, 12))
-        dream_surface = _frame_to_surface(current_rgb, (panel_w, panel_h))
-        screen.blit(dream_surface, (0, 0))
-
-        # Latent visualization panel
-        lat_surface = _latent_grid_to_surface(player.get_current_latent(), panel_h)
-        screen.blit(lat_surface, (panel_w + gap, 0))
-
-        fps_frame += 1
-        if fps_frame >= 30:
-            fps_val = clock.get_fps()
-            fps_surface = hud_font.render(f"{fps_val:.0f} FPS", True, (100, 255, 100))
-            fps_frame = 0
-
-        label = f"DREAM  step {player.dream_steps}"
-        label_surface = hud_font.render(label, True, (220, 220, 220))
-        lat_label = hud_font.render("LATENT \u03bc", True, (180, 180, 220))
-        hud_y = panel_h
-        screen.blit(label_surface, (4, hud_y + 2))
-        screen.blit(lat_label, (panel_w + gap, hud_y + 2))
-        screen.blit(fps_surface, (win_w - fps_surface.get_width() - 4, hud_y + 2))
-
-        pygame.display.flip()
-        clock.tick(60)
+        while player._decoded_future_frames and running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    running = False
+                controller.process_event(event)
+            if not running:
+                break
+            current_rgb = player.step(action_idx)
+            _present_frame(current_rgb)
 
     pygame.quit()
+
+    if record_gif is not None:
+        if not recorded_frames:
+            print(f"No GIF frames captured; nothing saved to {record_gif}")
+            return
+        _save_recording(recorded_frames, recorded_durations_ms, record_gif)
+        print(f"Saved GIF to {record_gif}")
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +549,12 @@ def main() -> None:
 
     if args.scale < 1:
         raise SystemExit("--scale must be at least 1")
+    if args.record_fps < 1:
+        raise SystemExit("--record-fps must be at least 1")
 
     device = _resolve_device(args.device)
     autocast_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+    record_gif_path = Path(args.record_gif).resolve() if args.record_gif is not None else None
 
     # ------------------------------------------------------------------
     # Resolve data directory
@@ -509,6 +651,11 @@ def main() -> None:
     print(f"  VAE: latent_channels={vae_info['latent_channels']}, "
           f"temporal_downsample={vae_info['temporal_downsample']}, "
           f"frame={frame_height}x{frame_width}")
+    latent_frame_stride = int(
+        latent_meta.get("latent_temporal_stride", 2 ** int(vae_info.get("temporal_downsample", 0)))
+    ) if latent_meta is not None else 2 ** int(vae_info.get("temporal_downsample", 0))
+    latent_frame_stride = max(1, latent_frame_stride)
+    print(f"  latent_frame_stride={latent_frame_stride} generated frames / latent")
 
     # ------------------------------------------------------------------
     # Load seed episode from dataset
@@ -544,6 +691,7 @@ def main() -> None:
         action_values=action_values,
         default_action_index=default_action_index,
         context_latents=context_latents,
+        latent_frame_stride=latent_frame_stride,
         ode_steps=args.ode_steps,
         device=device,
         autocast_dtype=autocast_dtype,
@@ -556,6 +704,11 @@ def main() -> None:
     print(f"\nUsing device: {device}")
     print(f"ODE steps: {args.ode_steps}, context: {context_latents}")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")
+    if record_gif_path is not None:
+        print(
+            f"Recording GIF to {record_gif_path} "
+            f"({args.record_fps} FPS generative-time, {GENERATIVE_FPS} generated frames/sec)"
+        )
 
     run_game_loop(
         player=player,
@@ -563,6 +716,8 @@ def main() -> None:
         frame_height=frame_height,
         frame_width=frame_width,
         scale=args.scale,
+        record_gif=record_gif_path,
+        record_fps=args.record_fps,
     )
 
 
