@@ -33,6 +33,7 @@
 ## Diffusion & Flow Matching
 
 - [ ] Ho, Jain & Abbeel (2020), *"Denoising Diffusion Probabilistic Models"* (NeurIPS) — DDPM; foundational diffusion model paper.
+- [ ] Ho & Salimans (2022), *"Classifier-Free Diffusion Guidance"* — The canonical CFG paper; jointly trains conditional and unconditional models and combines their predictions at sampling time without a separate classifier.
 - [ ] Song et al. (2021), *"Score-Based Generative Modeling through Stochastic Differential Equations"* (ICLR) — Unifies score matching and diffusion under SDEs.
 - [ ] Lipman et al. (2023), *"Flow Matching for Generative Modeling"* (ICLR) — Flow matching / conditional optimal transport; the framework used in your DiT trainer.
 - [ ] Liu, Gong & Liu (2023), *"Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow"* (ICLR) — Rectified flow; straight-line ODE paths for fast sampling.
