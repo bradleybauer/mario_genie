@@ -5,8 +5,8 @@
 - [Mesen-Based Data Collection](#mesen-based-data-collection)
 - [Initial Video Tokenizer Parameter Sweep](#initial-video-tokenizer-parameter-sweep)
 - [Dense Cross-Entropy And NES Color Palette](#dense-cross-entropy-and-nes-color-palette)
-- [Disentangling Hidden State From RAM](#disentangling-hidden-state-from-ram)
-- [SMB3 x Super Mario Land 2](#smb3-x-super-mario-land-2)
+- [Accessing Hidden State From RAM](#accessing-hidden-state-from-ram)
+- [SMB3 x Super Mario Land](#smb3-x-super-mario-land)
 - [More Data Artifacts](#more-data-artifacts)
 - [Causal Conv Temporal Padding](#causal-conv-temporal-padding)
 - [Discrete Tokenizer Variables To Explore](#discrete-tokenizer-variables-to-explore)
@@ -16,7 +16,7 @@
 - [Audio Data Exploration](#audio-data-exploration)
 - [Initial Video Only World Model Training](#initial-video-only-world-model-training)
 - [Video VAE Latents](#video-vae-latents)
-- [World Model Example Generation](#world-model-example-generation)
+- [World Models First Steps](#world-models-first-steps)
 
 <br>
 
@@ -74,7 +74,7 @@ Mesen records raw gameplay data to disk, and an offline conversion step turns th
 
 **Result:** 
 
-TODO
+Yea it works. Had to fix some issues with corrupred save states but evrything seems to be working fine now. The dataset I've collected now is more uniform over game progression than I would have been able to achieve with natural play. And the save state method works much more smoothly than the previous approach using action replay in the gym env. With the current system I could easily balance different variables such as power status or specific scene transitions or even mechanics like stomping enemies or getting powerups.
 
 <br>
 <br>
@@ -123,7 +123,7 @@ It clearly has a much better grasp of spatial layout within the image.
 <br>
 <br>
 
-# Disentangling Hidden State From RAM
+# Accessing Hidden State From RAM
 
 **Context:**
 
@@ -175,7 +175,7 @@ TODO
 <br>
 <br>
 
-# SMB3 x Super Mario Land 2
+# SMB3 x Super Mario Land
 
 **Context:**
 
@@ -477,7 +477,7 @@ TODO
 <br>
 <br>
 
-# World Model Example Generation
+# World Models First Steps
 
 **Context:**
 
@@ -503,7 +503,13 @@ Two latent-space improvements were made for this run:
 
 The generated video shows that the model has learned something — it produces recognizable Mario scenes — but there are clear issues:
 
-- **Weak action conditioning.** Generation is not well conditioned on the player's actions. Actions are currently injected via cross-attention: each NES controller byte is decomposed into 8 bits, passed through a 2-layer MLP (`8 → action_dim=32 → 32`), projected to `d_model`, and then cross-attended to by the latent tokens with a causal mask. The diffusion timestep, by contrast, uses FiLM-style modulation (AdaLayerNorm) which directly scales and shifts every token at every layer. The action signal may be too weak relative to the timestep conditioning — cross-attention lets the model learn to ignore it. Potential improvements include using FiLM for actions as well (or in addition), increasing `action_dim`, adding action tokens to the self-attention sequence rather than a separate cross-attention path, or using additive action embeddings directly on the latent tokens.
+- **Weak action conditioning.** Generation is not well conditioned on the player's actions. Actions are currently injected via cross-attention: each NES controller byte is decomposed into 8 bits, passed through a 2-layer MLP (`8 → action_dim=32 → 32`), projected to `d_model`, and then cross-attended to by the latent tokens with a causal mask. The diffusion timestep, by contrast, uses FiLM-style modulation (AdaLayerNorm) which directly scales and shifts every token at every layer. The action signal may be too weak relative to the timestep conditioning — cross-attention lets the model learn to ignore it. One especially interesting fix is **classifier-free guidance for actions**: during training, randomly drop the action conditioning some fraction of the time so the model learns both conditional and unconditional predictions, then at inference push samples toward the action-conditioned branch with
+
+  $$
+  v_{\mathrm{cfg}}(x_t, t, a) = v_\theta(x_t, t, \varnothing) + s\left(v_\theta(x_t, t, a) - v_\theta(x_t, t, \varnothing)\right)
+  $$
+
+  where $a$ is the action conditioning and $s$ is the guidance scale. Intuitively, this amplifies the part of the denoising update that is specifically explained by the actions, which seems directly relevant to the weak-control failure mode here. Potential improvements include using FiLM for actions as well (or in addition), increasing `action_dim`, adding action tokens to the self-attention sequence rather than a separate cross-attention path, or using additive action embeddings directly on the latent tokens. One concern with FiLM-ing both the diffusion timestep and the actions is that the two signals may interact ambiguously: both would try to scale and shift the same hidden features, so the model may blur together what should be attributed to denoising stage versus what should be attributed to player control. One possible fix would be to partition the activation channels so diffusion-timestep conditioning modulates only one subset while action conditioning modulates another, giving each signal a more explicit subspace instead of forcing both through the exact same modulation pathway.
 
 - **Train/inference distribution mismatch in the VAE.** The VAE trained on 16-frame sequences but runs on 60-frame sequences at inference. The causal temporal convolutions see input patterns they've never encountered, and it shows — especially around scene transitions like Game Over → main menu.
 
