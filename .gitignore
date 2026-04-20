@@ -6,3 +6,4 @@ results
 .env
 *api_key*
 *.secret
+notes/todo.md
