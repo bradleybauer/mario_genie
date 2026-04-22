@@ -24,7 +24,7 @@ def _make_model(**kwargs) -> VideoLatentDiTDiffusers:
         num_encoder_layers=2,
         num_decoder_layers=2,
         num_heads=4,
-        max_frames=32,
+        max_latents=32,
     )
     defaults.update(kwargs)
     return VideoLatentDiTDiffusers(**defaults)
@@ -37,7 +37,7 @@ def test_forward_output_shape() -> None:
     actions = torch.randint(0, 16, (B, ctx + fut), dtype=torch.long)
     timesteps = torch.rand(B)
 
-    velocity = model(noisy_latents, actions, timesteps, context_frames=ctx)
+    velocity = model(noisy_latents, actions, timesteps, context_latents=ctx)
 
     assert velocity.shape == (B, C, fut, H, W)
 
@@ -48,7 +48,7 @@ def test_forward_single_timestep_broadcasts() -> None:
     noisy_latents = torch.randn(B, 4, ctx + fut, 3, 3)
     actions = torch.randint(0, 8, (B, ctx + fut), dtype=torch.long)
 
-    velocity = model(noisy_latents, actions, torch.tensor([0.5]), context_frames=ctx)
+    velocity = model(noisy_latents, actions, torch.tensor([0.5]), context_latents=ctx)
 
     assert velocity.shape == (B, 4, fut, 3, 3)
 
@@ -63,7 +63,7 @@ def test_encode_decode_matches_forward() -> None:
     timesteps = torch.rand(B)
 
     with torch.no_grad():
-        vel_forward = model(noisy_latents, actions, timesteps, context_frames=ctx)
+        vel_forward = model(noisy_latents, actions, timesteps, context_latents=ctx)
 
         encoded = model.encode_history(noisy_latents[:, :, :ctx], actions[:, :ctx])
         vel_split = model.decode_future(
@@ -92,19 +92,83 @@ def test_encode_history_cached_across_steps() -> None:
     assert torch.allclose(v1, v2)
 
 
-def test_rejects_total_frames_exceeding_max_frames() -> None:
-    model = _make_model(max_frames=4)
+def test_dropped_action_conditioning_is_invariant_to_action_ids() -> None:
+    model = _make_model()
+    model.eval()
+    B, C, ctx, fut, H, W = 2, 8, 4, 2, 4, 4
+    noisy_latents = torch.randn(B, C, ctx + fut, H, W)
+    actions_a = torch.randint(0, 16, (B, ctx + fut), dtype=torch.long)
+    actions_b = torch.randint(0, 16, (B, ctx + fut), dtype=torch.long)
+    timesteps = torch.rand(B)
+    dropped = torch.zeros(B)
+
+    with torch.no_grad():
+        vel_a = model(
+            noisy_latents,
+            actions_a,
+            timesteps,
+            context_latents=ctx,
+            action_cond_scale=dropped,
+        )
+        vel_b = model(
+            noisy_latents,
+            actions_b,
+            timesteps,
+            context_latents=ctx,
+            action_cond_scale=dropped,
+        )
+
+    assert torch.allclose(vel_a, vel_b, atol=1e-5)
+
+
+def test_encode_decode_matches_forward_when_actions_dropped() -> None:
+    model = _make_model()
+    model.eval()
+    B, C, ctx, fut, H, W = 2, 8, 4, 2, 4, 4
+    noisy_latents = torch.randn(B, C, ctx + fut, H, W)
+    actions = torch.randint(0, 16, (B, ctx + fut), dtype=torch.long)
+    timesteps = torch.rand(B)
+    dropped = torch.zeros(B)
+
+    with torch.no_grad():
+        vel_forward = model(
+            noisy_latents,
+            actions,
+            timesteps,
+            context_latents=ctx,
+            action_cond_scale=dropped,
+        )
+
+        encoded = model.encode_history(
+            noisy_latents[:, :, :ctx],
+            actions[:, :ctx],
+            action_cond_scale=dropped,
+        )
+        vel_split = model.decode_future(
+            noisy_latents[:, :, ctx:],
+            actions,
+            timesteps,
+            encoded,
+            ctx,
+            action_cond_scale=dropped,
+        )
+
+    assert torch.allclose(vel_forward, vel_split, atol=1e-5)
+
+
+def test_rejects_total_frames_exceeding_max_latents() -> None:
+    model = _make_model(max_latents=4)
     noisy_latents = torch.randn(1, 8, 5, 2, 2)
     actions = torch.randint(0, 16, (1, 5), dtype=torch.long)
 
-    with pytest.raises(ValueError, match="exceeds max_frames"):
-        model(noisy_latents, actions, torch.tensor([0.3]), context_frames=3)
+    with pytest.raises(ValueError, match="exceeds max_latents"):
+        model(noisy_latents, actions, torch.tensor([0.3]), context_latents=3)
 
 
-def test_rejects_invalid_context_frames() -> None:
+def test_rejects_invalid_context_latents() -> None:
     model = _make_model()
     noisy_latents = torch.randn(1, 8, 6, 4, 4)
     actions = torch.randint(0, 16, (1, 6), dtype=torch.long)
 
-    with pytest.raises(ValueError, match="context_frames"):
-        model(noisy_latents, actions, torch.tensor([0.5]), context_frames=6)
+    with pytest.raises(ValueError, match="context_latents"):
+        model(noisy_latents, actions, torch.tensor([0.5]), context_latents=6)

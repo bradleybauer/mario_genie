@@ -129,6 +129,12 @@ def parse_args() -> argparse.Namespace:
                         help=f"Display scale factor (default: {DEFAULT_SCALE})")
     parser.add_argument("--ode-steps", type=int, default=DEFAULT_ODE_STEPS,
                         help=f"ODE integration steps for denoising (default: {DEFAULT_ODE_STEPS})")
+    parser.add_argument(
+        "--action-cfg-scale",
+        type=float,
+        default=1.0,
+        help="Action classifier-free guidance scale used during denoising.",
+    )
     parser.add_argument("--context-latents", type=int, default=None,
                         help="Context window size (default: model max_latents - 1)")
     parser.add_argument("--episode", type=int, default=None,
@@ -144,7 +150,10 @@ def parse_args() -> argparse.Namespace:
                             f"GIF playback FPS in generative time (default: {DEFAULT_RECORD_FPS}). "
                             "Recording is based on 60 generated frames/sec, not wall-clock runtime."
                         ))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.action_cfg_scale < 0.0:
+        parser.error("--action-cfg-scale must be >= 0")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +263,7 @@ class WorldModelPlayer:
         context_latents: int,
         latent_frame_stride: int,
         ode_steps: int,
+        action_cfg_scale: float,
         device: torch.device,
         autocast_dtype: torch.dtype,
     ) -> None:
@@ -266,6 +276,7 @@ class WorldModelPlayer:
         self.context_latents = context_latents
         self.latent_frame_stride = max(1, int(latent_frame_stride))
         self.ode_steps = ode_steps
+        self.action_cfg_scale = float(action_cfg_scale)
         self.device = device
         self.autocast_dtype = autocast_dtype
 
@@ -361,6 +372,7 @@ class WorldModelPlayer:
                 actions=actions_t,
                 future_latents=1,
                 ode_steps=self.ode_steps,
+                action_cfg_scale=self.action_cfg_scale,
                 autocast_ctx=lambda: torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype),
             )  # (1, C, 1, H', W')
 
@@ -693,6 +705,7 @@ def main() -> None:
         context_latents=context_latents,
         latent_frame_stride=latent_frame_stride,
         ode_steps=args.ode_steps,
+        action_cfg_scale=args.action_cfg_scale,
         device=device,
         autocast_dtype=autocast_dtype,
     )
@@ -702,7 +715,7 @@ def main() -> None:
     # Launch
     # ------------------------------------------------------------------
     print(f"\nUsing device: {device}")
-    print(f"ODE steps: {args.ode_steps}, context: {context_latents}")
+    print(f"ODE steps: {args.ode_steps}, context: {context_latents}, action_cfg_scale: {args.action_cfg_scale}")
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")
     if record_gif_path is not None:
         print(

@@ -160,6 +160,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-loss", type=str, choices=["mse", "huber"], default="huber")
     parser.add_argument("--huber-delta", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument(
+        "--action-cfg-drop-prob",
+        type=float,
+        default=0.1,
+        help="Per-sample probability of dropping action conditioning during training.",
+    )
 
     parser.add_argument("--timestep-sampler", type=str, choices=["uniform", "logit_normal"],
                         default="uniform")
@@ -174,6 +180,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-buffer-clip", type=float, default=3.0)
 
     parser.add_argument("--preview-ode-steps", type=int, default=8)
+    parser.add_argument(
+        "--preview-action-cfg-scale",
+        type=float,
+        default=1.0,
+        help="Action CFG scale used for autoregressive rollout previews.",
+    )
     parser.add_argument("--preview-interval", type=int, default=None,
                         help="Steps between rollout previews (default: eval-interval).")
     parser.add_argument("--preview-rollout-latents", type=int, default=64,
@@ -202,6 +214,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-latents must be smaller than --clip-latents")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient-accumulation-steps must be >= 1")
+    if not (0.0 <= args.action_cfg_drop_prob <= 1.0):
+        parser.error("--action-cfg-drop-prob must be in [0, 1]")
+    if args.preview_action_cfg_scale < 0.0:
+        parser.error("--preview-action-cfg-scale must be >= 0")
 
     default_half = (args.num_layers // 2)
     if args.num_encoder_layers is None:
@@ -365,6 +381,7 @@ def denoise_future_segment(
     actions: torch.Tensor,
     future_latents: int,
     ode_steps: int,
+    action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
     return _denoise_future_segment(
@@ -373,6 +390,7 @@ def denoise_future_segment(
         actions=actions,
         future_latents=future_latents,
         ode_steps=ode_steps,
+        action_cfg_scale=action_cfg_scale,
         autocast_ctx=accelerator.autocast,
     )
 
@@ -387,6 +405,7 @@ def autoregressive_rollout(
     future_latents: int,
     total_latents: int,
     ode_steps: int,
+    action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
     """Autoregressively roll out latent timesteps.
@@ -410,6 +429,7 @@ def autoregressive_rollout(
             actions=step_actions,
             future_latents=step_future,
             ode_steps=ode_steps,
+            action_cfg_scale=action_cfg_scale,
             accelerator=accelerator,
         )
         generated = torch.cat([generated, pred], dim=2)
@@ -953,10 +973,21 @@ def main() -> None:
 
                 noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
                 model_input = torch.cat((history, noisy_future), dim=2)
+                action_cond_scale = None
+                if args.action_cfg_drop_prob > 0.0:
+                    action_cond_scale = (
+                        torch.rand(actions.shape[0], device=device) >= args.action_cfg_drop_prob
+                    ).to(dtype=model_input.dtype)
 
                 with accelerator.accumulate(model):
                     with accelerator.autocast():
-                        v_pred = model(model_input, actions, t, args.context_latents)
+                        v_pred = model(
+                            model_input,
+                            actions,
+                            t,
+                            args.context_latents,
+                            action_cond_scale=action_cond_scale,
+                        )
                         loss = compute_flow_loss(v_pred, v_target, loss_type=args.flow_loss, huber_delta=args.huber_delta)
 
                     if not torch.isfinite(loss):
@@ -1209,6 +1240,7 @@ def main() -> None:
                             future_latents=rollout_step_latent_count,
                             total_latents=_preview_length,
                             ode_steps=args.preview_ode_steps,
+                            action_cfg_scale=args.preview_action_cfg_scale,
                             accelerator=accelerator,
                         )
                         torch.cuda.synchronize()

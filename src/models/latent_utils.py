@@ -5,6 +5,7 @@ Used by both the DiT trainer and the play-world-model evaluation script.
 from __future__ import annotations
 
 import json
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -197,6 +198,7 @@ def denoise_future_segment(
     actions: torch.Tensor,
     future_latents: int,
     ode_steps: int,
+    action_cfg_scale: float = 1.0,
     autocast_ctx=None,
 ) -> torch.Tensor:
     """Denoise future latents via midpoint ODE integration.
@@ -219,9 +221,23 @@ def denoise_future_segment(
 
     if autocast_ctx is not None:
         with autocast_ctx():
-            encoded = model.encode_history(history_latents, actions[:, :ctx])
+            encoded_cond = model.encode_history(history_latents, actions[:, :ctx])
+            encoded_uncond = None
+            if not math.isclose(float(action_cfg_scale), 1.0):
+                encoded_uncond = model.encode_history(
+                    history_latents,
+                    actions[:, :ctx],
+                    action_cond_scale=0.0,
+                )
     else:
-        encoded = model.encode_history(history_latents, actions[:, :ctx])
+        encoded_cond = model.encode_history(history_latents, actions[:, :ctx])
+        encoded_uncond = None
+        if not math.isclose(float(action_cfg_scale), 1.0):
+            encoded_uncond = model.encode_history(
+                history_latents,
+                actions[:, :ctx],
+                action_cond_scale=0.0,
+            )
 
     dt = 1.0 / float(ode_steps)
     for step in range(ode_steps, 0, -1):
@@ -229,8 +245,36 @@ def denoise_future_segment(
         t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
         if autocast_ctx is not None:
             with autocast_ctx():
-                velocity = model.decode_future(future, actions, t, encoded, ctx)
+                velocity_cond = model.decode_future(future, actions, t, encoded_cond, ctx)
+                if encoded_uncond is None:
+                    velocity = velocity_cond
+                else:
+                    velocity_uncond = model.decode_future(
+                        future,
+                        actions,
+                        t,
+                        encoded_uncond,
+                        ctx,
+                        action_cond_scale=0.0,
+                    )
+                    velocity = velocity_uncond + float(action_cfg_scale) * (
+                        velocity_cond - velocity_uncond
+                    )
         else:
-            velocity = model.decode_future(future, actions, t, encoded, ctx)
+            velocity_cond = model.decode_future(future, actions, t, encoded_cond, ctx)
+            if encoded_uncond is None:
+                velocity = velocity_cond
+            else:
+                velocity_uncond = model.decode_future(
+                    future,
+                    actions,
+                    t,
+                    encoded_uncond,
+                    ctx,
+                    action_cond_scale=0.0,
+                )
+                velocity = velocity_uncond + float(action_cfg_scale) * (
+                    velocity_cond - velocity_uncond
+                )
         future = future - dt * velocity
     return future

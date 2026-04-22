@@ -96,16 +96,20 @@ class DiffusersEncoderBlock(nn.Module):
         *,
         action_tokens: Tensor,
         action_attn_mask: Tensor | None,
+        action_cond_scale: Tensor | None = None,
     ) -> Tensor:
         h = self.norm1(tokens)
         tokens = tokens + self.self_attn(h)
 
         q = self.norm2(tokens)
-        tokens = tokens + self.action_cross_attn(
+        action_update = self.action_cross_attn(
             q,
             encoder_hidden_states=action_tokens,
             attention_mask=action_attn_mask,
         )
+        if action_cond_scale is not None:
+            action_update = action_update * action_cond_scale
+        tokens = tokens + action_update
 
         tokens = tokens + self.mlp(self.norm3(tokens))
         return tokens
@@ -178,6 +182,7 @@ class DiffusersDecoderBlock(nn.Module):
         action_tokens: Tensor,
         cond: Tensor,
         action_attn_mask: Tensor | None,
+        action_cond_scale: Tensor | None = None,
     ) -> Tensor:
         h = self.norm1(tokens, cond)
         tokens = tokens + self.self_attn(h)
@@ -189,11 +194,14 @@ class DiffusersDecoderBlock(nn.Module):
         )
 
         q = self.norm3(tokens)
-        tokens = tokens + self.action_cross_attn(
+        action_update = self.action_cross_attn(
             q,
             encoder_hidden_states=action_tokens,
             attention_mask=action_attn_mask,
         )
+        if action_cond_scale is not None:
+            action_update = action_update * action_cond_scale
+        tokens = tokens + action_update
 
         tokens = tokens + self.mlp(self.norm4(tokens, cond))
         return tokens
@@ -335,6 +343,29 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         return self.action_to_model(self.action_mlp(bits))
 
     @staticmethod
+    def _prepare_action_cond_scale(
+        action_cond_scale: Tensor | float | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tensor | None:
+        if action_cond_scale is None:
+            return None
+        scale = torch.as_tensor(action_cond_scale, device=device, dtype=dtype)
+        if scale.ndim == 0:
+            scale = scale.expand(batch_size)
+        elif scale.ndim == 2 and scale.shape[1] == 1:
+            scale = scale[:, 0]
+        elif scale.ndim != 1:
+            raise ValueError(
+                f"Expected action_cond_scale scalar, (B,), or (B, 1); got {tuple(scale.shape)}"
+            )
+        if scale.shape[0] != batch_size:
+            raise ValueError(f"Expected action_cond_scale batch size {batch_size}, got {scale.shape[0]}")
+        return scale.view(batch_size, 1, 1)
+
+    @staticmethod
     def _causal_action_mask(
         *,
         query_absolute_steps: Tensor,
@@ -365,7 +396,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
                 f"but got min={int(actions.min())}, max={int(actions.max())}"
             )
 
-    def encode_history(self, history_latents: Tensor, history_actions: Tensor) -> Tensor:
+    def encode_history(
+        self,
+        history_latents: Tensor,
+        history_actions: Tensor,
+        action_cond_scale: Tensor | float | None = None,
+    ) -> Tensor:
         if history_latents.ndim != 5:
             raise ValueError(
                 f"Expected history_latents (B, C, T, H, W), got {tuple(history_latents.shape)}"
@@ -382,6 +418,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError(f"context_latents ({context_latents}) exceeds max_latents ({self.max_latents})")
 
         self._validate_actions(history_actions)
+        cond_scale = self._prepare_action_cond_scale(
+            action_cond_scale,
+            batch_size=batch,
+            device=history_latents.device,
+            dtype=history_latents.dtype,
+        )
 
         tokens = rearrange(history_latents, "b c t h w -> b (h w t) c")
         tokens = self.input_proj(tokens)
@@ -397,7 +439,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         action_tokens = self._encode_actions(history_actions, dtype=tokens.dtype)
 
         for block in self.encoder_blocks:
-            tokens = block(tokens, action_tokens=action_tokens, action_attn_mask=None)
+            tokens = block(
+                tokens,
+                action_tokens=action_tokens,
+                action_attn_mask=None,
+                action_cond_scale=cond_scale,
+            )
 
         return tokens
 
@@ -408,6 +455,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         timesteps: Tensor,
         encoded_history: Tensor,
         context_latents: int,
+        action_cond_scale: Tensor | float | None = None,
     ) -> Tensor:
         if noisy_future.ndim != 5:
             raise ValueError(
@@ -436,6 +484,12 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError(f"Expected {batch} timesteps, got {timesteps.shape[0]}")
 
         self._validate_actions(actions)
+        cond_scale = self._prepare_action_cond_scale(
+            action_cond_scale,
+            batch_size=batch,
+            device=noisy_future.device,
+            dtype=noisy_future.dtype,
+        )
 
         tokens = rearrange(noisy_future, "b c t h w -> b (h w t) c")
         tokens = self.input_proj(tokens)
@@ -477,6 +531,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
                 action_tokens=action_tokens,
                 cond=cond,
                 action_attn_mask=action_bias,
+                action_cond_scale=cond_scale,
             )
 
         tokens = self.final_norm(tokens)
@@ -493,6 +548,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         actions: Tensor,
         timesteps: Tensor,
         context_latents: int,
+        action_cond_scale: Tensor | float | None = None,
     ) -> Tensor:
         if latents.ndim != 5:
             raise ValueError(f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}")
@@ -507,5 +563,16 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         clean_history = latents[:, :, :context_latents]
         noisy_future = latents[:, :, context_latents:]
 
-        encoded_history = self.encode_history(clean_history, actions[:, :context_latents])
-        return self.decode_future(noisy_future, actions, timesteps, encoded_history, context_latents)
+        encoded_history = self.encode_history(
+            clean_history,
+            actions[:, :context_latents],
+            action_cond_scale=action_cond_scale,
+        )
+        return self.decode_future(
+            noisy_future,
+            actions,
+            timesteps,
+            encoded_history,
+            context_latents,
+            action_cond_scale=action_cond_scale,
+        )
