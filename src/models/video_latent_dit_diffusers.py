@@ -28,20 +28,6 @@ class AdaLayerNorm(nn.Module):
         return self.norm(x) * (1.0 + scale) + shift
 
 
-def _init_zero_attention_out(attn: Attention) -> None:
-    nn.init.zeros_(attn.to_out[0].weight)
-    if attn.to_out[0].bias is not None:
-        nn.init.zeros_(attn.to_out[0].bias)
-
-
-def _init_zero_ff_out(ff: FeedForward) -> None:
-    final_linear = ff.net[-1]
-    if isinstance(final_linear, nn.Linear):
-        nn.init.zeros_(final_linear.weight)
-        if final_linear.bias is not None:
-            nn.init.zeros_(final_linear.bias)
-
-
 class DiffusersEncoderBlock(nn.Module):
     """History encoder block built from Diffusers attention/MLP layers."""
 
@@ -85,10 +71,6 @@ class DiffusersEncoderBlock(nn.Module):
 
         self.norm3 = nn.LayerNorm(d_model)
         self.mlp = FeedForward(d_model, inner_dim=hidden_dim, dropout=dropout)
-
-        _init_zero_attention_out(self.self_attn)
-        _init_zero_attention_out(self.action_cross_attn)
-        _init_zero_ff_out(self.mlp)
 
     def forward(
         self,
@@ -168,11 +150,6 @@ class DiffusersDecoderBlock(nn.Module):
 
         self.norm4 = AdaLayerNorm(d_model)
         self.mlp = FeedForward(d_model, inner_dim=hidden_dim, dropout=dropout)
-
-        _init_zero_attention_out(self.self_attn)
-        _init_zero_attention_out(self.history_cross_attn)
-        _init_zero_attention_out(self.action_cross_attn)
-        _init_zero_ff_out(self.mlp)
 
     def forward(
         self,
@@ -310,8 +287,6 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
 
         self.final_norm = nn.LayerNorm(d_model)
         self.final_mod = nn.Linear(d_model, 2 * d_model)
-        nn.init.zeros_(self.final_mod.weight)
-        nn.init.zeros_(self.final_mod.bias)
 
     @staticmethod
     def _spatial_coords(height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
