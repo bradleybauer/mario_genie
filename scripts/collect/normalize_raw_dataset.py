@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import json
 import shutil
@@ -36,6 +37,11 @@ from rich.progress import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.data.smb1_memory_map import SMB1_RAM_LABELS  # noqa: E402
+
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 OUT_DIR = PROJECT_ROOT / "data" / "normalized"
 PALETTE_FILE = RAW_DIR / "smb1_palette.pal"
@@ -454,6 +460,65 @@ def run_process_pool(
     return [result for result in results if result is not None]
 
 
+def deduplicate_vary_together(
+    bases: list[Path], kept_cols: np.ndarray
+) -> np.ndarray:
+    """Collapse kept RAM addresses that share identical per-frame traces.
+
+    Streams each recording's .ram.npy and updates one hasher per kept column so
+    memory stays bounded. For every vary-together group, the lowest-indexed
+    address is retained as the representative and the others are dropped from
+    ``kept_cols``. Returns the reduced kept_cols array.
+    """
+    if kept_cols.size < 2:
+        return kept_cols
+
+    n_cols = int(kept_cols.size)
+    hashers = [hashlib.blake2b(digest_size=16) for _ in range(n_cols)]
+    for base in bases:
+        ram = np.load(str(base) + ".ram.npy", mmap_mode="r")
+        kept = np.ascontiguousarray(ram[:, kept_cols])
+        for i in range(n_cols):
+            hashers[i].update(np.ascontiguousarray(kept[:, i]).tobytes())
+
+    buckets: dict[bytes, list[int]] = {}
+    for i, h in enumerate(hashers):
+        buckets.setdefault(h.digest(), []).append(i)
+
+    groups = [group for group in buckets.values() if len(group) >= 2]
+    groups.sort(key=lambda g: (-len(g), g[0]))
+
+    grouped_cols = sum(len(g) for g in groups)
+    dropped_cols = sum(len(g) - 1 for g in groups)
+    CONSOLE.print(
+        f"RAM:     {len(groups)} vary-together group(s) covering {grouped_cols} / {n_cols} kept addresses; "
+        f"dropping {dropped_cols} redundant address(es)"
+    )
+
+    if not groups:
+        return kept_cols
+
+    shown = groups
+    for gi, group in enumerate(shown, start=1):
+        addrs = [int(kept_cols[i]) for i in group]
+        addr_strs = []
+        for a in addrs:
+            label = SMB1_RAM_LABELS.get(a, ("", ""))[0]
+            addr_strs.append(f"${a:04X}" + (f"({label})" if label else ""))
+        kept_addr = int(kept_cols[group[0]])
+        CONSOLE.print(
+            f"  group {gi} (size={len(group)}, keep ${kept_addr:04X}): {', '.join(addr_strs)}"
+        )
+    if len(groups) > len(shown):
+        CONSOLE.print(f"  ... {len(groups) - len(shown)} more group(s) hidden")
+
+    drop_local = {i for group in groups for i in group[1:]}
+    keep_local = np.array(
+        [i for i in range(n_cols) if i not in drop_local], dtype=kept_cols.dtype
+    )
+    return kept_cols[keep_local]
+
+
 def filter_empty_recordings(bases: list[Path]) -> list[Path]:
     """Delete empty recordings in place and return the remaining base paths."""
     valid_bases: list[Path] = []
@@ -573,6 +638,8 @@ def main():
         CONSOLE.print(
             f"RAM:     {len(kept_cols)} / {ram_min.shape[0]} non-constant addresses (Stack+OAM excluded)"
         )
+        kept_cols = deduplicate_vary_together(bases, kept_cols)
+        CONSOLE.print(f"RAM:     {len(kept_cols)} address(es) kept after vary-together dedup")
 
         # ── Write JSON mapping files ─────────────────────────────────────
         OUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -245,24 +245,13 @@ def load_latent_stats_path(
     )
 
 
-def shift_actions_causal(actions: torch.Tensor, *, default_action_index: int) -> torch.Tensor:
-    shifted = torch.empty_like(actions)
-    shifted[:, 0] = default_action_index
-    shifted[:, 1:] = actions[:, :-1]
-    return shifted
-
-
 def prepare_batch(
     batch: dict,
     *,
     device: torch.device,
-    default_action_index: int,
     latent_normalization: LatentNormalization | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    actions = shift_actions_causal(
-        batch["actions"].to(device, non_blocking=True).long(),
-        default_action_index=default_action_index,
-    )
+    actions = batch["actions"].to(device, non_blocking=True).long()
     latents = batch["latents"].to(device, non_blocking=True).float()
     if latent_normalization is not None:
         latents = latent_normalization.normalize(latents)
@@ -511,7 +500,6 @@ def evaluate(
             latents, actions = prepare_batch(
                 batch,
                 device=device,
-                default_action_index=default_action_index,
                 latent_normalization=latent_normalization,
             )
             history = latents[:, :, :context_latents]
@@ -941,7 +929,6 @@ def main() -> None:
                 latents, actions = prepare_batch(
                     batch,
                     device=device,
-                    default_action_index=default_action_index,
                     latent_normalization=latent_normalization,
                 )
 
@@ -1208,7 +1195,6 @@ def main() -> None:
                             {"latents": preview_clip["latents"].unsqueeze(0),
                              "actions": preview_clip["actions"].unsqueeze(0)},
                             device=device,
-                            default_action_index=default_action_index,
                             latent_normalization=latent_normalization,
                         )
 
