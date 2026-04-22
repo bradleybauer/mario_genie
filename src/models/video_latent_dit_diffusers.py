@@ -287,6 +287,8 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
 
         self.final_norm = nn.LayerNorm(d_model)
         self.final_mod = nn.Linear(d_model, 2 * d_model)
+        nn.init.zeros_(self.final_mod.weight)
+        nn.init.zeros_(self.final_mod.bias)
 
     @staticmethod
     def _spatial_coords(height: int, width: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
