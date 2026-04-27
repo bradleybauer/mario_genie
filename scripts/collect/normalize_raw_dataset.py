@@ -8,19 +8,16 @@ Reads data/raw/ and produces data/normalized/:
       actions.json, ram_addresses.json).
 
 Usage:
-    python scripts/collect/normalize_raw_dataset.py --workers 16
+    python scripts/collect/normalize_raw_dataset.py
 """
 
-import argparse
 import hashlib
-import os
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -70,36 +67,6 @@ _PASS2_KEPT_COLS: np.ndarray | None = None
 _PASS2_OUT_DIR: Path | None = None
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Normalize raw Mesen recordings into data/normalized.")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=0,
-        help=(
-            "Number of worker processes to use for per-recording work. "
-            "Default: use all logical CPUs, capped by recording count. Use 1 for sequential mode."
-        ),
-    )
-    return parser.parse_args()
-
-
-def resolve_worker_count(requested_workers: int, num_tasks: int) -> int:
-    """Choose a safe worker count for a pool-backed pass."""
-    if requested_workers < 0:
-        raise ValueError("--workers must be >= 0")
-    if num_tasks <= 0:
-        return 1
-    available = os.cpu_count() or 1
-    if requested_workers == 0:
-        # Each recording spawns two ffmpeg subprocesses and writes large temp files.
-        # A conservative default avoids exhausting ffmpeg thread/process resources.
-        desired = min(max(1, available // 2), 32)
-    else:
-        desired = requested_workers
-    return max(1, min(desired, num_tasks))
-
-
 def build_progress() -> Progress:
     """Build a Rich progress bar matching existing repo scripts."""
     return Progress(
@@ -138,14 +105,13 @@ def decode_avi_and_audio(
     expected_frames: int,
     sample_rate: int = AUDIO_SAMPLE_RATE,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Decode video, audio, and fps from AVI in parallel ffmpeg calls.
+    """Decode video, audio, and fps from AVI.
 
     Returns (rgb_frames, audio_samples, fps).
     """
     # Quick metadata read for fps
     fps = probe_fps(avi_path)
 
-    # Launch video and audio decodes concurrently
     video_cmd = [
         "ffmpeg", "-threads", "1", "-i", str(avi_path),
         "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -158,19 +124,20 @@ def decode_avi_and_audio(
         "-f", "s16le", "-acodec", "pcm_s16le",
         "-v", "error", "-",
     ]
-    video_proc = subprocess.Popen(video_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    audio_proc = subprocess.Popen(audio_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    video_result = subprocess.run(video_cmd, capture_output=True)
+    if video_result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg video error on {avi_path.name}: {video_result.stderr.decode()}"
+        )
 
-    video_out, video_err = video_proc.communicate()
-    audio_out, audio_err = audio_proc.communicate()
-
-    if video_proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg video error on {avi_path.name}: {video_err.decode()}")
-    if audio_proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio error on {avi_path.name}: {audio_err.decode()}")
+    audio_result = subprocess.run(audio_cmd, capture_output=True)
+    if audio_result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg audio error on {avi_path.name}: {audio_result.stderr.decode()}"
+        )
 
     # Parse video
-    raw = np.frombuffer(video_out, dtype=np.uint8)
+    raw = np.frombuffer(video_result.stdout, dtype=np.uint8)
     frame_bytes = NES_H * NES_W * 3
     actual_frames = len(raw) // frame_bytes
     if actual_frames < expected_frames:
@@ -183,7 +150,7 @@ def decode_avi_and_audio(
     rgb = raw.reshape(expected_frames, NES_H, NES_W, 3)
 
     # Parse audio
-    audio = np.frombuffer(audio_out, dtype=AUDIO_DTYPE)
+    audio = np.frombuffer(audio_result.stdout, dtype=AUDIO_DTYPE)
 
     return rgb, audio, fps
 
@@ -414,16 +381,15 @@ def process_recording_pass2(task: tuple[int, str, dict[str, Any]]) -> dict[str, 
     }
 
 
-def run_process_pool(
+def run_tasks(
     tasks: list[Any],
     *,
-    worker_count: int,
     description: str,
     fn,
     initializer=None,
     initargs: tuple[Any, ...] = (),
 ) -> list[dict[str, Any]]:
-    """Run tasks sequentially or in a process pool with a Rich progress bar."""
+    """Run tasks sequentially with a Rich progress bar."""
     if not tasks:
         return []
 
@@ -434,28 +400,14 @@ def run_process_pool(
     with build_progress() as progress:
         task_id = progress.add_task(description, total=len(tasks), rate=0.0)
 
-        if worker_count == 1:
-            if initializer is not None:
-                initializer(*initargs)
-            for task in tasks:
-                result = fn(task)
-                results[result["index"]] = result
-                completed += 1
-                elapsed = max(time.time() - start_time, 1e-9)
-                progress.update(task_id, advance=1, rate=completed / elapsed)
-        else:
-            with ProcessPoolExecutor(
-                max_workers=worker_count,
-                initializer=initializer,
-                initargs=initargs,
-            ) as pool:
-                futures = [pool.submit(fn, task) for task in tasks]
-                for future in as_completed(futures):
-                    result = future.result()
-                    results[result["index"]] = result
-                    completed += 1
-                    elapsed = max(time.time() - start_time, 1e-9)
-                    progress.update(task_id, advance=1, rate=completed / elapsed)
+        if initializer is not None:
+            initializer(*initargs)
+        for task in tasks:
+            result = fn(task)
+            results[result["index"]] = result
+            completed += 1
+            elapsed = max(time.time() - start_time, 1e-9)
+            progress.update(task_id, advance=1, rate=completed / elapsed)
 
     return [result for result in results if result is not None]
 
@@ -543,7 +495,6 @@ def filter_empty_recordings(bases: list[Path]) -> list[Path]:
 
 
 def main():
-    args = parse_args()
     palette = load_palette(PALETTE_FILE)
     bases = scan_raw_recordings()
 
@@ -558,8 +509,7 @@ def main():
         print("No valid recordings remaining.", file=sys.stderr)
         sys.exit(1)
 
-    worker_count = resolve_worker_count(args.workers, len(bases))
-    CONSOLE.print(f"Using {worker_count} worker(s)")
+    CONSOLE.print("Using sequential processing")
 
     # ── Pass 1: decode each AVI once, collect stats, cache to temp ──
     tmpdir = Path(tempfile.mkdtemp(prefix="normalize_"))
@@ -574,9 +524,8 @@ def main():
     cache_meta: list[dict[str, Any]] = [dict() for _ in bases]
 
     try:
-        pass1_results = run_process_pool(
+        pass1_results = run_tasks(
             [(i, str(base)) for i, base in enumerate(bases)],
-            worker_count=worker_count,
             description="Pass 1: decoding recordings",
             fn=process_recording_pass1,
             initializer=init_pass1_worker,
@@ -679,9 +628,8 @@ def main():
 
         # ── Pass 2: load cached data, remap, and save (no ffmpeg) ────────
         CONSOLE.print("Pass 2: remapping arrays and writing compressed .npz files ...")
-        pass2_results = run_process_pool(
+        pass2_results = run_tasks(
             [(i, str(base), cache_meta[i]) for i, base in enumerate(bases)],
-            worker_count=worker_count,
             description="Pass 2: saving normalized files",
             fn=process_recording_pass2,
             initializer=init_pass2_worker,

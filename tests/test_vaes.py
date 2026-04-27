@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,10 +14,35 @@ if project_root_str not in sys.path:
 from src.models.gan_discriminator import build_mel_discriminator, build_palette_discriminator
 from src.models.audio_vae import AudioVAE
 from src.models.audio_vocoder import AudioVocoder
+from src.models.ram_vae import RAMVAE
 from src.models.ram_video_vae import RAMVideoVAE
 from src.models.ram_video_vae_v2 import RAMVideoVAEv2
-from src.models.onehot_conv3d import OneHotConv3d
-from src.models.video_vae import CausalConv3d, VideoVAE
+from src.models.video_vae import VideoVAE
+
+
+def _encode_stream_in_chunks(
+    model: VideoVAE,
+    video: torch.Tensor,
+    chunk_sizes: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert sum(chunk_sizes) == video.shape[2]
+
+    state = model.init_encode_stream_state()
+    mean_chunks: list[torch.Tensor] = []
+    logvar_chunks: list[torch.Tensor] = []
+    start = 0
+    for index, chunk_size in enumerate(chunk_sizes):
+        end = start + chunk_size
+        mean_chunk, logvar_chunk, state = model.encode_stream(
+            video[:, :, start:end],
+            state,
+            final=index == len(chunk_sizes) - 1,
+        )
+        mean_chunks.append(mean_chunk)
+        logvar_chunks.append(logvar_chunk)
+        start = end
+
+    return torch.cat(mean_chunks, dim=2), torch.cat(logvar_chunks, dim=2)
 
 
 def test_video_vae_preserves_video_shape() -> None:
@@ -48,23 +74,59 @@ def test_video_vae_temporal_downsample_preserves_output_shape() -> None:
     assert output.latents.shape == (2, 4, 3, 1, 1)
 
 
-def test_video_vae_global_bottleneck_attention_preserves_shape() -> None:
+@pytest.mark.parametrize(
+    ("temporal_downsample", "frames", "chunk_sizes"),
+    [
+        (0, 6, (1, 2, 3)),
+        (0, 6, (2, 1, 1, 2)),
+        (1, 7, (1, 2, 1, 3)),
+        (1, 7, (1, 1, 1, 1, 1, 1, 1)),
+    ],
+)
+def test_video_vae_encode_stream_matches_full_encode(
+    temporal_downsample: int,
+    frames: int,
+    chunk_sizes: tuple[int, ...],
+) -> None:
+    model = VideoVAE(
+        num_colors=8,
+        base_channels=8,
+        latent_channels=4,
+        temporal_downsample=temporal_downsample,
+        dropout=0.0,
+    )
+    model.eval()
+    video = torch.randn(2, 8, frames, 32, 32)
+
+    full_mean, full_logvar = model.encode(video)
+    stream_mean, stream_logvar = _encode_stream_in_chunks(model, video, chunk_sizes)
+
+    torch.testing.assert_close(stream_mean, full_mean, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(stream_logvar, full_logvar, rtol=1e-5, atol=1e-6)
+
+
+def test_video_vae_encode_stream_final_flush_emits_trailing_paired_latent() -> None:
     model = VideoVAE(
         num_colors=8,
         base_channels=8,
         latent_channels=4,
         temporal_downsample=1,
-        global_bottleneck_attn=True,
-        global_bottleneck_attn_heads=4,
+        dropout=0.0,
     )
+    model.eval()
     video = torch.randn(2, 8, 5, 32, 32)
 
-    output = model(video, sample_posterior=False)
+    state = model.init_encode_stream_state()
+    mean_a, logvar_a, state = model.encode_stream(video[:, :, :4], state, final=False)
+    mean_b, logvar_b, _ = model.encode_stream(video[:, :, 4:], state, final=True)
+    full_mean, full_logvar = model.encode(video)
 
-    assert output.logits.shape == video.shape
-    assert output.posterior_mean.shape == (2, 4, 3, 1, 1)
-    assert output.posterior_logvar.shape == (2, 4, 3, 1, 1)
-    assert output.latents.shape == (2, 4, 3, 1, 1)
+    assert mean_a.shape[2] == 2
+    assert logvar_a.shape[2] == 2
+    assert mean_b.shape[2] == 1
+    assert logvar_b.shape[2] == 1
+    torch.testing.assert_close(torch.cat((mean_a, mean_b), dim=2), full_mean, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(torch.cat((logvar_a, logvar_b), dim=2), full_logvar, rtol=1e-5, atol=1e-6)
 
 
 def test_ram_video_vae_preserves_ram_and_video_shapes() -> None:
@@ -165,6 +227,31 @@ def test_ram_video_vae_v2_temporal_downsample_preserves_output_shape() -> None:
     assert output.video_latents.shape == (2, 4, 3, 2, 3)
 
 
+def test_ram_vae_expected_values_preserve_ram_shape() -> None:
+    model = RAMVAE(
+        values_per_address=[list(range(4)), [0, 64, 128, 255], [3, 9]],
+        embed_dim=4,
+        hidden_dim=16,
+        latent_dim=8,
+        dropout=0.0,
+    )
+    ram = torch.tensor(
+        [
+            [[0, 64, 3], [1, 128, 9], [2, 255, 3]],
+            [[3, 0, 9], [2, 64, 3], [1, 128, 9]],
+        ],
+        dtype=torch.long,
+    )
+
+    output = model(ram, sample_posterior=False)
+    expected = model.logits_to_expected_values(output.logits)
+
+    assert output.logits.shape == (2, 3, 10)
+    assert output.reconstruction.shape == ram.shape
+    assert expected.shape == ram.shape
+    assert expected.dtype == output.logits.dtype
+
+
 def test_audio_vae_preserves_mel_shape() -> None:
     model = AudioVAE(in_channels=1, n_mels=64, base_channels=8, latent_channels=4)
     mel = torch.rand(2, 1, 61, 64)
@@ -220,114 +307,3 @@ def test_mel_discriminator_returns_one_logit_per_sample() -> None:
     assert logits.shape == (2,)
 
 
-# ---------- OneHotConv3d tests ----------
-
-
-@torch.no_grad()
-def test_onehot_conv3d_matches_causal_conv3d() -> None:
-    """OneHotConv3d on palette indices must produce the same output as CausalConv3d on one-hot."""
-    num_classes, out_channels = 8, 12
-    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
-    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
-
-    indices = torch.randint(0, num_classes, (2, 4, 32, 32), device="cuda")
-    one_hot = torch.zeros(2, num_classes, 4, 32, 32, device="cuda")
-    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
-
-    expected = causal(one_hot)
-    actual = onehot(indices)
-
-    assert actual.shape == expected.shape
-    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-4)
-
-
-@torch.no_grad()
-def test_onehot_conv3d_uint8_matches_int64() -> None:
-    """OneHotConv3d produces identical output for uint8 and int64 indices."""
-    num_classes, out_channels = 8, 12
-    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
-    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
-
-    indices_long = torch.randint(0, num_classes, (2, 4, 32, 32), device="cuda")
-    indices_byte = indices_long.byte()
-
-    out_long = onehot(indices_long)
-    out_byte = onehot(indices_byte)
-
-    torch.testing.assert_close(out_byte, out_long, atol=1e-5, rtol=1e-5)
-
-
-@torch.no_grad()
-def test_onehot_conv3d_different_kernel_sizes() -> None:
-    """OneHotConv3d matches CausalConv3d for non-cubic kernels too."""
-    num_classes, out_channels = 6, 10
-    for ks in [(1, 1, 1), (3, 1, 1), (1, 3, 3)]:
-        causal = CausalConv3d(num_classes, out_channels, kernel_size=ks).cuda()
-        onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
-
-        indices = torch.randint(0, num_classes, (1, 3, 16, 16), device="cuda")
-        one_hot = torch.zeros(1, num_classes, 3, 16, 16, device="cuda")
-        one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
-
-        expected = causal(one_hot)
-        actual = onehot(indices)
-
-        torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-4)
-
-
-def test_onehot_conv3d_backward_matches_causal_conv3d() -> None:
-    """OneHotConv3d weight and bias gradients must match dense CausalConv3d."""
-    num_classes, out_channels = 8, 12
-    causal = CausalConv3d(num_classes, out_channels, kernel_size=3).cuda()
-    onehot = OneHotConv3d.from_causal_conv3d(causal).cuda()
-
-    indices = torch.randint(0, num_classes, (2, 4, 16, 16), device="cuda")
-    one_hot = torch.zeros(2, num_classes, 4, 16, 16, device="cuda")
-    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
-
-    dense_out = causal(one_hot)
-    sparse_out = onehot(indices)
-    grad = torch.randn_like(dense_out)
-
-    dense_out.backward(grad)
-    sparse_out.backward(grad)
-
-    torch.testing.assert_close(sparse_out, dense_out, atol=5e-4, rtol=1e-4)
-    torch.testing.assert_close(onehot.weight.grad, causal.conv.weight.grad, atol=5e-4, rtol=1e-4)
-    assert onehot.bias is not None
-    assert causal.conv.bias is not None
-    torch.testing.assert_close(onehot.bias.grad, causal.conv.bias.grad, atol=5e-4, rtol=1e-4)
-
-
-def test_video_vae_4d_indices_match_5d_onehot() -> None:
-    """VideoVAE(onehot_conv=True) forward with 4D indices matches 5D one-hot."""
-    num_colors = 8
-    model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4, onehot_conv=True)
-    model.eval().cuda()
-
-    indices = torch.randint(0, num_colors, (2, 4, 32, 32), device="cuda")
-    one_hot = torch.zeros(2, num_colors, 4, 32, 32, device="cuda")
-    one_hot.scatter_(1, indices.unsqueeze(1), 1.0)
-
-    with torch.no_grad():
-        out_idx = model(indices, sample_posterior=False)
-        out_oh = model(one_hot, sample_posterior=False)
-
-    torch.testing.assert_close(out_idx.logits, out_oh.logits, atol=1e-3, rtol=1e-3)
-    torch.testing.assert_close(out_idx.posterior_mean, out_oh.posterior_mean, atol=1e-3, rtol=1e-3)
-
-
-def test_video_vae_loads_old_checkpoint_keys() -> None:
-    """Checkpoints cross-load between onehot_conv=True and False."""
-    num_colors = 8
-
-    # CausalConv3d (default) -> OneHotConv3d
-    default_model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4)
-    default_state = default_model.state_dict()
-    onehot_model = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4, onehot_conv=True)
-    onehot_model.load_state_dict(default_state, strict=True)
-
-    # OneHotConv3d -> CausalConv3d (default)
-    onehot_state = onehot_model.state_dict()
-    fresh_default = VideoVAE(num_colors=num_colors, base_channels=8, latent_channels=4)
-    fresh_default.load_state_dict(onehot_state, strict=True)

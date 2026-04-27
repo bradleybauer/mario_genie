@@ -23,6 +23,7 @@ import random
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,9 @@ if project_root_str not in sys.path:
 from src.data.latent_dataset import LatentSequenceDataset
 from src.data.normalized_dataset import load_palette_tensor
 from src.models.latent_utils import (
+    FLOW_SAMPLERS,
     LatentNormalization,
+    integrate_flow_ode,
     is_readable as _is_readable,
     load_json as _load_json,
     load_latent_normalization,
@@ -55,7 +58,9 @@ from src.models.latent_utils import (
 from src.models.video_latent_dit_unified import VideoLatentDiTUnified
 from src.path_utils import resolve_workspace_path
 from src.system_info import collect_system_info, print_system_info
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -130,7 +135,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--disable-latent-normalization", action="store_true")
 
-    parser.add_argument("--clip-latents", type=int, default=256)
     parser.add_argument("--context-latents", type=int, default=255)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
@@ -156,9 +160,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flow-loss", type=str, choices=["mse", "huber"], default="huber")
     parser.add_argument("--huber-delta", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=10.0)
+    parser.add_argument(
+        "--action-cfg-drop-prob",
+        type=float,
+        default=0.1,
+        help="Per-sample probability of dropping action conditioning during training.",
+    )
 
     parser.add_argument("--timestep-sampler", type=str, choices=["uniform", "logit_normal"],
-                        default="uniform")
+                        default="logit_normal")
 
     parser.add_argument(
         "--error-buffer-size", type=int, default=1024,
@@ -169,7 +179,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-inject-start-step", type=int, default=2000)
     parser.add_argument("--error-buffer-clip", type=float, default=3.0)
 
-    parser.add_argument("--preview-ode-steps", type=int, default=8)
+    parser.add_argument("--preview-ode-steps", type=int, default=64)
+    parser.add_argument(
+        "--preview-ode-sampler",
+        type=str,
+        choices=FLOW_SAMPLERS,
+        default="heun",
+        help="Flow ODE sampler used for autoregressive rollout previews.",
+    )
+    parser.add_argument(
+        "--preview-action-cfg-scale",
+        type=float,
+        default=2.0,
+        help="Action CFG scale used for autoregressive rollout previews.",
+    )
     parser.add_argument("--preview-interval", type=int, default=None,
                         help="Steps between rollout previews (default: eval-interval).")
     parser.add_argument("--preview-rollout-latents", type=int, default=64,
@@ -187,17 +210,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
 
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    if args.clip_latents < 2:
-        parser.error("--clip-latents must be >= 2")
     if args.context_latents < 1:
         parser.error("--context-latents must be >= 1")
-    if args.context_latents >= args.clip_latents:
-        parser.error("--context-latents must be smaller than --clip-latents")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient-accumulation-steps must be >= 1")
+    if not (0.0 <= args.action_cfg_drop_prob <= 1.0):
+        parser.error("--action-cfg-drop-prob must be in [0, 1]")
+    if args.preview_action_cfg_scale < 0.0:
+        parser.error("--preview-action-cfg-scale must be >= 0")
     if args.num_layers <= 0:
         parser.error("--num-layers must be > 0")
 
@@ -233,24 +261,13 @@ def load_latent_stats_path(
     )
 
 
-def shift_actions_causal(actions: torch.Tensor, *, default_action_index: int) -> torch.Tensor:
-    shifted = torch.empty_like(actions)
-    shifted[:, 0] = default_action_index
-    shifted[:, 1:] = actions[:, :-1]
-    return shifted
-
-
 def prepare_batch(
     batch: dict,
     *,
     device: torch.device,
-    default_action_index: int,
     latent_normalization: LatentNormalization | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    actions = shift_actions_causal(
-        batch["actions"].to(device, non_blocking=True).long(),
-        default_action_index=default_action_index,
-    )
+    actions = batch["actions"].to(device, non_blocking=True).long()
     latents = batch["latents"].to(device, non_blocking=True).float()
     if latent_normalization is not None:
         latents = latent_normalization.normalize(latents)
@@ -362,33 +379,33 @@ def denoise_future_segment_unified(
     *,
     history_latents: torch.Tensor,
     actions: torch.Tensor,
-    future_latents: int,
     ode_steps: int,
-    autocast_ctx=None,
+    ode_sampler: str = "heun",
+    action_cfg_scale: float = 1.0,
+    autocast_ctx=nullcontext,
 ) -> torch.Tensor:
-    """Denoise future latents via midpoint ODE integration (unified model).
+    """Denoise one future latent via explicit flow ODE integration.
 
     Unlike the encoder-decoder variant, history is reprocessed at every ODE
     step since the unified model has no separate encoding pass.
     """
     batch, channels, ctx, height, width = history_latents.shape
     future = torch.randn(
-        batch, channels, future_latents, height, width,
+        batch, channels, 1, height, width,
         device=history_latents.device, dtype=history_latents.dtype,
     )
 
-    dt = 1.0 / float(ode_steps)
-    for step in range(ode_steps, 0, -1):
-        t_val = (step - 0.5) / float(ode_steps)
-        t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
-        model_input = torch.cat((history_latents, future), dim=2)
-        if autocast_ctx is not None:
-            with autocast_ctx():
-                velocity = model(model_input, actions, t, ctx)
-        else:
-            velocity = model(model_input, actions, t, ctx)
-        future = future - dt * velocity
-    return future
+    def velocity_fn(current_future: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        model_input = torch.cat((history_latents, current_future), dim=2)
+        with autocast_ctx():
+            return model(model_input, actions, t, ctx, action_cond_scale=action_cfg_scale)
+
+    return integrate_flow_ode(
+        future,
+        ode_steps=ode_steps,
+        velocity_fn=velocity_fn,
+        sampler=ode_sampler,
+    )
 
 
 def denoise_future_segment(
@@ -396,16 +413,18 @@ def denoise_future_segment(
     *,
     history_latents: torch.Tensor,
     actions: torch.Tensor,
-    future_latents: int,
     ode_steps: int,
+    ode_sampler: str = "heun",
+    action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
     return denoise_future_segment_unified(
         accelerator.unwrap_model(model),
         history_latents=history_latents,
         actions=actions,
-        future_latents=future_latents,
         ode_steps=ode_steps,
+        ode_sampler=ode_sampler,
+        action_cfg_scale=action_cfg_scale,
         autocast_ctx=accelerator.autocast,
     )
 
@@ -417,16 +436,17 @@ def autoregressive_rollout(
     seed_latents: torch.Tensor,
     all_actions: torch.Tensor,
     context_latents: int,
-    future_latents: int,
     total_latents: int,
     ode_steps: int,
+    ode_sampler: str = "heun",
+    action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
     """Autoregressively roll out latent timesteps."""
     generated = seed_latents  # (B, C, context_latents, H, W)
     while generated.shape[2] < total_latents:
         generated_latent_count = generated.shape[2]
-        step_future = min(future_latents, total_latents - generated_latent_count)
+        step_future = 1
         history = generated[:, :, -context_latents:]
         abs_start = generated_latent_count - context_latents
         abs_end = generated_latent_count + step_future
@@ -435,8 +455,9 @@ def autoregressive_rollout(
             model,
             history_latents=history,
             actions=step_actions,
-            future_latents=step_future,
             ode_steps=ode_steps,
+            ode_sampler=ode_sampler,
+            action_cfg_scale=action_cfg_scale,
             accelerator=accelerator,
         )
         generated = torch.cat([generated, pred], dim=2)
@@ -505,7 +526,6 @@ def evaluate(
     device: torch.device,
     context_latents: int,
     accelerator: Accelerator,
-    default_action_index: int,
     loss_type: str,
     huber_delta: float,
     latent_normalization: LatentNormalization | None,
@@ -520,11 +540,14 @@ def evaluate(
             latents, actions = prepare_batch(
                 batch,
                 device=device,
-                default_action_index=default_action_index,
                 latent_normalization=latent_normalization,
             )
             history = latents[:, :, :context_latents]
             future = latents[:, :, context_latents:]
+            if future.shape[2] != 1:
+                raise ValueError(
+                    f"Unified evaluation expects one future latent, got {future.shape[2]}"
+                )
             noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
             model_input = torch.cat((history, noisy_future), dim=2)
 
@@ -549,6 +572,7 @@ def evaluate(
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    clip_latent_count = args.context_latents + 1
 
     data_dir = _resolve_data_dir(args)
     output_dir = make_output_dir(
@@ -587,7 +611,7 @@ def main() -> None:
     with accelerator.main_process_first():
         dataset = LatentSequenceDataset(
             data_dir=data_dir,
-            clip_latents=args.clip_latents,
+            clip_latents=clip_latent_count,
             include_actions=True,
             num_workers=args.num_workers,
             system_info=system_info,
@@ -599,8 +623,15 @@ def main() -> None:
     latent_frame_width = int(latent_meta.get("frame_width", 0)) if latent_meta is not None else 0
     latent_source_height = int(latent_meta.get("source_frame_height", latent_frame_height or 0)) if latent_meta is not None else 0
     latent_source_width = int(latent_meta.get("source_frame_width", latent_frame_width or 0)) if latent_meta is not None else 0
+    action_frame_count = int(dataset.action_frame_count)
+    expected_action_frame_count = int(latent_meta.get("action_frame_count", action_frame_count)) if latent_meta is not None else action_frame_count
     expected_latent_height = int(latent_meta.get("latent_height", 0)) if latent_meta is not None else 0
     expected_latent_width = int(latent_meta.get("latent_width", 0)) if latent_meta is not None else 0
+    if expected_action_frame_count != action_frame_count:
+        raise ValueError(
+            f"Latent dataset action frame count mismatch: metadata says {expected_action_frame_count}, "
+            f"indexed dataset says {action_frame_count}"
+        )
     if expected_latent_height > 0 and expected_latent_height != int(dataset.latent_height):
         raise ValueError(
             f"Latent dataset height mismatch: metadata says {expected_latent_height}, indexed dataset says {dataset.latent_height}"
@@ -617,7 +648,7 @@ def main() -> None:
     )
 
     if accelerator.is_main_process:
-        console.print(f"Found {len(dataset)} segments of {args.clip_latents} latents.")
+        console.print(f"Found {len(dataset)} segments of {clip_latent_count} latents.")
         if eval_dataset:
             console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train")
 
@@ -731,9 +762,9 @@ def main() -> None:
         if action_values_meta is not None
         else list(range(num_actions))
     )
-    default_action_index = int({v: i for i, v in enumerate(action_values)}.get(0, 0))
     if accelerator.is_main_process:
-        console.print(f"[actions] num_actions={num_actions} default_index={default_action_index}")
+        console.print(f"[actions] num_actions={num_actions}")
+        console.print(f"[actions] action_frame_count={action_frame_count}")
 
     # ------------------------------------------------------------------
     # Model
@@ -741,6 +772,7 @@ def main() -> None:
     model_config = dict(
         latent_channels=latent_channels,
         num_actions=num_actions,
+        action_frame_count=action_frame_count,
         action_dim=args.action_dim,
         action_values=action_values,
         d_model=args.d_model,
@@ -748,7 +780,7 @@ def main() -> None:
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
-        max_latents=args.clip_latents,
+        max_latents=clip_latent_count,
     )
     model: torch.nn.Module = build_unified_dit(model_config=model_config).to(device)
     diffusers_version = str(diffusers.__version__)
@@ -828,39 +860,52 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Save training config
     # ------------------------------------------------------------------
+    config = build_trainer_config(
+        model_name="unified_dit",
+        args=args,
+        device=device,
+        mixed_precision=args.mixed_precision,
+        num_processes=accelerator.num_processes,
+        data={
+            "latent_channels": int(latent_channels),
+            "latent_height": int(dataset.latent_height),
+            "latent_width": int(dataset.latent_width),
+            "num_actions": int(num_actions),
+            "action_frame_count": int(action_frame_count),
+            "clip_latents": int(clip_latent_count),
+            "context_latents": int(args.context_latents),
+            "future_latents_per_step": 1,
+            "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
+            "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
+            "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
+            "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
+            "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
+            "latent_stats_version": int(latent_normalization.version) if latent_normalization is not None else None,
+            "latent_normalization_scheme": latent_normalization.scheme if latent_normalization is not None else None,
+        },
+        model={
+            "num_parameters": int(num_params),
+            "config": model_config,
+            "backend": "diffusers",
+            "diffusers_version": diffusers_version,
+        },
+    )
+    mlflow_run = MLflowRun.create(
+        enabled=accelerator.is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "unified_dit",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if accelerator.is_main_process:
-        save_json(
-            output_dir / "config.json",
-            build_trainer_config(
-                model_name="unified_dit",
-                args=args,
-                device=device,
-                mixed_precision=args.mixed_precision,
-                num_processes=accelerator.num_processes,
-                data={
-                    "latent_channels": int(latent_channels),
-                    "latent_height": int(dataset.latent_height),
-                    "latent_width": int(dataset.latent_width),
-                    "num_actions": int(num_actions),
-                    "clip_latents": int(args.clip_latents),
-                    "context_latents": int(args.context_latents),
-                    "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
-                    "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
-                    "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
-                    "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
-                    "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
-                    "latent_stats_version": int(latent_normalization.version) if latent_normalization is not None else None,
-                    "latent_normalization_scheme": latent_normalization.scheme if latent_normalization is not None else None,
-                },
-                model={
-                    "num_parameters": int(num_params),
-                    "config": model_config,
-                    "backend": "diffusers",
-                    "diffusers_version": diffusers_version,
-                },
-            ),
-            indent=2,
-        )
+        save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
 
     error_buffer = ResidualErrorBuffer(args.error_buffer_size, clip_abs=args.error_buffer_clip)
 
@@ -930,12 +975,15 @@ def main() -> None:
                 latents, actions = prepare_batch(
                     batch,
                     device=device,
-                    default_action_index=default_action_index,
                     latent_normalization=latent_normalization,
                 )
 
                 history = latents[:, :, :args.context_latents]
                 future = latents[:, :, args.context_latents:]
+                if future.shape[2] != 1:
+                    raise ValueError(
+                        f"Unified training expects one future latent, got {future.shape[2]}"
+                    )
 
                 # Optional history perturbation
                 if (
@@ -955,10 +1003,21 @@ def main() -> None:
 
                 noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
                 model_input = torch.cat((history, noisy_future), dim=2)
+                action_cond_scale = None
+                if args.action_cfg_drop_prob > 0.0:
+                    action_cond_scale = (
+                        torch.rand(actions.shape[0], device=device) >= args.action_cfg_drop_prob
+                    ).to(dtype=model_input.dtype)
 
                 with accelerator.accumulate(model):
                     with accelerator.autocast():
-                        v_pred = model(model_input, actions, t, args.context_latents)
+                        v_pred = model(
+                            model_input,
+                            actions,
+                            t,
+                            args.context_latents,
+                            action_cond_scale=action_cond_scale,
+                        )
                         loss = compute_flow_loss(v_pred, v_target, loss_type=args.flow_loss, huber_delta=args.huber_delta)
 
                     if not torch.isfinite(loss):
@@ -1068,6 +1127,7 @@ def main() -> None:
                 }
                 train_entry.update(gpu_stats(device))
                 metrics.append(train_entry)
+                mlflow_run.log_metrics(train_entry)
                 with train_log_path.open("a") as fh:
                     fh.write(json.dumps(train_entry) + "\n")
                 if not use_live:
@@ -1111,7 +1171,6 @@ def main() -> None:
                     device=device,
                     context_latents=args.context_latents,
                     accelerator=accelerator,
-                    default_action_index=default_action_index,
                     loss_type=args.flow_loss,
                     huber_delta=args.huber_delta,
                     latent_normalization=latent_normalization,
@@ -1125,6 +1184,7 @@ def main() -> None:
                 eval_cgnorms = _component_gnorms(accelerator.unwrap_model(model))
                 eval_metrics.update({f"grad_norm_{k}": v for k, v in eval_cgnorms.items()})
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
 
                 eval_line = (
                     f"eval step={step:06d} flow_loss={eval_metrics['flow_loss']:.6f} "
@@ -1183,8 +1243,11 @@ def main() -> None:
                     try:
                         t0_preview = time.perf_counter()
                         context_latent_count = args.context_latents
-                        rollout_step_latent_count = args.clip_latents - context_latent_count
                         predicted_latent_count = args.preview_rollout_latents
+                        preview_context_latents = min(
+                            predicted_latent_count,
+                            context_latent_count + 1,
+                        )
 
                         # Sample a fresh clip of exactly the right length.
                         episode_index, episode_latent_count = random.choice(_preview_eligible)
@@ -1194,11 +1257,11 @@ def main() -> None:
                             {"latents": preview_clip["latents"].unsqueeze(0),
                              "actions": preview_clip["actions"].unsqueeze(0)},
                             device=device,
-                            default_action_index=default_action_index,
                             latent_normalization=latent_normalization,
                         )
 
                         seed_latents = reference_latents[:, :, :context_latent_count]
+                        preview_start_latent = max(0, context_latent_count - preview_context_latents)
 
                         t0_denoise = time.perf_counter()
                         rollout_latents = autoregressive_rollout(
@@ -1206,9 +1269,10 @@ def main() -> None:
                             seed_latents=seed_latents,
                             all_actions=reference_actions,
                             context_latents=context_latent_count,
-                            future_latents=rollout_step_latent_count,
                             total_latents=_preview_length,
                             ode_steps=args.preview_ode_steps,
+                            ode_sampler=args.preview_ode_sampler,
+                            action_cfg_scale=args.preview_action_cfg_scale,
                             accelerator=accelerator,
                         )
                         torch.cuda.synchronize()
@@ -1219,10 +1283,14 @@ def main() -> None:
 
                         t0_decode = time.perf_counter()
                         rollout_frame_indices = latents_to_frame_indices(
-                            video_vae, denormalize_for_preview(rollout_latents), accelerator=accelerator
+                            video_vae,
+                            denormalize_for_preview(rollout_latents[:, :, preview_start_latent:]),
+                            accelerator=accelerator,
                         )
                         reference_frame_indices = latents_to_frame_indices(
-                            video_vae, denormalize_for_preview(reference_latents), accelerator=accelerator
+                            video_vae,
+                            denormalize_for_preview(reference_latents[:, :, preview_start_latent:]),
+                            accelerator=accelerator,
                         )
                         torch.cuda.synchronize()
                         t_decode = time.perf_counter() - t0_decode
@@ -1231,8 +1299,8 @@ def main() -> None:
                         out_path = preview_path(output_dir, split="rollout", step=step)
                         save_rollout_preview(
                             out_path,
-                            frames_gt=reference_frame_indices[0, context_latent_count:],
-                            frames_pred=rollout_frame_indices[0, context_latent_count:],
+                            frames_gt=reference_frame_indices[0],
+                            frames_pred=rollout_frame_indices[0],
                             palette=palette,
                         )
                         t_save = time.perf_counter() - t0_save
@@ -1240,7 +1308,8 @@ def main() -> None:
                         t_preview = time.perf_counter() - t0_preview
                         log_console.print(
                             f"[rollout] {t_preview:.1f}s total "
-                            f"(latents={_preview_length} ctx={context_latent_count} pred={predicted_latent_count} "
+                            f"(latents={_preview_length} ctx={context_latent_count} "
+                            f"ctx_shown={context_latent_count - preview_start_latent} pred={predicted_latent_count} "
                             f"denoise={t_denoise:.1f}s "
                             f"decode={t_decode:.1f}s save={t_save:.1f}s) -> {out_path}",
                             markup=False,
@@ -1255,6 +1324,11 @@ def main() -> None:
                 accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
+        save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
         console.print(f"Training complete. Best eval flow_loss={best_eval:.6f}")
 
 

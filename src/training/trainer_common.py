@@ -272,6 +272,45 @@ def add_resume_scheduler_args(
     )
 
 
+def add_mlflow_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--mlflow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable MLflow tracking for this training run.",
+    )
+    parser.add_argument(
+        "--mlflow-experiment",
+        type=str,
+        default="mario",
+        help="MLflow experiment name to log into when --mlflow is enabled.",
+    )
+    parser.add_argument(
+        "--mlflow-tracking-uri",
+        type=str,
+        default=None,
+        help="Optional MLflow tracking URI. Defaults to the current MLflow environment configuration.",
+    )
+    parser.add_argument(
+        "--mlflow-run-name",
+        type=str,
+        default=None,
+        help="Optional MLflow run name override. Defaults to --run-name or the output directory name.",
+    )
+    parser.add_argument(
+        "--mlflow-tag",
+        action="append",
+        default=None,
+        help="Additional MLflow tag in key=value format. Pass multiple times to add multiple tags.",
+    )
+    parser.add_argument(
+        "--mlflow-log-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upload the full output directory to MLflow when training finishes.",
+    )
+
+
 def validate_resume_scheduler_args(
     parser: argparse.ArgumentParser,
     args: Any,

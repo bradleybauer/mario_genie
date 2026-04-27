@@ -41,10 +41,11 @@ from src.training.palette_video_vae_training import (
     evaluate_video_vae,
     frames_to_one_hot,
     save_video_preview,
-    split_context_targets,
 )
 from src.system_info import collect_system_info, print_system_info
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     add_resume_scheduler_args,
     build_trainer_config,
     configure_resume_scheduler,
@@ -84,36 +85,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--clip-frames", type=int, default=16)
     parser.add_argument(
-        "--context-frames",
-        type=int,
-        default=0,
-        help="Extra context frames prepended to each clip; recon loss is masked to non-context frames.",
-    )
-    parser.add_argument(
         "--frame-size",
         type=int,
         default=224,
         choices=SUPPORTED_FRAME_SIZES,
         help="Output frame size used for training and eval previews.",
-    )
-    parser.add_argument(
-        "--progressive-resize",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Train first at lower resolution, then switch to --frame-size for fine-tuning.",
-    )
-    parser.add_argument(
-        "--progressive-start-size",
-        type=int,
-        default=112,
-        choices=SUPPORTED_FRAME_SIZES,
-        help="Initial lower resolution when --progressive-resize is enabled.",
-    )
-    parser.add_argument(
-        "--progressive-switch-ratio",
-        type=float,
-        default=0.8,
-        help="Fraction of total steps spent at --progressive-start-size before switching to --frame-size.",
     )
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument(
@@ -178,24 +154,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="bf16",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode passed to Accelerator.",
-    )
-    parser.add_argument(
-        "--onehot-conv",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use OneHotConv3d for the encoder input (index-gather instead of dense conv on one-hot).",
-    )
-    parser.add_argument(
-        "--global-bottleneck-attn",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable a lightweight global self-attention block at the 3D bottleneck.",
-    )
-    parser.add_argument(
-        "--global-bottleneck-attn-heads",
-        type=int,
-        default=8,
-        help="Number of attention heads for --global-bottleneck-attn.",
     )
     parser.add_argument(
         "--compile",
@@ -346,9 +304,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--resume-from", type=str, default=None)
     add_resume_scheduler_args(parser, default_tail_final_lr_scale=0.25)
+    add_mlflow_args(parser)
     args = parser.parse_args(argv)
-    if args.context_frames < 0:
-        parser.error("--context-frames must be >= 0")
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.clip_frames <= 0:
         parser.error("--clip-frames must be > 0")
     if args.eval_batch_size is not None and args.eval_batch_size <= 0:
@@ -363,13 +324,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--palette-aug-prob must be in [0, 1]")
     if not (0.0 <= args.dropout < 1.0):
         parser.error("--dropout must be in [0, 1)")
-    if args.global_bottleneck_attn_heads <= 0:
-        parser.error("--global-bottleneck-attn-heads must be > 0")
-    if args.progressive_resize:
-        if args.progressive_start_size >= args.frame_size:
-            parser.error("--progressive-start-size must be smaller than --frame-size")
-        if not (0.0 < args.progressive_switch_ratio < 1.0):
-            parser.error("--progressive-switch-ratio must be in (0, 1)")
     if args.ram_align_weight > 0 and args.ram_vae_checkpoint is None:
         parser.error("--ram-vae-checkpoint is required when --ram-align-weight > 0")
     validate_resume_scheduler_args(parser, args)
@@ -554,9 +508,7 @@ def _format_resume_optimizer_mismatch(
         f"ram_align_head={current_has_ram}, "
         f"base_channels={int(args.base_channels)}, "
         f"latent_channels={int(args.latent_channels)}, "
-        f"temporal_downsample={int(args.temporal_downsample)}, "
-        f"onehot_conv={bool(args.onehot_conv)}, "
-        f"global_bottleneck_attn={bool(args.global_bottleneck_attn)}"
+        f"temporal_downsample={int(args.temporal_downsample)}"
     )
     lines.append(
         "Checkpoint state keys: "
@@ -574,9 +526,6 @@ def _format_resume_optimizer_mismatch(
             "base_channels",
             "latent_channels",
             "temporal_downsample",
-            "onehot_conv",
-            "global_bottleneck_attn",
-            "global_bottleneck_attn_heads",
             "num_actions",
             "action_embed_dim",
             "next_frame_hidden_dim",
@@ -678,7 +627,6 @@ def main() -> None:
     if is_main_process:
         print_system_info(system_info)
 
-    total_clip_frames = args.clip_frames + args.context_frames
     eval_batch_size = args.eval_batch_size or args.batch_size
     use_aux_actions = args.next_frame_weight > 0
     use_aux_ram = args.ram_align_weight > 0
@@ -706,7 +654,7 @@ def main() -> None:
         with accelerator.main_process_first():
             stage_dataset = NormalizedSequenceDataset(
                 data_dir=args.data_dir,
-                clip_frames=total_clip_frames,
+                clip_frames=args.clip_frames,
                 frame_size=frame_size,
                 include_actions=use_aux_actions,
                 include_ram=use_aux_ram,
@@ -726,8 +674,7 @@ def main() -> None:
             raise RuntimeError("Could not determine training frame shape from dataset")
         if is_main_process:
             console.print(
-                f"[dataset:{stage_label}] Found {len(stage_dataset)} sequence segments of {total_clip_frames} "
-                f"frames ({args.context_frames} context + {args.clip_frames} target)."
+                f"[dataset:{stage_label}] Found {len(stage_dataset)} sequence segments of {args.clip_frames} frames."
             )
             console.print(
                 f"[dataset:{stage_label}] Dataset: {stage_dataset.num_files} files, {len(stage_dataset):,} samples, "
@@ -769,14 +716,8 @@ def main() -> None:
             int(stage_source_frame_width or stage_frame_width),
         )
 
-    progressive_resize = args.progressive_resize and args.progressive_start_size != args.frame_size
     target_frame_size = int(args.frame_size)
-    current_frame_size = int(args.progressive_start_size if progressive_resize else target_frame_size)
-    if progressive_resize and is_main_process:
-        console.print(
-            f"[progressive] Enabled: {current_frame_size}x{current_frame_size} -> "
-            f"{target_frame_size}x{target_frame_size} at {args.progressive_switch_ratio:.0%} of training."
-        )
+    current_frame_size = target_frame_size
 
     (
         dataset,
@@ -788,7 +729,7 @@ def main() -> None:
         frame_width,
         source_frame_height,
         source_frame_width,
-    ) = build_data_for_frame_size(current_frame_size, stage_label="initial")
+    ) = build_data_for_frame_size(target_frame_size, stage_label="train")
 
     palette_path = Path(args.data_dir) / "palette.json"
     palette = load_palette_tensor(args.data_dir)
@@ -840,9 +781,6 @@ def main() -> None:
         latent_channels=args.latent_channels,
         temporal_downsample=args.temporal_downsample,
         dropout=args.dropout,
-        onehot_conv=args.onehot_conv,
-        global_bottleneck_attn=args.global_bottleneck_attn,
-        global_bottleneck_attn_heads=args.global_bottleneck_attn_heads,
     ).to(device)
     discriminator = None
     discriminator_optimizer = None
@@ -1031,45 +969,6 @@ def main() -> None:
             for message in scheduler_setup.log_messages:
                 console.print(message)
 
-    progressive_switch_step: int | None = None
-    if progressive_resize:
-        if args.max_steps < 2:
-            progressive_resize = False
-            if is_main_process:
-                console.print("[progressive] Disabled because --max-steps < 2.")
-        else:
-            progressive_switch_step = int(args.max_steps * args.progressive_switch_ratio)
-            progressive_switch_step = min(max(progressive_switch_step, 1), args.max_steps - 1)
-            if is_main_process:
-                console.print(
-                    f"[progressive] Switch step: {progressive_switch_step} "
-                    f"(start_step={start_step}, max_steps={args.max_steps})."
-                )
-
-    if (
-        progressive_resize
-        and progressive_switch_step is not None
-        and start_step >= progressive_switch_step
-        and current_frame_size != target_frame_size
-    ):
-        if is_main_process:
-            console.print(
-                f"[progressive] Resume starts at step {start_step} >= switch step {progressive_switch_step}; "
-                f"loading full-resolution data ({target_frame_size}x{target_frame_size}) now."
-            )
-        (
-            dataset,
-            train_dataset,
-            eval_dataset,
-            train_loader,
-            eval_loader,
-            frame_height,
-            frame_width,
-            source_frame_height,
-            source_frame_width,
-        ) = build_data_for_frame_size(target_frame_size, stage_label="fullres-resume")
-        current_frame_size = target_frame_size
-
     if args.use_gan and discriminator is not None and discriminator_optimizer is not None:
         model, discriminator, optimizer, discriminator_optimizer, train_loader = accelerator.prepare(
             model,
@@ -1092,13 +991,10 @@ def main() -> None:
         data={
             "num_colors": int(num_colors),
             "clip_frames": int(args.clip_frames),
-            "context_frames": int(args.context_frames),
-            "frame_height": int(target_frame_size),
-            "frame_width": int(target_frame_size),
+            "frame_height": int(frame_height),
+            "frame_width": int(frame_width),
             "source_frame_height": int(source_frame_height or frame_height),
             "source_frame_width": int(source_frame_width or frame_width),
-            "initial_frame_height": int(frame_height),
-            "initial_frame_width": int(frame_width),
         },
         model={
             "num_parameters": int(num_parameters),
@@ -1107,15 +1003,27 @@ def main() -> None:
             "latent_channels": int(args.latent_channels),
             "temporal_downsample": int(args.temporal_downsample),
             "dropout": float(args.dropout),
-            "global_bottleneck_attn": bool(args.global_bottleneck_attn),
-            "global_bottleneck_attn_heads": int(args.global_bottleneck_attn_heads),
             "next_frame_weight": float(args.next_frame_weight),
             "temporal_smooth_weight": float(args.temporal_smooth_weight),
             "ram_align_weight": float(args.ram_align_weight),
         },
     )
+    mlflow_run = MLflowRun.create(
+        enabled=is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "video_vae",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
         console.print(f"Config saved to {output_dir / 'config.json'}")
         console.print(json.dumps(config, indent=2))
 
@@ -1142,39 +1050,7 @@ def main() -> None:
         log_console = progress.console
         train_task = progress.add_task("Training", total=total_train_steps, status="")
         onehot_buffer: torch.Tensor | None = None
-        use_onehot_conv = args.onehot_conv
         for step in range(start_step, args.max_steps):
-            if (
-                progressive_resize
-                and progressive_switch_step is not None
-                and current_frame_size != target_frame_size
-                and step >= progressive_switch_step
-            ):
-                accelerator.wait_for_everyone()
-                if is_main_process:
-                    log_console.print(
-                        f"[progressive] Switching to full resolution at step {step}: "
-                        f"{current_frame_size}x{current_frame_size} -> "
-                        f"{target_frame_size}x{target_frame_size}"
-                    )
-                (
-                    dataset,
-                    train_dataset,
-                    eval_dataset,
-                    train_loader,
-                    eval_loader,
-                    frame_height,
-                    frame_width,
-                    source_frame_height,
-                    source_frame_width,
-                ) = build_data_for_frame_size(target_frame_size, stage_label=f"fullres@{step}")
-                train_loader = accelerator.prepare(train_loader)
-                train_iter = infinite_batches(train_loader)
-                current_frame_size = target_frame_size
-                onehot_buffer = None
-                bytes_per_sample = None
-                accelerator.wait_for_everyone()
-
             gan_active = args.use_gan and step >= args.gan_start_step
             gan_discr_loss_value = 0.0
             gan_gen_loss_value = 0.0
@@ -1200,7 +1076,6 @@ def main() -> None:
 
             for _accum_idx in range(accum_steps):
                 batch = next(train_iter)
-                # Keep palette indices compact on-device for onehot_conv; convert to long only when needed.
                 frames = batch["frames"].to(device, non_blocking=True)
                 input_frames = frames
                 if palette_aug_probs is not None:
@@ -1210,11 +1085,8 @@ def main() -> None:
                         replacement_prob=args.palette_aug_prob,
                         replacement_probs=palette_aug_probs,
                     )
-                if use_onehot_conv:
-                    input_frames = input_frames.byte()
-                else:
-                    input_frames = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-                    onehot_buffer = input_frames
+                input_frames = frames_to_one_hot(input_frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+                onehot_buffer = input_frames
                 if bytes_per_sample is None:
                     _, time_steps, height, width = frames.shape
                     bytes_per_sample = (
@@ -1229,7 +1101,8 @@ def main() -> None:
                     with accelerator.autocast():
                         outputs = model(input_frames)
                     target_frames = frames.long()
-                    recon_logits, recon_targets = split_context_targets(outputs.logits, target_frames, args.context_frames)
+                    recon_logits = outputs.logits
+                    recon_targets = target_frames
 
                     # Build per-pixel weight combining class weights + temporal change boost,
                     # then spatially smooth.  Temporal change boost is added independently
@@ -1244,37 +1117,20 @@ def main() -> None:
 
                         # Add temporal change boost independently.
                         if args.temporal_change_boost > 0:
-                            tc = temporal_change_weight(
-                                target_frames, boost=args.temporal_change_boost,
-                                context_frames=args.context_frames,
-                            )
-                            # tc is (B, T', H, W) where T' = T - context_frames
-                            if args.context_frames > 0:
-                                raw_cw = raw_cw[:, args.context_frames:]
+                            tc = temporal_change_weight(target_frames, boost=args.temporal_change_boost)
                             # tc has base 1 + boost*changed; extract just the delta
                             # and add it to the class weights.
                             raw_cw = raw_cw + args.temporal_change_boost * (tc - 1.0)
 
                         # Spatially smooth the combined map.
                         if class_weight is not None and args.class_weight_radius >= 0.5:
-                            # Reconstruct full-sequence weight if we trimmed context above,
-                            # since spatial_weight_map expects (B, T, H, W) aligned to targets.
-                            if args.context_frames > 0 and args.temporal_change_boost > 0:
-                                # Pad leading context frames with raw class weights (no boost).
-                                ctx_cw = class_weight.to(target_frames.device)[target_frames[:, :args.context_frames]]
-                                combined = torch.cat([ctx_cw, raw_cw], dim=1)
-                            else:
-                                combined = raw_cw
                             pixel_weight = spatial_weight_map(
                                 target_frames, class_weight,
                                 radius=args.class_weight_radius,
                                 hardness=args.class_weight_hardness,
                                 temporal_ema=args.class_weight_temporal_ema,
-                                per_pixel_weight=combined,
+                                per_pixel_weight=raw_cw,
                             )
-                            # Strip context prefix for loss alignment.
-                            if args.context_frames > 0:
-                                pixel_weight = pixel_weight[:, args.context_frames:]
                         else:
                             pixel_weight = raw_cw
 
@@ -1459,6 +1315,7 @@ def main() -> None:
                 if ram_align_head is not None:
                     train_row["ram_align_loss"] = ram_align_loss_value
                 metrics.append(train_row)
+                mlflow_run.log_metrics(train_row)
 
             if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
@@ -1508,9 +1365,7 @@ def main() -> None:
                         device=device,
                         num_colors=num_colors,
                         kl_weight=args.kl_weight,
-                        context_frames=args.context_frames,
                         onehot_dtype=onehot_dtype,
-                        onehot_conv=use_onehot_conv,
                         focal_gamma=args.focal_gamma,
                         class_weight=class_weight,
                         class_weight_radius=args.class_weight_radius,
@@ -1534,6 +1389,7 @@ def main() -> None:
                         eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                         eval_metrics["train_grad_norm"] = grad_norm
                         metrics.append(eval_metrics)
+                        mlflow_run.log_metrics(eval_metrics)
                         save_metrics_json(output_dir / "metrics.json", metrics)
 
                         eval_line = (
@@ -1547,7 +1403,7 @@ def main() -> None:
                                 preview[0],
                                 preview[1],
                                 palette,
-                                max_frames=total_clip_frames,
+                                max_frames=args.clip_frames,
                             )
 
                         # Avoid desynchronizing data iteration across processes during distributed training.
@@ -1556,10 +1412,7 @@ def main() -> None:
                                 try:
                                     train_batch = next(train_iter)
                                     train_frames = train_batch["frames"][:1].to(device, non_blocking=True).long()
-                                    if use_onehot_conv:
-                                        train_input = train_frames.byte()
-                                    else:
-                                        train_input = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
+                                    train_input = frames_to_one_hot(train_frames, num_colors, dtype=onehot_dtype)
                                     with accelerator.autocast():
                                         train_outputs = model(train_input, sample_posterior=False)
                                     save_video_preview(
@@ -1567,7 +1420,7 @@ def main() -> None:
                                         train_frames.detach().cpu(),
                                         train_outputs.logits.detach().cpu(),
                                         palette,
-                                        max_frames=total_clip_frames,
+                                        max_frames=args.clip_frames,
                                     )
                                     del train_outputs, train_frames, train_batch
                                 except torch.cuda.OutOfMemoryError:
@@ -1628,6 +1481,13 @@ def main() -> None:
 
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
+
+    if is_main_process:
+        save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
 
 
 if __name__ == "__main__":

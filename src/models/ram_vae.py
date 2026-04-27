@@ -225,6 +225,21 @@ class RAMVAE(nn.Module):
         global_idx = local_argmax + self.offsets.unsqueeze(0)
         return self.index_to_value[global_idx].reshape(B, T, self.n_addresses)
 
+    def logits_to_expected_values(self, logits: Tensor) -> Tensor:
+        """Convert logits to differentiable per-address expected byte values."""
+        B, T, _ = logits.shape
+        flat = logits.reshape(B * T, self.total_classes)
+
+        gathered = flat[:, self.gather_indices.reshape(-1)].reshape(
+            B * T, self.n_addresses, self.max_card,
+        )
+        gathered = gathered.masked_fill(~self.gather_mask.unsqueeze(0), -1e30)
+
+        probs = gathered.softmax(dim=-1)
+        gather_values = self.index_to_value[self.gather_indices].to(dtype=logits.dtype)
+        expected = (probs * gather_values.unsqueeze(0)).sum(dim=-1)
+        return expected.reshape(B, T, self.n_addresses)
+
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------

@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import json
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -156,12 +156,6 @@ def load_video_vae(
     latent_channels = int(model_cfg.get("latent_channels", cfg.get("latent_channels", 64)))
     temporal_downsample = int(model_cfg.get("temporal_downsample", cfg.get("temporal_downsample", 0)))
     dropout = float(model_cfg.get("dropout", cfg.get("dropout", 0.0)))
-    global_bottleneck_attn = bool(
-        model_cfg.get("global_bottleneck_attn", cfg.get("global_bottleneck_attn", False))
-    )
-    global_bottleneck_attn_heads = int(
-        model_cfg.get("global_bottleneck_attn_heads", cfg.get("global_bottleneck_attn_heads", 8))
-    )
     vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors or 0)))
     if vae_num_colors <= 0:
         raise ValueError("Cannot determine VAE num_colors.")
@@ -171,8 +165,6 @@ def load_video_vae(
         latent_channels=latent_channels,
         temporal_downsample=temporal_downsample,
         dropout=dropout,
-        global_bottleneck_attn=global_bottleneck_attn,
-        global_bottleneck_attn_heads=global_bottleneck_attn_heads,
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     vae.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state)
@@ -190,6 +182,58 @@ def load_video_vae(
 # ODE denoising
 # ---------------------------------------------------------------------------
 
+FLOW_SAMPLERS = ("euler", "heun")
+
+
+def normalize_flow_sampler(sampler: str) -> str:
+    normalized = str(sampler).strip().lower()
+    if normalized not in FLOW_SAMPLERS:
+        choices = ", ".join(FLOW_SAMPLERS)
+        raise ValueError(f"Unknown flow sampler {sampler!r}; expected one of: {choices}")
+    return normalized
+
+
+def integrate_flow_ode(
+    initial_state: torch.Tensor,
+    *,
+    ode_steps: int,
+    velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    sampler: str = "heun",
+) -> torch.Tensor:
+    if ode_steps < 1:
+        raise ValueError("ode_steps must be >= 1")
+
+    sampler = normalize_flow_sampler(sampler)
+    state = initial_state
+    batch = state.shape[0]
+    dt = 1.0 / float(ode_steps)
+
+    for step in range(ode_steps, 0, -1):
+        if sampler == "euler":
+            t_val = (step - 0.5) / float(ode_steps)
+            t = torch.full((batch,), t_val, device=state.device, dtype=state.dtype)
+            state = state - dt * velocity_fn(state, t)
+            continue
+
+        t_now = torch.full(
+            (batch,),
+            step / float(ode_steps),
+            device=state.device,
+            dtype=state.dtype,
+        )
+        velocity_now = velocity_fn(state, t_now)
+        predicted_state = state - dt * velocity_now
+        t_next = torch.full(
+            (batch,),
+            (step - 1) / float(ode_steps),
+            device=state.device,
+            dtype=state.dtype,
+        )
+        velocity_next = velocity_fn(predicted_state, t_next)
+        state = state - 0.5 * dt * (velocity_now + velocity_next)
+
+    return state
+
 @torch.no_grad()
 def denoise_future_segment(
     model: torch.nn.Module,
@@ -198,10 +242,11 @@ def denoise_future_segment(
     actions: torch.Tensor,
     future_latents: int,
     ode_steps: int,
+    ode_sampler: str = "heun",
     action_cfg_scale: float = 1.0,
-    autocast_ctx=None,
+    autocast_ctx=nullcontext,
 ) -> torch.Tensor:
-    """Denoise future latents via midpoint ODE integration.
+    """Denoise future latents via explicit flow ODE integration.
 
     Parameters
     ----------
@@ -211,7 +256,7 @@ def denoise_future_segment(
         A callable returning a context manager for mixed-precision autocast.
         E.g. ``accelerator.autocast`` or
         ``lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)``.
-        If *None*, no autocasting is applied.
+        Defaults to ``contextlib.nullcontext`` when no autocasting is applied.
     """
     batch, channels, ctx, height, width = history_latents.shape
     future = torch.randn(
@@ -219,17 +264,7 @@ def denoise_future_segment(
         device=history_latents.device, dtype=history_latents.dtype,
     )
 
-    if autocast_ctx is not None:
-        with autocast_ctx():
-            encoded_cond = model.encode_history(history_latents, actions[:, :ctx])
-            encoded_uncond = None
-            if not math.isclose(float(action_cfg_scale), 1.0):
-                encoded_uncond = model.encode_history(
-                    history_latents,
-                    actions[:, :ctx],
-                    action_cond_scale=0.0,
-                )
-    else:
+    with autocast_ctx():
         encoded_cond = model.encode_history(history_latents, actions[:, :ctx])
         encoded_uncond = None
         if not math.isclose(float(action_cfg_scale), 1.0):
@@ -239,42 +274,28 @@ def denoise_future_segment(
                 action_cond_scale=0.0,
             )
 
-    dt = 1.0 / float(ode_steps)
-    for step in range(ode_steps, 0, -1):
-        t_val = (step - 0.5) / float(ode_steps)
-        t = torch.full((batch,), t_val, device=history_latents.device, dtype=history_latents.dtype)
-        if autocast_ctx is not None:
-            with autocast_ctx():
-                velocity_cond = model.decode_future(future, actions, t, encoded_cond, ctx)
-                if encoded_uncond is None:
-                    velocity = velocity_cond
-                else:
-                    velocity_uncond = model.decode_future(
-                        future,
-                        actions,
-                        t,
-                        encoded_uncond,
-                        ctx,
-                        action_cond_scale=0.0,
-                    )
-                    velocity = velocity_uncond + float(action_cfg_scale) * (
-                        velocity_cond - velocity_uncond
-                    )
-        else:
-            velocity_cond = model.decode_future(future, actions, t, encoded_cond, ctx)
+    ode_sampler = normalize_flow_sampler(ode_sampler)
+
+    def velocity_fn(current_future: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        with autocast_ctx():
+            velocity_cond = model.decode_future(current_future, actions, t, encoded_cond, ctx)
             if encoded_uncond is None:
-                velocity = velocity_cond
-            else:
-                velocity_uncond = model.decode_future(
-                    future,
-                    actions,
-                    t,
-                    encoded_uncond,
-                    ctx,
-                    action_cond_scale=0.0,
-                )
-                velocity = velocity_uncond + float(action_cfg_scale) * (
-                    velocity_cond - velocity_uncond
-                )
-        future = future - dt * velocity
-    return future
+                return velocity_cond
+            velocity_uncond = model.decode_future(
+                current_future,
+                actions,
+                t,
+                encoded_uncond,
+                ctx,
+                action_cond_scale=0.0,
+            )
+            return velocity_uncond + float(action_cfg_scale) * (
+                velocity_cond - velocity_uncond
+            )
+
+    return integrate_flow_ode(
+        future,
+        ode_steps=ode_steps,
+        velocity_fn=velocity_fn,
+        sampler=ode_sampler,
+    )

@@ -42,6 +42,7 @@ if project_root_str not in sys.path:
 from src.data.latent_dataset import LatentSequenceDataset
 from src.data.normalized_dataset import load_palette_tensor
 from src.models.latent_utils import (
+    FLOW_SAMPLERS,
     LatentNormalization,
     denoise_future_segment as _denoise_future_segment,
     is_readable as _is_readable,
@@ -53,7 +54,9 @@ from src.models.latent_utils import (
 from src.models.video_latent_dit_diffusers import VideoLatentDiTDiffusers
 from src.path_utils import resolve_workspace_path
 from src.system_info import collect_system_info, print_system_info
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -131,7 +134,6 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--disable-latent-normalization", action="store_true")
 
-    parser.add_argument("--clip-latents", type=int, default=256)
     parser.add_argument("--context-latents", type=int, default=255)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
@@ -168,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--timestep-sampler", type=str, choices=["uniform", "logit_normal"],
-                        default="uniform")
+                        default="logit_normal")
 
     parser.add_argument(
         "--error-buffer-size", type=int, default=1024,
@@ -179,7 +181,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--error-inject-start-step", type=int, default=2000)
     parser.add_argument("--error-buffer-clip", type=float, default=3.0)
 
-    parser.add_argument("--preview-ode-steps", type=int, default=8)
+    parser.add_argument("--preview-ode-steps", type=int, default=64)
+    parser.add_argument(
+        "--preview-ode-sampler",
+        type=str,
+        choices=FLOW_SAMPLERS,
+        default="heun",
+        help="Flow ODE sampler used for autoregressive rollout previews.",
+    )
     parser.add_argument(
         "--preview-action-cfg-scale",
         type=float,
@@ -203,15 +212,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
 
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    if args.clip_latents < 2:
-        parser.error("--clip-latents must be >= 2")
     if args.context_latents < 1:
         parser.error("--context-latents must be >= 1")
-    if args.context_latents >= args.clip_latents:
-        parser.error("--context-latents must be smaller than --clip-latents")
     if args.gradient_accumulation_steps < 1:
         parser.error("--gradient-accumulation-steps must be >= 1")
     if not (0.0 <= args.action_cfg_drop_prob <= 1.0):
@@ -381,6 +391,7 @@ def denoise_future_segment(
     actions: torch.Tensor,
     future_latents: int,
     ode_steps: int,
+    ode_sampler: str = "heun",
     action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
@@ -390,6 +401,7 @@ def denoise_future_segment(
         actions=actions,
         future_latents=future_latents,
         ode_steps=ode_steps,
+        ode_sampler=ode_sampler,
         action_cfg_scale=action_cfg_scale,
         autocast_ctx=accelerator.autocast,
     )
@@ -405,6 +417,7 @@ def autoregressive_rollout(
     future_latents: int,
     total_latents: int,
     ode_steps: int,
+    ode_sampler: str = "heun",
     action_cfg_scale: float = 1.0,
     accelerator: Accelerator,
 ) -> torch.Tensor:
@@ -429,6 +442,7 @@ def autoregressive_rollout(
             actions=step_actions,
             future_latents=step_future,
             ode_steps=ode_steps,
+            ode_sampler=ode_sampler,
             action_cfg_scale=action_cfg_scale,
             accelerator=accelerator,
         )
@@ -524,6 +538,10 @@ def evaluate(
             )
             history = latents[:, :, :context_latents]
             future = latents[:, :, context_latents:]
+            if future.shape[2] != 1:
+                raise ValueError(
+                    f"Diffusers evaluation expects one future latent, got {future.shape[2]}"
+                )
             noisy_future, v_target, t, eps = sample_flow_target(future, t_sampler)
             model_input = torch.cat((history, noisy_future), dim=2)
 
@@ -548,6 +566,7 @@ def evaluate(
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    clip_latent_count = args.context_latents + 1
 
     data_dir = _resolve_data_dir(args)
     output_dir = make_output_dir(
@@ -586,7 +605,7 @@ def main() -> None:
     with accelerator.main_process_first():
         dataset = LatentSequenceDataset(
             data_dir=data_dir,
-            clip_latents=args.clip_latents,
+            clip_latents=clip_latent_count,
             include_actions=True,
             num_workers=args.num_workers,
             system_info=system_info,
@@ -598,8 +617,15 @@ def main() -> None:
     latent_frame_width = int(latent_meta.get("frame_width", 0)) if latent_meta is not None else 0
     latent_source_height = int(latent_meta.get("source_frame_height", latent_frame_height or 0)) if latent_meta is not None else 0
     latent_source_width = int(latent_meta.get("source_frame_width", latent_frame_width or 0)) if latent_meta is not None else 0
+    action_frame_count = int(dataset.action_frame_count)
+    expected_action_frame_count = int(latent_meta.get("action_frame_count", action_frame_count)) if latent_meta is not None else action_frame_count
     expected_latent_height = int(latent_meta.get("latent_height", 0)) if latent_meta is not None else 0
     expected_latent_width = int(latent_meta.get("latent_width", 0)) if latent_meta is not None else 0
+    if expected_action_frame_count != action_frame_count:
+        raise ValueError(
+            f"Latent dataset action frame count mismatch: metadata says {expected_action_frame_count}, "
+            f"indexed dataset says {action_frame_count}"
+        )
     if expected_latent_height > 0 and expected_latent_height != int(dataset.latent_height):
         raise ValueError(
             f"Latent dataset height mismatch: metadata says {expected_latent_height}, indexed dataset says {dataset.latent_height}"
@@ -616,7 +642,7 @@ def main() -> None:
     )
 
     if accelerator.is_main_process:
-        console.print(f"Found {len(dataset)} segments of {args.clip_latents} latents.")
+        console.print(f"Found {len(dataset)} segments of {clip_latent_count} latents.")
         if eval_dataset:
             console.print(f"Eval split: {len(eval_dataset)} eval, {len(train_dataset)} train")
 
@@ -733,6 +759,7 @@ def main() -> None:
     default_action_index = int({v: i for i, v in enumerate(action_values)}.get(0, 0))
     if accelerator.is_main_process:
         console.print(f"[actions] num_actions={num_actions} default_index={default_action_index}")
+        console.print(f"[actions] action_frame_count={action_frame_count}")
 
     # ------------------------------------------------------------------
     # Model
@@ -740,6 +767,7 @@ def main() -> None:
     model_config = dict(
         latent_channels=latent_channels,
         num_actions=num_actions,
+        action_frame_count=action_frame_count,
         action_dim=args.action_dim,
         action_values=action_values,
         d_model=args.d_model,
@@ -748,7 +776,7 @@ def main() -> None:
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
         dropout=args.dropout,
-        max_latents=args.clip_latents,
+        max_latents=clip_latent_count,
     )
     model: torch.nn.Module = build_video_latent_dit(model_config=model_config).to(device)
     diffusers_version = str(diffusers.__version__)
@@ -836,39 +864,51 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Save training config
     # ------------------------------------------------------------------
+    config = build_trainer_config(
+        model_name="video_latent_dit",
+        args=args,
+        device=device,
+        mixed_precision=args.mixed_precision,
+        num_processes=accelerator.num_processes,
+        data={
+            "latent_channels": int(latent_channels),
+            "latent_height": int(dataset.latent_height),
+            "latent_width": int(dataset.latent_width),
+            "num_actions": int(num_actions),
+            "action_frame_count": int(action_frame_count),
+            "clip_latents": int(clip_latent_count),
+            "context_latents": int(args.context_latents),
+            "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
+            "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
+            "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
+            "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
+            "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
+            "latent_stats_version": int(latent_normalization.version) if latent_normalization is not None else None,
+            "latent_normalization_scheme": latent_normalization.scheme if latent_normalization is not None else None,
+        },
+        model={
+            "num_parameters": int(num_params),
+            "config": model_config,
+            "backend": "diffusers",
+            "diffusers_version": diffusers_version,
+        },
+    )
+    mlflow_run = MLflowRun.create(
+        enabled=accelerator.is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "video_latent_dit",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if accelerator.is_main_process:
-        save_json(
-            output_dir / "config.json",
-            build_trainer_config(
-                model_name="video_latent_dit",
-                args=args,
-                device=device,
-                mixed_precision=args.mixed_precision,
-                num_processes=accelerator.num_processes,
-                data={
-                    "latent_channels": int(latent_channels),
-                    "latent_height": int(dataset.latent_height),
-                    "latent_width": int(dataset.latent_width),
-                    "num_actions": int(num_actions),
-                    "clip_latents": int(args.clip_latents),
-                    "context_latents": int(args.context_latents),
-                    "frame_height": int(latent_frame_height) if latent_frame_height > 0 else None,
-                    "frame_width": int(latent_frame_width) if latent_frame_width > 0 else None,
-                    "source_frame_height": int(latent_source_height) if latent_source_height > 0 else None,
-                    "source_frame_width": int(latent_source_width) if latent_source_width > 0 else None,
-                    "latent_stats_path": str(latent_stats_path) if latent_stats_path is not None else None,
-                    "latent_stats_version": int(latent_normalization.version) if latent_normalization is not None else None,
-                    "latent_normalization_scheme": latent_normalization.scheme if latent_normalization is not None else None,
-                },
-                model={
-                    "num_parameters": int(num_params),
-                    "config": model_config,
-                    "backend": "diffusers",
-                    "diffusers_version": diffusers_version,
-                },
-            ),
-            indent=2,
-        )
+        save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
 
     error_buffer = ResidualErrorBuffer(args.error_buffer_size, clip_abs=args.error_buffer_clip)
 
@@ -954,6 +994,10 @@ def main() -> None:
 
                 history = latents[:, :, :args.context_latents]
                 future = latents[:, :, args.context_latents:]
+                if future.shape[2] != 1:
+                    raise ValueError(
+                        f"Diffusers training expects one future latent, got {future.shape[2]}"
+                    )
 
                 # Optional history perturbation
                 if (
@@ -1100,6 +1144,7 @@ def main() -> None:
                 }
                 train_entry.update(gpu_stats(device))
                 metrics.append(train_entry)
+                mlflow_run.log_metrics(train_entry)
                 with train_log_path.open("a") as fh:
                     fh.write(json.dumps(train_entry) + "\n")
                 if not use_live:
@@ -1157,6 +1202,7 @@ def main() -> None:
                 eval_cgnorms = _component_gnorms(accelerator.unwrap_model(model))
                 eval_metrics.update({f"grad_norm_{k}": v for k, v in eval_cgnorms.items()})
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
 
                 eval_line = (
                     f"eval step={step:06d} flow_loss={eval_metrics['flow_loss']:.6f} "
@@ -1215,7 +1261,7 @@ def main() -> None:
                     try:
                         t0_preview = time.perf_counter()
                         context_latent_count = args.context_latents
-                        rollout_step_latent_count = args.clip_latents - context_latent_count
+                        rollout_step_latent_count = 1
                         predicted_latent_count = args.preview_rollout_latents
 
                         # Sample a fresh clip of exactly the right length.
@@ -1240,6 +1286,7 @@ def main() -> None:
                             future_latents=rollout_step_latent_count,
                             total_latents=_preview_length,
                             ode_steps=args.preview_ode_steps,
+                            ode_sampler=args.preview_ode_sampler,
                             action_cfg_scale=args.preview_action_cfg_scale,
                             accelerator=accelerator,
                         )
@@ -1287,6 +1334,11 @@ def main() -> None:
                 accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
+        save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
         console.print(f"Training complete. Best eval flow_loss={best_eval:.6f}")
 
 

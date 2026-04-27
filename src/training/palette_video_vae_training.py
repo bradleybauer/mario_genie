@@ -126,7 +126,6 @@ def evaluate_video_vae(
     kl_weight: float,
     context_frames: int = 0,
     onehot_dtype: torch.dtype = torch.float32,
-    onehot_conv: bool = False,
     focal_gamma: float = 0.0,
     class_weight: torch.Tensor | None = None,
     class_weight_radius: float = 0.0,
@@ -154,11 +153,8 @@ def evaluate_video_vae(
     with torch.no_grad():
         for batch in loader:
             frames = batch["frames"].to(device, non_blocking=True).long()
-            if onehot_conv:
-                model_input = frames.byte()
-            else:
-                model_input = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
-                onehot_buffer = model_input
+            model_input = frames_to_one_hot(frames, num_colors, dtype=onehot_dtype, out=onehot_buffer)
+            onehot_buffer = model_input
             with autocast_context():
                 outputs = model(model_input, sample_posterior=False)
             recon_logits, recon_targets = split_context_targets(outputs.logits, frames, context_frames)
@@ -212,8 +208,7 @@ def evaluate_video_vae(
             kl_losses.append(kl_loss.item())
             if preview is None:
                 with autocast_context():
-                    preview_input = frames[:1].byte() if onehot_conv else model_input[:1]
-                    preview_out = model(preview_input, sample_posterior=False)
+                    preview_out = model(model_input[:1], sample_posterior=False)
                 preview = (frames[:1].detach().cpu(), preview_out.logits.detach().cpu())
                 del preview_out
             del recon_logits, recon_targets, recon_loss, kl_loss, outputs, model_input, frames

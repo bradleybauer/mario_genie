@@ -77,7 +77,6 @@ class DiffusersEncoderBlock(nn.Module):
         tokens: Tensor,
         *,
         action_tokens: Tensor,
-        action_attn_mask: Tensor | None,
         action_cond_scale: Tensor | None = None,
     ) -> Tensor:
         h = self.norm1(tokens)
@@ -87,7 +86,6 @@ class DiffusersEncoderBlock(nn.Module):
         action_update = self.action_cross_attn(
             q,
             encoder_hidden_states=action_tokens,
-            attention_mask=action_attn_mask,
         )
         if action_cond_scale is not None:
             action_update = action_update * action_cond_scale
@@ -158,7 +156,6 @@ class DiffusersDecoderBlock(nn.Module):
         encoded_history: Tensor,
         action_tokens: Tensor,
         cond: Tensor,
-        action_attn_mask: Tensor | None,
         action_cond_scale: Tensor | None = None,
     ) -> Tensor:
         h = self.norm1(tokens, cond)
@@ -174,7 +171,6 @@ class DiffusersDecoderBlock(nn.Module):
         action_update = self.action_cross_attn(
             q,
             encoder_hidden_states=action_tokens,
-            attention_mask=action_attn_mask,
         )
         if action_cond_scale is not None:
             action_update = action_update * action_cond_scale
@@ -193,6 +189,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         *,
         latent_channels: int,
         num_actions: int,
+        action_frame_count: int,
         action_dim: int = 32,
         action_values: list[int] | None = None,
         d_model: int = 512,
@@ -208,6 +205,8 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError("latent_channels must be positive")
         if num_actions <= 0:
             raise ValueError("num_actions must be positive")
+        if action_frame_count <= 0:
+            raise ValueError("action_frame_count must be positive")
         if action_dim <= 0:
             raise ValueError("action_dim must be positive")
         if max_latents <= 0:
@@ -215,6 +214,7 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
 
         self.latent_channels = latent_channels
         self.num_actions = num_actions
+        self.action_frame_count = action_frame_count
         self.max_latents = max_latents
         self.d_model = d_model
         self.num_heads = num_heads
@@ -245,7 +245,8 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             nn.Linear(action_dim, action_dim),
             nn.SiLU(),
         )
-        self.action_to_model = nn.Linear(action_dim, d_model)
+        self.action_frame_pos = nn.Parameter(torch.zeros(1, 1, action_frame_count, action_dim))
+        self.action_to_model = nn.Linear(action_dim * action_frame_count, d_model)
 
         self.spatial_coord_proj = nn.Linear(2, d_model)
         self.temporal_pos = nn.Parameter(torch.zeros(1, max_latents, d_model))
@@ -317,7 +318,10 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         if actions.dtype != torch.long:
             actions = actions.long()
         bits = self.action_bit_lut[actions].to(dtype=dtype)
-        return self.action_to_model(self.action_mlp(bits))
+        action_emb = self.action_mlp(bits)
+        action_emb = action_emb + self.action_frame_pos.to(dtype=dtype)
+        action_emb = rearrange(action_emb, "b t f d -> b t (f d)")
+        return self.action_to_model(action_emb)
 
     @staticmethod
     def _prepare_action_cond_scale(
@@ -342,30 +346,6 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             raise ValueError(f"Expected action_cond_scale batch size {batch_size}, got {scale.shape[0]}")
         return scale.view(batch_size, 1, 1)
 
-    @staticmethod
-    def _causal_action_mask(
-        *,
-        query_absolute_steps: Tensor,
-        num_action_steps: int,
-        device: torch.device,
-    ) -> Tensor:
-        key_steps = torch.arange(num_action_steps, device=device)
-        return key_steps.unsqueeze(0) > query_absolute_steps.unsqueeze(1)
-
-    @staticmethod
-    def _to_attention_bias(
-        mask: Tensor,
-        *,
-        batch_size: int,
-        num_heads: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tensor:
-        # Diffusers Attention expects additive attention bias with shape (B*H, Nq, Nk).
-        bias = torch.zeros(mask.shape, device=device, dtype=dtype)
-        bias = bias.masked_fill(mask, torch.tensor(-10_000.0, device=device, dtype=dtype))
-        return bias.unsqueeze(0).repeat(batch_size * num_heads, 1, 1)
-
     def _validate_actions(self, actions: Tensor) -> None:
         if torch.any(actions < 0) or torch.any(actions >= self.num_actions):
             raise ValueError(
@@ -386,9 +366,10 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         batch, channels, context_latents, height, width = history_latents.shape
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
-        if history_actions.shape != (batch, context_latents):
+        if history_actions.shape != (batch, context_latents, self.action_frame_count):
             raise ValueError(
-                f"history_actions must be (B={batch}, context_latents={context_latents}), "
+                f"history_actions must be (B={batch}, context_latents={context_latents}, "
+                f"action_frame_count={self.action_frame_count}), "
                 f"got {tuple(history_actions.shape)}"
             )
         if context_latents > self.max_latents:
@@ -419,7 +400,6 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
             tokens = block(
                 tokens,
                 action_tokens=action_tokens,
-                action_attn_mask=None,
                 action_cond_scale=cond_scale,
             )
 
@@ -443,9 +423,14 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
 
         if channels != self.latent_channels:
             raise ValueError(f"Expected {self.latent_channels} latent channels, got {channels}")
-        if actions.shape != (batch, total_latents):
+        if future_latents != 1:
             raise ValueError(
-                f"actions must be (B={batch}, context+future={total_latents}), "
+                f"Diffusers DiT expects exactly one future latent per decode: got {future_latents}"
+            )
+        if actions.shape != (batch, total_latents, self.action_frame_count):
+            raise ValueError(
+                f"actions must be (B={batch}, context+future={total_latents}, "
+                f"action_frame_count={self.action_frame_count}), "
                 f"got {tuple(actions.shape)}"
             )
         if total_latents > self.max_latents:
@@ -480,23 +465,6 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
         )
 
         action_tokens = self._encode_actions(actions, dtype=tokens.dtype)
-        spatial_tokens = height * width
-        query_steps_abs = (
-            torch.arange(future_latents, device=noisy_future.device).repeat(spatial_tokens)
-            + context_latents
-        )
-        action_mask = self._causal_action_mask(
-            query_absolute_steps=query_steps_abs,
-            num_action_steps=total_latents,
-            device=noisy_future.device,
-        )
-        action_bias = self._to_attention_bias(
-            action_mask,
-            batch_size=batch,
-            num_heads=self.num_heads,
-            device=noisy_future.device,
-            dtype=tokens.dtype,
-        )
 
         t_proj = self.time_proj(timesteps.float()).to(device=noisy_future.device, dtype=tokens.dtype)
         cond = self.time_embedding(t_proj).to(dtype=tokens.dtype)
@@ -507,7 +475,6 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
                 encoded_history=encoded_history,
                 action_tokens=action_tokens,
                 cond=cond,
-                action_attn_mask=action_bias,
                 action_cond_scale=cond_scale,
             )
 
@@ -529,12 +496,18 @@ class VideoLatentDiTDiffusers(ModelMixin, ConfigMixin):
     ) -> Tensor:
         if latents.ndim != 5:
             raise ValueError(f"Expected latents (B, C, T, H, W), got {tuple(latents.shape)}")
-        if actions.ndim != 2:
-            raise ValueError(f"Expected actions (B, T), got {tuple(actions.shape)}")
+        if actions.ndim != 3:
+            raise ValueError(f"Expected actions (B, T, action_frame_count), got {tuple(actions.shape)}")
         _, _, total_latents, _, _ = latents.shape
-        if context_latents < 1 or context_latents >= total_latents:
+        expected_total_latents = context_latents + 1
+        if context_latents < 1:
             raise ValueError(
-                f"context_latents must be in [1, T-1], got {context_latents} with T={total_latents}"
+                f"context_latents must be >= 1, got {context_latents}"
+            )
+        if total_latents != expected_total_latents:
+            raise ValueError(
+                "Diffusers DiT expects exactly one future latent per forward pass: "
+                f"got total_latents={total_latents}, context_latents={context_latents}"
             )
 
         clean_history = latents[:, :, :context_latents]

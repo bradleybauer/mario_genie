@@ -37,7 +37,9 @@ from src.models.audio_vae import AudioVAE
 from src.data.normalized_dataset import NormalizedSequenceDataset
 from src.system_info import collect_system_info, print_system_info
 from src.training.audio_training_helpers import build_mel_mask, context_waveform_lengths, masked_l1_loss
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -162,7 +164,12 @@ def parse_args() -> argparse.Namespace:
         help="EMA decay for LeCAM running real/fake logits.",
     )
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.context_frames < 0:
         parser.error("--context-frames must be non-negative")
@@ -537,8 +544,22 @@ def main() -> None:
             "dropout": float(args.dropout),
         },
     )
+    mlflow_run = MLflowRun.create(
+        enabled=is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "audio_vae",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
         console.print(f"Config saved to {output_dir / 'config.json'}")
         console.print(json.dumps(config, indent=2))
 
@@ -719,6 +740,7 @@ def main() -> None:
                     if args.use_lecam:
                         train_row["gan_lecam_reg"] = gan_lecam_reg_value
                 metrics.append(train_row)
+                mlflow_run.log_metrics(train_row)
 
             if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
@@ -771,6 +793,7 @@ def main() -> None:
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
@@ -851,6 +874,13 @@ def main() -> None:
 
             if eval_due or should_checkpoint:
                 accelerator.wait_for_everyone()
+
+    if is_main_process:
+        save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
 
 
 if __name__ == "__main__":

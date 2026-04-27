@@ -1,190 +1,232 @@
-# VAE Decode Streaming for World Model Inference
+# Exact Cache-Carrying VAE Decode Streaming for World Model Inference
+
+## Scope
+
+This note is only about **exact cache-carrying decode at inference time** for
+the current video VAE. It does **not** propose overlap-window approximate
+decoding, and it does **not** require streaming training.
+
+The goal is to make VAE decoding during autoregressive world-model inference:
+
+- exact, relative to decoding the full latent history with the same VAE
+- cheap per step, so decode cost no longer grows with rollout length
+- free of boundary artifacts from decoding new latents in isolation
 
 ## Problem
 
-During autoregressive world model inference, the DiT predicts 1 new latent
-per step.  Naively decoding only that latent in isolation produces
-boundary artifacts because the VAE decoder's 3D causal convolutions need
-temporal context from preceding latents.
+During autoregressive world model inference, the DiT predicts 1 new latent per
+step. Naively decoding only that latent in isolation produces artifacts because
+the VAE decoder is temporally causal and expects preceding latent context.
 
-Decoding the *entire* accumulated latent history every step is wasteful — the
-VAE decoder is the dominant cost (~3 GB peak, 33M params, full 224×224 spatial).
+Decoding the entire accumulated latent history every step is exact, but wasteful.
+The decoder cost grows linearly with rollout length even though only the newest
+2 output frames are actually needed.
 
-## VAE Decoder Temporal Receptive Field
+## Why Exact Cache-Carrying Works
 
-The current VAE (`video_vae_20260411_232136`) has:
-- `temporal_downsample=1` (2 frames per latent)
-- `global_bottleneck_attn=false` (bounded receptive field)
-- All temporal convolutions are **CausalConv3d** (left-pad only, no future leakage)
+For the current VAE (`video_vae_20260411_232136`):
 
-### Layer-by-layer analysis
+- `temporal_downsample=1`, so 1 latent corresponds to 2 decoded frames
+- the bottleneck is convolution-only, so temporal dependence is bounded
+- temporal operators are causal / left-aligned only
 
-**Pre-temporal-upsample** (latent time domain):
+That means the decoder is a finite-state causal system. If each layer carries
+forward the exact temporal state it would have had in a full decode, then
+streaming one latent at a time is mathematically the same as re-decoding the
+entire latent history every step.
 
-| Layer | Temporal convs | Lookback (latents) |
-|-------|:-:|:-:|
-| `decoder_in` (Conv3d k=1) | 0 | 0 |
-| `decoder_mid` (ResBlock: 2× CausalConv3d k=3) | 2 | 4 |
-| `decoder_block6` (ResBlock: 2× CausalConv3d k=3) | 2 | 4 |
+Put differently:
 
-Subtotal: **8 latents** of past context needed before upsample.
+- full decode of latent history is the reference computation
+- exact streaming decode is just a different execution schedule for the same
+  computation graph
+- unlike overlap decode, no approximation is introduced
 
-**Temporal upsample** at `decoder_up1`:
-- `ConvTranspose3d(k=3, stride=2)` — doubles temporal resolution
-- Adds 1 latent of lookback through stride-2 mapping
+## Decoder Structure Relevant to Streaming
 
-**Post-temporal-upsample** (raw pixel time domain):
+The current decoder stack in `src/models/video_vae.py` is:
 
-| Layer | Temporal convs | Lookback (frames) |
-|-------|:-:|:-:|
-| `decoder_block5` (ResBlock) | 2 | 4 |
-| `decoder_up2` + `decoder_block4` | 1 + 2 | 2 + 4 |
-| `decoder_up3` + `decoder_block3` | 1 + 2 | 2 + 4 |
-| `decoder_up4` + `decoder_block2` | 1 + 2 | 2 + 4 |
-| `decoder_up5` + `decoder_block1` | 1 + 2 | 2 + 4 |
-| `decoder_out` (CausalConv3d k=3) | 1 | 2 |
+1. `decoder_in` (`Conv3d` kernel 1)
+2. `decoder_mid` (`ResidualBlock3D`)
+3. `decoder_block6` (`ResidualBlock3D`)
+4. `decoder_up1` (`SpatialUpsample3D`, temporal upsample enabled)
+5. `decoder_block5`
+6. `decoder_up2`
+7. `decoder_block4`
+8. `decoder_up3`
+9. `decoder_block3`
+10. `decoder_up4`
+11. `decoder_block2`
+12. `decoder_up5`
+13. `decoder_block1`
+14. `decoder_out` (`CausalConv3d`)
 
-Subtotal: **30 frames** of past context needed after upsample.
+The important temporal facts are:
 
-### Full receptive field (temporal_downsample=1)
+- every `CausalConv3d(k=3)` needs the last 2 input timesteps of its own input
+  resolution
+- every `ResidualBlock3D` contains two such temporal convolutions
+- every `SpatialUpsample3D` uses a temporal transposed convolution with kernel
+  size 3, so it also has temporal state
+- `decoder_up1` is the only stage that changes temporal resolution, from latent
+  time to frame time
 
-Working backward from 1 target latent (= 2 output frames):
+So the exact streaming implementation should cache **layer-local temporal
+activations**, not just a window of past latents.
 
-1. Post-upsample needs 2 + 30 = 32 frames at decoder_up1 output
-2. Through stride-2 transpose → 17 latents at decoder_up1 input
-3. Pre-upsample layers → 17 + 8 = **25 latents total input**
+## What Must Be Cached
 
-**To correctly decode the last latent, feed the decoder 25 latents and
-discard all but the final 2 frames (1 latent) of output.**
+The clean implementation is to make each temporal module stateful and let it own
+its cache. The top-level decoder should not try to reconstruct internal layer
+state from the latent history on every step.
 
-### Practical overlap window
+### Per-module cache rules
 
-The theoretical receptive field of 24 preceding latents decays exponentially —
-each additional layer multiplies the effect of distant frames by the convolution
-weights.  In practice, **8–12 latents of overlap** should be sufficient
-for artifact-free boundaries.  This can be tuned by visual inspection.
+| Module type | Exact cache needed |
+|---|---|
+| `Conv3d(k=1)` | none |
+| `CausalConv3d(k=3)` | last 2 input timesteps at that module's resolution |
+| `ResidualBlock3D` | internal caches for both causal convs |
+| `SpatialUpsample3D` | last 2 low-rate input timesteps for its temporal deconv |
+| norms / SiLU / dropout / 1x1 skip | none |
 
-| Overlap | Latent decode window | Frames decoded | Memory |
-|---------|:---:|:---:|:---:|
-| 0 (isolated) | 1 | 2 | ~25 MB |
-| 4 | 5 | 10 | ~125 MB |
-| 8 | 9 | 18 | ~225 MB |
-| 12 | 13 | 26 | ~325 MB |
-| 24 (full RF) | 25 | 50 | ~625 MB |
+For `decoder_up1`, one new latent step should emit exactly 2 new frame-time
+feature steps. Later stages stay on frame time and should emit exactly those 2
+new frames, not re-emit old ones.
 
-All well within GPU memory.  Memory scales linearly with temporal window size
-since the spatial dimensions (224×224) are fixed.
+## Exact Streaming API Sketch
 
-## Streaming Decode Algorithm
+The simplest external API is:
 
+```python
+state = vae.init_decode_state(batch_size=1, device=device, dtype=dtype)
+
+# Bootstrap from the initial latent context.
+bootstrap_frames, state = vae.decode_stream_init(context_latents, state)
+
+for each new latent z_new:
+    new_frames, state = vae.decode_stream_step(z_new, state)
+    # new_frames has shape (B, C, 2, H, W)
 ```
-decode_overlap = 8   # tunable, 8-12 recommended
 
-# Ring buffer of recent latents (kept on GPU)
-latent_buffer: Tensor  # shape (1, C, context_latents, H, W)
+Suggested semantics:
 
-each prediction step:
-    new_latents = dit.predict(...)           # (1, C, 1, 7, 7)
-    latent_buffer = slide(latent_buffer, new_latents)
+- `decode_stream_init(latents, state)`:
+  - runs the initial latent prefix through the same streaming decoder path
+  - fills all caches exactly as if those latents had been decoded sequentially
+  - optionally returns all decoded bootstrap frames, or only the tail needed for
+    display
 
-    # Decode window: overlap + new latent
-    window = latent_buffer[:, :, -(decode_overlap + 1):]  # (1, C, overlap+1, 7, 7)
-    frames = vae.decode(denormalize(window))               # (1, 23, 2*(overlap+1), 224, 224)
-    display_frames = frames[:, :, -2:]                     # last 2 frames only
-    palette_indices = display_frames.argmax(dim=1)         # (1, 2, 224, 224)
-```
+- `decode_stream_step(z_new, state)`:
+  - consumes exactly one new latent timestep `(B, C, 1, H_lat, W_lat)`
+  - updates every decoder cache once
+  - returns exactly the 2 new output frames generated by that latent
 
-  Only the final 2 frames (from the 1 new latent) are displayed.
-The overlap region provides temporal context for the causal convolutions but
-its decoded output is discarded.
+This is the inference-time equivalent of processing the entire latent history,
+then slicing out only the newest 2 decoded frames.
 
-### Why this works
+## Bootstrap Procedure
 
-CausalConv3d pads on the left by repeating `x[:, :, :1]`.  When we include
-real preceding latents instead, those convolutions receive proper
-temporal context rather than synthetic padding.  The causal structure means
-including *more* past never changes the output for any given timestep — it
-only improves it.
+Streaming decode needs an initial latent prefix before the first world-model
+step. That prefix already exists in this project: the VAE-encoded context used
+to seed the DiT.
 
-### First decode (bootstrap)
+Bootstrap should work like this:
 
-After the initial context is built from emulator frames, decode the full context
-through the VAE once.  This is expensive but only happens once (and again on
-recontextualize).  Subsequent steps use the streaming window.
+1. Build the initial latent context from emulator frames as usual.
+2. Call `decode_stream_init(context_latents, state)` once.
+3. Use the returned decoded frames to initialize display state.
+4. After that, call `decode_stream_step()` once per newly predicted latent.
 
-## Context Length for a Mario World Model
+The expensive bootstrap happens only once per rollout, or once again after any
+explicit recontextualization.
 
-### How long is 30 seconds?
+## Exactness Claim
 
-| Metric | Value |
-|--------|-------|
-| NES frame rate | 60 fps |
-| 30 seconds of gameplay | 1,800 frames |
-| With temporal_downsample=1 | **900 latents** |
+With the current convolution-only bottleneck, the following two procedures should match
+up to floating-point noise:
 
-### DiT self-attention cost at 900 latents
+1. Full reference decode:
+   - concatenate all latents generated so far
+   - run `vae.decode(full_history)`
+   - keep the last 2 frames
 
-Each latent has 7×7 = 49 spatial tokens.
+2. Exact streaming decode:
+   - initialize caches from the same latent prefix
+   - feed only the newest latent through `decode_stream_step()`
+   - use the returned 2 frames
 
-| Context (latent) | Encoder tokens | Self-attn cost (per layer) | 6 layers total |
-|:---:|:---:|:---:|:---:|
-| 62 (current training) | 3,038 | 9.2M pairs | 55M |
-| 254 (planned) | 12,446 | 155M pairs | 930M |
-| 900 (30 seconds) | 44,100 | 1.94B pairs | 11.7B |
+If they do not match, the cache logic is wrong.
 
-At d_model=128, 4 heads: 11.7B pairs × 128d × 2 (Q·K + attn·V) ≈ **3 TFLOP**
-per encoder pass.  On a Blackwell GPU at ~1 PFLOP/s bf16 throughput, that's
-~3ms — still fast!  But memory for the attention matrix (44,100² × 2 bytes =
-**3.6 GB** per layer, 21.6 GB for 6 layers) becomes significant.
+That gives a very clear validation target for implementation.
 
-### What context length actually matters for Mario?
+## Why This Is Better Than Overlap Decode
 
-Mario gameplay has these temporal scales:
+The overlap-window method is an approximation:
 
-| Scale | Duration | Latents | What happens |
-|-------|:---:|:---:|---|
-| Immediate | 0.1–0.5s | 3–15 | Jump arcs, enemy collision, block hits |
-| Short-term | 1–3s | 30–90 | Platform sequences, pipe transitions |
-| Medium-term | 5–10s | 150–300 | Screen scrolling, level section traversal |
-| Long-term | 30s+ | 900+ | Level progression, lives/score accumulation |
+- it repeatedly re-runs a short suffix of latent history
+- it depends on choosing a large enough overlap window
+- exactness is only asymptotic as overlap approaches the full receptive field
 
-The world model needs enough context to:
-1. **Continue smooth motion** — 0.5–1s minimum (15–30 latents)
-2. **Remember what's just off-screen** — 3–5s (90–150 latents)
-3. **Maintain level continuity** — 10–15s (300–450 latents)
+Exact cache-carrying inference has none of those issues:
 
-30 seconds (900 latents) is likely overkill for visual prediction.  The
-DiT would spend most of its attention budget on frames that are no longer
-visible and don't affect the current screen state.
+- no overlap hyperparameter
+- no discarded overlap decode work
+- constant per-step decoder cost
+- exact equivalence to full-history decode for bounded-receptive-field models
 
-### Recommendations
+## Memory and Compute Properties
 
-| Config | Context latents | Raw duration | Attention memory | Use case |
-|--------|:---:|:---:|:---:|---|
-| **Conservative** | 62 | ~2s | 36 MB | Fast iteration, proof of concept |
-| **Moderate** | 126 | ~4.2s | 150 MB | Good balance, covers most gameplay |
-| **Full screen memory** | 254 | ~8.5s | 600 MB | Remembers off-screen state well |
-| **30 seconds** | 900 | 30s | 21.6 GB | Likely diminishing returns |
+With exact cache-carrying inference:
 
-**Suggestion: 126–254 latents (4–8.5 seconds)** covers the useful
-temporal range for Mario.  The NES screen is 256px wide and scrolls at
-~2–3 px/frame — it takes about 2–3 seconds to scroll one full screen width.
-Having 2–3 screens worth of memory (6–9 seconds) is plenty.
+- decoder activation memory is `O(1)` with respect to total rollout length
+- only the current step's tensors and persistent caches are kept
+- per-step compute is constant after bootstrap
+- the only unbounded state is the DiT context or latent history kept for the
+  world model itself, not for VAE decode
 
-If you want 30 seconds, it's computationally feasible on Blackwell but you'd
-want to either:
-- Use **flash attention** to avoid materializing the 3.6 GB/layer attention
-  matrices (flash attn is O(N) memory)
-- Switch to a **sliding window** or **chunked** attention pattern in the
-  encoder so distant frames get cheaper attention
+This is the main reason to prefer exact cache-carrying decode over re-decoding
+the entire latent history.
 
-### max_frames constraint
+## Interaction With Training
 
-The DiT uses learned temporal position embeddings of shape `(1, max_frames,
-d_model)`.  Currently `max_frames=64`.  To support longer contexts:
+This note is inference-only, but one training implication matters.
 
-- **max_frames=256** works with current training config (clip=256, ctx=254)
-- **max_frames=1024** would cover 30 seconds but wastes embedding parameters
-  for positions rarely seen during training
-- Alternative: switch to **sinusoidal** or **RoPE** temporal embeddings which
-  generalize to unseen lengths without a fixed max_frames table
+Exact cache-carrying decode does **not** change the decoder's function. It only
+changes how that function is executed. So for the current bounded decoder, the
+main train/inference mismatch is not the streaming algorithm itself. The real
+remaining mismatch is that training clips reset decoder state at clip starts,
+while inference only resets at episode starts.
+
+That can be managed by:
+
+- training on large clips
+- using `context_frames` warmup
+- ignoring loss on the warmup prefix
+
+No streaming training implementation is required to get the benefit of exact
+cache-carrying decode at inference.
+
+## Recommended Implementation Strategy
+
+1. Keep the current VAE weights and architecture unchanged.
+2. Add a decoder-side streaming state object.
+3. Implement stateful streaming versions of:
+   - `CausalConv3d`
+   - `ResidualBlock3D`
+   - `SpatialUpsample3D`
+4. Build `decode_stream_init()` and `decode_stream_step()` on top of those.
+5. Validate exactness against full-history decode on short latent sequences.
+6. Only after exactness is confirmed, swap the world-model inference path to the
+   streaming decoder.
+
+## Non-goals
+
+This note does not cover:
+
+- streaming VAE encoder export
+- truncated-BPTT VAE training
+- overlap-window approximate decode
+- DiT context length / attention scaling choices
+
+Those are separate questions.

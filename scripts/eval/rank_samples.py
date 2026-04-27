@@ -38,7 +38,6 @@ from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_
 from src.training.palette_video_vae_training import (
     frames_to_one_hot,
     save_video_preview,
-    split_context_targets,
 )
 
 
@@ -152,13 +151,6 @@ def _build_model_from_config(config: dict, num_colors: int, device: torch.device
         latent_channels=int(model_cfg.get("latent_channels", config.get("latent_channels", 64))),
         temporal_downsample=int(model_cfg.get("temporal_downsample", config.get("temporal_downsample", 0))),
         dropout=float(model_cfg.get("dropout", config.get("dropout", 0.0))),
-        onehot_conv=bool(model_cfg.get("onehot_conv", config.get("onehot_conv", False))),
-        global_bottleneck_attn=bool(
-            model_cfg.get("global_bottleneck_attn", config.get("global_bottleneck_attn", False))
-        ),
-        global_bottleneck_attn_heads=int(
-            model_cfg.get("global_bottleneck_attn_heads", config.get("global_bottleneck_attn_heads", 8))
-        ),
     ).to(device)
     model.eval()
     return model
@@ -186,13 +178,13 @@ def _score_batch(
     model: VideoVAE,
     frames: torch.Tensor,
     num_colors: int,
-    context_frames: int,
     onehot_dtype: torch.dtype,
     onehot_buffer: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     inputs = frames_to_one_hot(frames, num_colors=num_colors, dtype=onehot_dtype, out=onehot_buffer)
     outputs = model(inputs, sample_posterior=False)
-    logits, targets = split_context_targets(outputs.logits, frames, context_frames)
+    logits = outputs.logits
+    targets = frames
 
     per_elem_loss = F.cross_entropy(logits.float(), targets, reduction="none")
     sample_loss = per_elem_loss.mean(dim=(1, 2, 3))
@@ -229,8 +221,6 @@ def main() -> None:
     data_cfg = dict(config.get("data", {}))
     training_cfg = dict(config.get("training", {}))
     clip_frames = int(data_cfg.get("clip_frames", config.get("clip_frames", 16)))
-    context_frames = int(data_cfg.get("context_frames", config.get("context_frames", 0)))
-    total_clip_frames = clip_frames + context_frames
 
     onehot_dtype_name = args.onehot_dtype or str(training_cfg.get("onehot_dtype", config.get("onehot_dtype", "float32")))
     onehot_dtype = _resolve_dtype(onehot_dtype_name)
@@ -238,7 +228,7 @@ def main() -> None:
 
     dataset = NormalizedSequenceDataset(
         data_dir=data_dir,
-        clip_frames=total_clip_frames,
+        clip_frames=clip_frames,
         frame_size=frame_size,
         num_workers=args.num_workers,
     )
@@ -276,7 +266,6 @@ def main() -> None:
                 model=model,
                 frames=frames,
                 num_colors=num_colors,
-                context_frames=context_frames,
                 onehot_dtype=onehot_dtype,
                 onehot_buffer=onehot_buffer,
             )
@@ -338,8 +327,6 @@ def main() -> None:
         "num_scored": len(results),
         "model_name": "video_vae",
         "clip_frames": clip_frames,
-        "context_frames": context_frames,
-        "total_clip_frames": total_clip_frames,
         "data_dir": str(data_dir),
         "mean_loss": float(losses.mean()),
         "median_loss": float(np.median(losses)),
@@ -365,7 +352,8 @@ def main() -> None:
         inputs = frames_to_one_hot(frames.long(), num_colors=num_colors, dtype=onehot_dtype)
         with torch.no_grad():
             outputs = model(inputs, sample_posterior=False)
-        logits, targets = split_context_targets(outputs.logits, frames.long(), context_frames)
+        logits = outputs.logits
+        targets = frames.long()
 
         filename = (
             f"{label}_loss{item.loss:.4f}_acc{item.pixel_accuracy:.4f}_"

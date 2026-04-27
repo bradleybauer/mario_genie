@@ -472,12 +472,6 @@ def main() -> None:
     base_channels = args.base_channels or int(config_model.get("base_channels", config.get("base_channels", 64)))
     latent_channels = args.latent_channels or int(config_model.get("latent_channels", config.get("latent_channels", 64)))
     temporal_downsample = int(config_model.get("temporal_downsample", config.get("temporal_downsample", 0)))
-    global_bottleneck_attn = bool(
-        config_model.get("global_bottleneck_attn", config.get("global_bottleneck_attn", False))
-    )
-    global_bottleneck_attn_heads = int(
-        config_model.get("global_bottleneck_attn_heads", config.get("global_bottleneck_attn_heads", 8))
-    )
     frame_height = int(args.frame_size or config_data.get("frame_height", CANONICAL_FRAME_HEIGHT))
     frame_width = int(args.frame_size or config_data.get("frame_width", CANONICAL_FRAME_WIDTH))
 
@@ -503,8 +497,6 @@ def main() -> None:
         base_channels=base_channels,
         latent_channels=latent_channels,
         temporal_downsample=temporal_downsample,
-        global_bottleneck_attn=global_bottleneck_attn,
-        global_bottleneck_attn_heads=global_bottleneck_attn_heads,
     ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -538,7 +530,7 @@ def main() -> None:
     print(f"Using device: {device}")
     print(
         f"Model: base_channels={base_channels}, latent_channels={latent_channels}, "
-        f"temporal_downsample={temporal_downsample}, global_bottleneck_attn={global_bottleneck_attn}, "
+        f"temporal_downsample={temporal_downsample}, "
         f"frame={frame_height}x{frame_width}, onehot_dtype={onehot_name}"
     )
     if onehot_name != requested_onehot_name:

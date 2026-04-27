@@ -36,17 +36,20 @@ from src.plot_style import (
 apply_plot_style()
 
 
-DEFAULT_PREDICTED_FRAMES = 16
+DEFAULT_PREDICTED_FRAMES = None
 
 
 def visible_frames(frames, include_context=False, predicted_frames=DEFAULT_PREDICTED_FRAMES):
     """Return the frame sequence shown in the viewer.
 
-    By default keeps only the last *predicted_frames* frames, which are the
-    model's predictions (skipping however many context frames the training
-    code happened to include in the PNG).
+    By default shows all frames. If *predicted_frames* is set, keeps only the
+    last *predicted_frames* frames, which are typically the model's
+    predictions (skipping however many context frames the training code
+    happened to include in the PNG).
     """
-    if include_context or len(frames) <= predicted_frames:
+    if include_context or predicted_frames is None or predicted_frames <= 0:
+        return frames
+    if len(frames) <= predicted_frames:
         return frames
     return frames[-predicted_frames:]
 
@@ -632,7 +635,7 @@ def parse_args() -> argparse.Namespace:
         "--predicted-frames",
         type=int,
         default=DEFAULT_PREDICTED_FRAMES,
-        help=f"Number of trailing predicted frames to show (default: {DEFAULT_PREDICTED_FRAMES})",
+        help="Number of trailing predicted frames to show; default shows all frames",
     )
     parser.add_argument(
         "--format",

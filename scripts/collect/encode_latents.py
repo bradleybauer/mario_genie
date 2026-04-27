@@ -115,13 +115,6 @@ def load_video_vae(
     base_channels = int(model_cfg.get("base_channels", cfg.get("base_channels", 64)))
     latent_channels = int(model_cfg.get("latent_channels", cfg.get("latent_channels", 64)))
     temporal_downsample = int(model_cfg.get("temporal_downsample", cfg.get("temporal_downsample", 0)))
-    global_bottleneck_attn = bool(
-        model_cfg.get("global_bottleneck_attn", cfg.get("global_bottleneck_attn", False))
-    )
-    global_bottleneck_attn_heads = int(
-        model_cfg.get("global_bottleneck_attn_heads", cfg.get("global_bottleneck_attn_heads", 8))
-    )
-    onehot_conv = bool(model_cfg.get("onehot_conv", cfg.get("onehot_conv", False)))
     vae_num_colors = int(data_cfg.get("num_colors", cfg.get("num_colors", num_colors)))
 
     if vae_num_colors != num_colors:
@@ -134,9 +127,6 @@ def load_video_vae(
         base_channels=base_channels,
         latent_channels=latent_channels,
         temporal_downsample=temporal_downsample,
-        onehot_conv=onehot_conv,
-        global_bottleneck_attn=global_bottleneck_attn,
-        global_bottleneck_attn_heads=global_bottleneck_attn_heads,
     )
     state = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
@@ -150,22 +140,24 @@ def load_video_vae(
         "base_channels": base_channels,
         "latent_channels": latent_channels,
         "temporal_downsample": temporal_downsample,
-        "global_bottleneck_attn": global_bottleneck_attn,
-        "global_bottleneck_attn_heads": global_bottleneck_attn_heads,
-        "onehot_conv": onehot_conv,
         "num_colors": vae_num_colors,
     }
     return vae, summary
 
 
-def downsample_actions(actions_np: np.ndarray, *, temporal_downsample: int) -> np.ndarray:
-    if temporal_downsample == 0:
-        return actions_np
-    if temporal_downsample != 1:
+def group_actions_by_latent(actions_np: np.ndarray, *, temporal_downsample: int) -> np.ndarray:
+    if temporal_downsample not in (0, 1):
         raise ValueError("temporal_downsample must be 0 or 1")
+    if actions_np.ndim != 1:
+        raise ValueError(f"actions must be 1D frame action IDs, got shape {tuple(actions_np.shape)}")
+
+    action_frame_count = 2 ** temporal_downsample
     if actions_np.shape[0] == 0:
-        return actions_np
-    indices = np.arange(0, actions_np.shape[0], 2, dtype=np.int64) + 1
+        return actions_np.reshape(0, action_frame_count)
+
+    starts = np.arange(0, actions_np.shape[0], action_frame_count, dtype=np.int64)
+    offsets = np.arange(action_frame_count, dtype=np.int64)
+    indices = starts[:, None] + offsets[None, :]
     indices = np.clip(indices, 0, actions_np.shape[0] - 1)
     return actions_np[indices]
 
@@ -197,12 +189,16 @@ def encode_file(
     device: torch.device,
     autocast_ctx,
     auto_batch_shrink: bool,
-    use_onehot_conv: bool = False,
     require_even_batch_frames: bool = False,
 ) -> np.ndarray:
-    """Encode all frames from one recording, returning latents as float16 numpy."""
+    """Encode all frames from one recording, returning latents as float16 numpy.
+
+    Uses the VAE's streaming encoder path so causal temporal state is carried
+    across chunk boundaries instead of resetting every batch.
+    """
     total_frames = frames_np.shape[0]
     latent_chunks: list[np.ndarray] = []
+    encode_state = vae.init_encode_stream_state()
 
     if batch_frames < 1:
         raise ValueError("batch_frames must be >= 1")
@@ -218,6 +214,7 @@ def encode_file(
         if require_even_batch_frames and current_batch_frames > 1 and current_batch_frames % 2 != 0:
             current_batch_frames -= 1
         end = min(start + current_batch_frames, total_frames)
+        is_final_chunk = end >= total_frames
 
         chunk = None
         one_hot = None
@@ -226,14 +223,13 @@ def encode_file(
         try:
             chunk = torch.from_numpy(frames_np[start:end]).to(device)
             # VAE expects (B, C, T, H, W) — use batch=1 with T=chunk_len
-            if use_onehot_conv:
-                one_hot = chunk.unsqueeze(0).to(torch.uint8)
-            else:
-                one_hot = frames_to_one_hot(chunk.unsqueeze(0), num_colors, onehot_dtype)
+            one_hot = frames_to_one_hot(chunk.unsqueeze(0), num_colors, onehot_dtype)
             with torch.inference_mode(), autocast_ctx:
-                mean, _ = vae.encode(one_hot)
+                mean, _, next_encode_state = vae.encode_stream(one_hot, encode_state, final=is_final_chunk)
             # mean shape: (1, latent_ch, T, H', W')
-            latent_chunks.append(mean[0].cpu().to(torch.float16).numpy())
+            if mean.shape[2] > 0:
+                latent_chunks.append(mean[0].cpu().to(torch.float16).numpy())
+            encode_state = next_encode_state
             start = end
         except torch.OutOfMemoryError as exc:
             if device.type != "cuda" or not auto_batch_shrink:
@@ -446,17 +442,13 @@ def main() -> None:
     vae_checkpoint = Path(args.video_vae_checkpoint).resolve()
     vae_config = infer_vae_config_path(args)
     vae, vae_summary = load_video_vae(vae_checkpoint, vae_config, num_colors, device)
-    if vae_summary["onehot_conv"]:
-        if args.onehot_dtype != "float32":
-            console.print("[encode] onehot_conv enabled; --onehot-dtype is ignored.")
-    elif not autocast_enabled and onehot_dtype != torch.float32:
+    if not autocast_enabled and onehot_dtype != torch.float32:
         console.print("[encode] Non-autocast encoding requires float32 inputs; overriding --onehot-dtype to float32.")
         onehot_dtype = torch.float32
 
     console.print(
         f"[vae] latent_channels={vae_summary['latent_channels']} "
-        f"temporal_downsample={vae_summary['temporal_downsample']} "
-        f"onehot_conv={vae_summary['onehot_conv']}"
+        f"temporal_downsample={vae_summary['temporal_downsample']}"
     )
     if vae_summary["temporal_downsample"] > 0 and args.batch_frames % 2 != 0:
         raise ValueError("--batch-frames must be even when the VAE uses temporal downsampling")
@@ -488,7 +480,8 @@ def main() -> None:
         "num_colors": num_colors,
         "temporal_downsample": int(vae_summary["temporal_downsample"]),
         "latent_temporal_stride": int(2 ** vae_summary["temporal_downsample"]),
-        "action_downsample": "last_of_pair" if vae_summary["temporal_downsample"] > 0 else "none",
+        "action_frame_count": int(2 ** vae_summary["temporal_downsample"]),
+        "action_downsample": "grouped_frame_actions",
         "latent_stats_version": 2,
         "latent_normalization_scheme": "component_chw_shared_time",
     }
@@ -567,10 +560,9 @@ def main() -> None:
                     device=device,
                     autocast_ctx=make_autocast_ctx(),
                     auto_batch_shrink=not args.no_auto_batch_shrink,
-                    use_onehot_conv=bool(vae_summary["onehot_conv"]),
                     require_even_batch_frames=vae_summary["temporal_downsample"] > 0,
                 )
-                latent_actions = downsample_actions(
+                latent_actions = group_actions_by_latent(
                     actions,
                     temporal_downsample=vae_summary["temporal_downsample"],
                 )

@@ -39,7 +39,9 @@ apply_plot_style()
 from src.data.normalized_dataset import NormalizedSequenceDataset
 from src.models.ram_vae import RAMVAE
 from src.system_info import collect_system_info, print_system_info
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -74,25 +76,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default="data/normalized")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--clip-frames", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--clip-frames", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=2000)
     parser.add_argument("--kl-weight", type=float, default=1e-4)
-    parser.add_argument("--focal-gamma", type=float, default=0.0, help="Focal loss gamma (0 = standard CE).")
+    parser.add_argument("--focal-gamma", type=float, default=1.0, help="Focal loss gamma (0 = standard CE).")
+    parser.add_argument(
+        "--temporal-consistency-weight",
+        type=float,
+        default=0.05,
+        help="Weight for MSE on consecutive-frame RAM deltas from decoder expected values.",
+    )
     parser.add_argument("--max-steps", type=int, required=True)
     parser.add_argument("--eval-samples", type=int, default=1024)
-    parser.add_argument("--log-interval", type=int, default=20)
-    parser.add_argument("--eval-interval", type=int, default=200)
-    parser.add_argument("--checkpoint-interval", type=int, default=1000)
-    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--eval-interval", type=int, default=2000)
+    parser.add_argument("--checkpoint-interval", type=int, default=2000)
+    parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--embed-dim", type=int, default=8, help="Per-address embedding dimension.")
-    parser.add_argument("--latent-dim", type=int, default=32)
+    parser.add_argument("--latent-dim", type=int, default=128)
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.0,
+        default=0.01,
         help="Dropout probability used in model residual blocks.",
     )
     parser.add_argument("--n-fc-blocks", type=int, default=2)
@@ -101,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temporal-downsample",
         type=int,
-        default=0,
+        default=1,
         choices=[0, 1],
         help="Enable 2× temporal downsampling in latent (0=off, 1=on).",
     )
@@ -115,7 +123,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not (0.0 <= args.dropout < 1.0):
         parser.error("--dropout must be in [0, 1)")
     return args
@@ -166,11 +179,21 @@ def compute_ram_vae_losses(
     target_ram: torch.Tensor,
     *,
     focal_gamma: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute categorical (focal) cross-entropy reconstruction loss and KL."""
+    temporal_consistency_weight: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute reconstruction, KL, and optional temporal delta-matching loss."""
     recon_loss = model.categorical_loss(outputs.logits.float(), target_ram, gamma=focal_gamma)
     kl_loss = model.kl_loss(outputs.posterior_mean.float(), outputs.posterior_logvar.float())
-    return recon_loss, kl_loss
+
+    temporal_consistency_loss = outputs.logits.new_zeros(())
+    if temporal_consistency_weight > 0.0 and target_ram.shape[1] > 1:
+        pred_expected = model.logits_to_expected_values(outputs.logits.float()) / 255.0
+        target_expected = target_ram.float() / 255.0
+        pred_deltas = pred_expected[:, 1:] - pred_expected[:, :-1]
+        target_deltas = target_expected[:, 1:] - target_expected[:, :-1]
+        temporal_consistency_loss = F.mse_loss(pred_deltas, target_deltas)
+
+    return recon_loss, kl_loss, temporal_consistency_loss
 
 
 def evaluate(
@@ -180,19 +203,29 @@ def evaluate(
     device: torch.device,
     kl_weight: float,
     focal_gamma: float = 0.0,
+    temporal_consistency_weight: float = 0.0,
 ) -> tuple[dict[str, float], tuple[torch.Tensor, torch.Tensor] | None]:
     model.eval()
     recon_losses: list[float] = []
     kl_losses: list[float] = []
+    temporal_consistency_losses: list[float] = []
     preview: tuple[torch.Tensor, torch.Tensor] | None = None
 
     with torch.no_grad():
         for batch in loader:
             ram = batch["ram"].to(device, non_blocking=True)
             outputs = model(ram)
-            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram, focal_gamma=focal_gamma)
+            recon_loss, kl_loss, temporal_consistency_loss = compute_ram_vae_losses(
+                model,
+                outputs,
+                ram,
+                focal_gamma=focal_gamma,
+                temporal_consistency_weight=temporal_consistency_weight,
+            )
             recon_losses.append(recon_loss.item())
             kl_losses.append(kl_loss.item())
+            if temporal_consistency_weight > 0.0:
+                temporal_consistency_losses.append(temporal_consistency_loss.item())
 
             if preview is None:
                 preview_out = model(ram[:1], sample_posterior=False)
@@ -209,11 +242,16 @@ def evaluate(
 
     mean_recon = float(np.mean(recon_losses))
     mean_kl = float(np.mean(kl_losses))
-    return {
+    metrics = {
         "recon_loss": mean_recon,
         "kl_loss": mean_kl,
         "loss": mean_recon + kl_weight * mean_kl,
-    }, preview
+    }
+    if temporal_consistency_weight > 0.0:
+        mean_temporal_consistency = float(np.mean(temporal_consistency_losses)) if temporal_consistency_losses else 0.0
+        metrics["temporal_consistency_loss"] = mean_temporal_consistency
+        metrics["loss"] += temporal_consistency_weight * mean_temporal_consistency
+    return metrics, preview
 
 
 def save_training_state(
@@ -399,6 +437,7 @@ def main() -> None:
             "embed_dim": int(args.embed_dim),
             "hidden_dim": int(args.hidden_dim),
             "latent_dim": int(args.latent_dim),
+            "temporal_consistency_weight": float(args.temporal_consistency_weight),
             "dropout": float(args.dropout),
             "n_fc_blocks": int(args.n_fc_blocks),
             "n_temporal_blocks": int(args.n_temporal_blocks),
@@ -406,8 +445,22 @@ def main() -> None:
             "temporal_downsample": int(args.temporal_downsample),
         },
     )
+    mlflow_run = MLflowRun.create(
+        enabled=is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "ram_vae",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
         console.print(f"Training RAM VAE on {len(train_dataset)} samples")
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
@@ -436,8 +489,18 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with accelerator.autocast():
                 outputs = model(ram)
-            recon_loss, kl_loss = compute_ram_vae_losses(model, outputs, ram, focal_gamma=args.focal_gamma)
-            loss = recon_loss + args.kl_weight * kl_loss
+            recon_loss, kl_loss, temporal_consistency_loss = compute_ram_vae_losses(
+                model,
+                outputs,
+                ram,
+                focal_gamma=args.focal_gamma,
+                temporal_consistency_weight=args.temporal_consistency_weight,
+            )
+            loss = (
+                recon_loss
+                + args.kl_weight * kl_loss
+                + args.temporal_consistency_weight * temporal_consistency_loss
+            )
 
             accelerator.backward(loss)
             grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
@@ -468,13 +531,21 @@ def main() -> None:
                     "samples_per_sec": round(samples_per_second, 1),
                     "steps_per_sec": round(steps_per_second, 2),
                 }
+                if args.temporal_consistency_weight > 0.0:
+                    train_row["temporal_consistency_loss"] = temporal_consistency_loss.item()
                 if is_main_process:
                     train_row.update(gpu_stats(device))
                     metrics.append(train_row)
+                    mlflow_run.log_metrics(train_row)
 
                     status = (
                         f"loss={loss.item():.5f} recon={recon_loss.item():.5f} "
-                        f"kl={kl_loss.item():.3f} lr={lr_current:.2e} "
+                        f"kl={kl_loss.item():.3f} "
+                        + (
+                            f"tc={temporal_consistency_loss.item():.5f} "
+                            if args.temporal_consistency_weight > 0.0 else ""
+                        )
+                        + f"lr={lr_current:.2e} "
                         f"gnorm={grad_norm:.2f} "
                         f"{samples_per_second:.0f} samp/s"
                     )
@@ -512,6 +583,7 @@ def main() -> None:
                     device=device,
                     kl_weight=args.kl_weight,
                     focal_gamma=args.focal_gamma,
+                    temporal_consistency_weight=args.temporal_consistency_weight,
                 )
                 eval_loss = eval_metrics["loss"]
                 eval_metrics["type"] = "eval"
@@ -519,6 +591,7 @@ def main() -> None:
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
@@ -526,6 +599,8 @@ def main() -> None:
                     f"recon={eval_metrics['recon_loss']:.5f} "
                     f"kl={eval_metrics['kl_loss']:.3f}"
                 )
+                if args.temporal_consistency_weight > 0.0:
+                    eval_line += f" tc={eval_metrics['temporal_consistency_loss']:.5f}"
 
                 if preview is not None:
                     save_ram_preview(
@@ -572,6 +647,10 @@ def main() -> None:
 
     if is_main_process:
         save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
 
         console.print(f"Training complete. Best eval loss: {best_eval:.6f}")
         console.print(f"Output: {output_dir}")

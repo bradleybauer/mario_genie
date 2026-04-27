@@ -22,14 +22,17 @@ from remote.helpers import (
 )
 
 
-def local_data_sources(*, include_raw: bool = False) -> list[Path]:
+def local_data_sources(*, include_raw: bool = False, only_raw: bool = False) -> list[Path]:
     """Return existing local data directories to sync."""
-    candidates = [
-        PROJECT_ROOT / "data" / "normalized",
-        PROJECT_ROOT / "data" / "latents",
-    ]
-    if include_raw:
-        candidates.append(PROJECT_ROOT / "data" / "raw")
+    if only_raw:
+        candidates = [PROJECT_ROOT / "data" / "raw"]
+    else:
+        candidates = [
+            PROJECT_ROOT / "data" / "normalized",
+            PROJECT_ROOT / "data" / "latents",
+        ]
+        if include_raw:
+            candidates.append(PROJECT_ROOT / "data" / "raw")
     return [path for path in candidates if path.exists()]
 
 
@@ -43,20 +46,29 @@ def rsync_extra_args_for_source(source: Path) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Send data to remotes")
-    parser.add_argument(
+    raw_group = parser.add_mutually_exclusive_group()
+    raw_group.add_argument(
         "--raw",
         action="store_true",
         help="Also sync data/raw in addition to normalized data and latents.",
+    )
+    raw_group.add_argument(
+        "--only-raw",
+        action="store_true",
+        help="Sync only data/raw.",
     )
     parser.add_argument("workers", nargs="*", help="Worker names, or 'all' (omit to list available)")
     return parser.parse_args()
 
 
-def send_data(worker, *, include_raw: bool = False):
-    sources = local_data_sources(include_raw=include_raw)
+def send_data(worker, *, include_raw: bool = False, only_raw: bool = False):
+    sources = local_data_sources(include_raw=include_raw, only_raw=only_raw)
     if not sources:
-        selected = "normalized, latents, raw" if include_raw else "normalized, latents"
-        raise FileNotFoundError(f"No local data directories found to sync ({selected})")
+        if only_raw:
+            selected = "raw"
+        else:
+            selected = "normalized, latents, raw" if include_raw else "normalized, latents"
+        return f"skipped (no local data directories found: {selected})"
 
     ssh(worker, f"mkdir -p {worker.project_dir}/data", capture=True)
     for source in sources:
@@ -76,11 +88,16 @@ def main():
         sys.exit(0)
 
     workers = load_workers(None if "all" in args.workers else args.workers)
-    raw_suffix = " (+ raw)" if args.raw else ""
+    if args.only_raw:
+        raw_suffix = " (raw only)"
+    elif args.raw:
+        raw_suffix = " (+ raw)"
+    else:
+        raw_suffix = ""
     print(f"Sending data to {len(workers)} worker(s){raw_suffix}: {[w.name for w in workers]}")
 
     def send_selected_data(worker):
-        return send_data(worker, include_raw=args.raw)
+        return send_data(worker, include_raw=args.raw, only_raw=args.only_raw)
 
     results = run_on_all(workers, send_selected_data, desc="send data")
     sys.exit(0 if report_results(results) else 1)

@@ -2,10 +2,9 @@
 """Interactive diagnostic viewer for Video VAE reconstructions.
 
 Loads a checkpoint, samples a random clip from the dataset, runs a forward
-pass, and displays six diagnostic panels:
-
-  Row 1: Target RGB | Reconstruction RGB | Error overlay
-  Row 2: P(correct) confidence | Class weight map | Latent channel grid
+pass, and displays target/reconstruction views, the latent grid, and optional
+intermediate activation panels. Extra diagnostics like reconstruction error,
+correct-probability, and loss-weight maps can be enabled on demand.
 
 Controls:
   Frame slider   – scrub through time
@@ -23,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -61,6 +61,12 @@ from src.training.training_utils import load_model_state_dict
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+DEFAULT_ACTIVATION_STAGES = (
+    "encoder_block1",
+    "encoder_block3",
+    "encoder_block5",
+)
 
 def _resolve_device(choice: str) -> torch.device:
     if choice == "cpu":
@@ -127,9 +133,6 @@ def _build_model(config: dict, device: torch.device) -> VideoVAE:
         latent_channels=tcfg["latent_channels"],
         temporal_downsample=tcfg.get("temporal_downsample", 0),
         dropout=0.0,
-        onehot_conv=tcfg.get("onehot_conv", False),
-        global_bottleneck_attn=tcfg.get("global_bottleneck_attn", False),
-        global_bottleneck_attn_heads=tcfg.get("global_bottleneck_attn_heads", 8),
     )
     return model.to(device)
 
@@ -141,6 +144,59 @@ def _load_checkpoint(model: VideoVAE, ckpt_path: Path, device: torch.device) -> 
     return ckpt
 
 
+def _slice_temporal_window(tensor: torch.Tensor, keep_start: int, keep_end: int, input_frames: int) -> torch.Tensor:
+    """Slice a temporally aligned window from a (B, C, T, H, W) tensor."""
+    t_out = int(tensor.shape[2])
+    out_start = int(round(keep_start * t_out / max(input_frames, 1)))
+    out_end = int(round(keep_end * t_out / max(input_frames, 1)))
+    if keep_end > keep_start:
+        out_end = max(out_end, out_start + 1)
+    out_start = max(0, min(out_start, t_out))
+    out_end = max(out_start, min(out_end, t_out))
+    return tensor[:, :, out_start:out_end]
+
+
+def _format_activation_stage_name(stage_name: str) -> str:
+    parts = stage_name.split("_", maxsplit=1)
+    if len(parts) != 2:
+        return stage_name
+    prefix = {"encoder": "Enc", "decoder": "Dec"}.get(parts[0], parts[0].title())
+    suffix_key = parts[1]
+    if suffix_key == "in":
+        suffix = "Input"
+    elif suffix_key == "out":
+        suffix = "Output"
+    elif suffix_key == "mid":
+        suffix = "Mid"
+    elif suffix_key.startswith("block"):
+        suffix = f"Block {suffix_key[len('block'):]}"
+    elif suffix_key.startswith("down"):
+        suffix = f"Down {suffix_key[len('down'):]}"
+    elif suffix_key.startswith("up"):
+        suffix = f"Up {suffix_key[len('up'):]}"
+    else:
+        suffix = suffix_key.replace("_", " ").title()
+    return f"{prefix} {suffix}".strip()
+
+
+def _map_time_index(frame_idx: int, source_frames: int, target_frames: int) -> int:
+    if target_frames <= 1 or source_frames <= 1:
+        return 0
+    if target_frames == source_frames:
+        return min(frame_idx, target_frames - 1)
+    return min(int(frame_idx * target_frames / source_frames), target_frames - 1)
+
+
+def _group_activation_channels(activation: np.ndarray, target_channels: int) -> np.ndarray:
+    """Average channel groups into a smaller latent-style code."""
+    channels = int(activation.shape[0])
+    if target_channels <= 0 or channels <= target_channels:
+        return activation
+    groups = np.array_split(np.arange(channels), target_channels)
+    grouped = [activation[idx_group].mean(axis=0) for idx_group in groups if len(idx_group) > 0]
+    return np.stack(grouped, axis=0)
+
+
 def _forward_video_vae_chunked(
     model: VideoVAE,
     frames: torch.Tensor,
@@ -149,17 +205,18 @@ def _forward_video_vae_chunked(
     *,
     chunk_frames: int,
     chunk_overlap: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    activation_stages: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Run chunked temporal inference and stitch outputs on CPU.
 
     Returns:
         logits_cpu: (1, C, T, H, W)
         mean_cpu: (1, Z, T_lat, H_lat, W_lat)
         logvar_cpu: (1, Z, T_lat, H_lat, W_lat)
+        activations_cpu: stage_name -> (1, C, T_stage, H_stage, W_stage)
     """
     tcfg = config["training"]
     dcfg = config["data"]
-    use_onehot_conv = tcfg.get("onehot_conv", False)
     onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
     onehot_dtype = {
         "float32": torch.float32,
@@ -180,49 +237,69 @@ def _forward_video_vae_chunked(
     logits_parts: list[torch.Tensor] = []
     mean_parts: list[torch.Tensor] = []
     logvar_parts: list[torch.Tensor] = []
+    activation_parts: dict[str, list[torch.Tensor]] = {name: [] for name in activation_stages}
 
-    core_start = 0
-    while core_start < total_frames:
-        core_end = min(core_start + core_step, total_frames)
-        in_start = max(0, core_start - chunk_overlap)
-        in_end = min(total_frames, core_end + chunk_overlap)
+    current_activations: dict[str, torch.Tensor] = {}
+    hook_handles = []
 
-        frames_chunk = frames[:, in_start:in_end]
-        if use_onehot_conv:
-            model_input = frames_chunk.byte()
-        else:
+    for stage_name in activation_stages:
+        module = getattr(model, stage_name)
+
+        def _hook(_module, _inputs, output, *, name: str = stage_name):
+            current_activations[name] = output.detach()
+
+        hook_handles.append(module.register_forward_hook(_hook))
+
+    try:
+        core_start = 0
+        while core_start < total_frames:
+            core_end = min(core_start + core_step, total_frames)
+            in_start = max(0, core_start - chunk_overlap)
+            in_end = min(total_frames, core_end + chunk_overlap)
+
+            frames_chunk = frames[:, in_start:in_end]
             model_input = frames_to_one_hot(frames_chunk.long(), dcfg["num_colors"], dtype=onehot_dtype)
 
-        amp_ctx = torch.autocast(device_type=device.type, dtype=autocast_dtype) if autocast_dtype and device.type == "cuda" else nullcontext()
-        with amp_ctx:
-            outputs = model(model_input, sample_posterior=False)
+            current_activations.clear()
+            amp_ctx = torch.autocast(device_type=device.type, dtype=autocast_dtype) if autocast_dtype and device.type == "cuda" else nullcontext()
+            with amp_ctx:
+                outputs = model(model_input, sample_posterior=False)
 
-        logits_chunk = outputs.logits.float().cpu()
-        mean_chunk = outputs.posterior_mean.float().cpu()
-        logvar_chunk = outputs.posterior_logvar.float().cpu()
+            logits_chunk = outputs.logits.float().cpu()
+            mean_chunk = outputs.posterior_mean.float().cpu()
+            logvar_chunk = outputs.posterior_logvar.float().cpu()
 
-        keep_start = core_start - in_start
-        keep_end = keep_start + (core_end - core_start)
-        logits_parts.append(logits_chunk[:, :, keep_start:keep_end])
+            keep_start = core_start - in_start
+            keep_end = keep_start + (core_end - core_start)
+            t_in = int(in_end - in_start)
 
-        t_in = int(in_end - in_start)
-        t_lat = int(mean_chunk.shape[2])
-        lat_start = int(round(keep_start * t_lat / max(t_in, 1)))
-        lat_end = int(round(keep_end * t_lat / max(t_in, 1)))
-        if keep_end > keep_start:
-            lat_end = max(lat_end, lat_start + 1)
-        lat_start = max(0, min(lat_start, t_lat))
-        lat_end = max(lat_start, min(lat_end, t_lat))
+            logits_parts.append(_slice_temporal_window(logits_chunk, keep_start, keep_end, t_in))
+            mean_parts.append(_slice_temporal_window(mean_chunk, keep_start, keep_end, t_in))
+            logvar_parts.append(_slice_temporal_window(logvar_chunk, keep_start, keep_end, t_in))
 
-        mean_parts.append(mean_chunk[:, :, lat_start:lat_end])
-        logvar_parts.append(logvar_chunk[:, :, lat_start:lat_end])
+            for stage_name in activation_stages:
+                activation_chunk = current_activations.get(stage_name)
+                if activation_chunk is None:
+                    raise RuntimeError(f"Missing activation capture for stage '{stage_name}'")
+                activation_cpu = activation_chunk.float().cpu()
+                activation_parts[stage_name].append(
+                    _slice_temporal_window(activation_cpu, keep_start, keep_end, t_in)
+                )
 
-        core_start = core_end
+            core_start = core_end
+    finally:
+        for handle in hook_handles:
+            handle.remove()
 
+    activations_cpu = {
+        stage_name: torch.cat(parts, dim=2)
+        for stage_name, parts in activation_parts.items()
+    }
     return (
         torch.cat(logits_parts, dim=2),
         torch.cat(mean_parts, dim=2),
         torch.cat(logvar_parts, dim=2),
+        activations_cpu,
     )
 
 
@@ -273,7 +350,6 @@ def _build_effective_loss_weight_map(
     frames: torch.Tensor,
     class_weight: torch.Tensor | None,
     *,
-    context_frames: int,
     class_weight_radius: float,
     class_weight_hardness: float,
     class_weight_temporal_ema: float,
@@ -282,11 +358,11 @@ def _build_effective_loss_weight_map(
     """Return (effective_display_weight, pixel_weight) matching training semantics.
 
     ``effective_display_weight`` is the full multiplicative factor applied per pixel
-    on the predicted frames only, suitable for visualization. ``pixel_weight`` is
+    on the full clip, suitable for visualization. ``pixel_weight`` is
     the tensor passed to ``focal_cross_entropy`` alongside the optional per-class
     vector, matching the training call structure.
     """
-    recon_targets = frames[:, context_frames:] if context_frames > 0 else frames
+    recon_targets = frames
     effective_weight: torch.Tensor | None = None
     pixel_weight: torch.Tensor | None = None
 
@@ -298,7 +374,7 @@ def _build_effective_loss_weight_map(
             hardness=class_weight_hardness,
             temporal_ema=class_weight_temporal_ema,
         )
-        effective_weight = spatial_pw[:, context_frames:] if context_frames > 0 else spatial_pw
+        effective_weight = spatial_pw
         pixel_weight = effective_weight
     elif class_weight is not None:
         effective_weight = class_weight.to(frames.device, dtype=torch.float32)[recon_targets.long()]
@@ -307,7 +383,6 @@ def _build_effective_loss_weight_map(
         change_pw = temporal_change_weight(
             frames,
             boost=temporal_change_boost,
-            context_frames=context_frames,
         )
         pixel_weight = change_pw if pixel_weight is None else pixel_weight * change_pw
         effective_weight = change_pw if effective_weight is None else effective_weight * change_pw
@@ -390,10 +465,10 @@ def _run_inspection(
     *,
     chunk_frames: int,
     chunk_overlap: int,
+    activation_stages: tuple[str, ...],
 ) -> dict:
     """Sample a random clip, run the model, and compute all diagnostic arrays."""
     tcfg = config["training"]
-    context_frames = tcfg.get("context_frames", 0)
     focal_gamma = tcfg.get("focal_gamma", 0.0)
     cw_radius = tcfg.get("class_weight_radius", 0.0)
     cw_hardness = tcfg.get("class_weight_hardness", 5.0)
@@ -403,17 +478,18 @@ def _run_inspection(
     clip_frames, clip_info = sampler.sample(rng)
     frames = clip_frames.unsqueeze(0).to(device)  # (1, T, H, W) uint8
 
-    logits_cpu, posterior_mean_cpu, posterior_logvar_cpu = _forward_video_vae_chunked(
+    logits_cpu, posterior_mean_cpu, posterior_logvar_cpu, activation_tensors_cpu = _forward_video_vae_chunked(
         model,
         frames,
         config,
         device,
         chunk_frames=chunk_frames,
         chunk_overlap=chunk_overlap,
+        activation_stages=activation_stages,
     )
     recon_indices = logits_cpu.argmax(dim=1)  # (1, T, H, W)
-    recon_logits = logits_cpu[:, :, context_frames:] if context_frames > 0 else logits_cpu
-    recon_targets = frames.long()[:, context_frames:] if context_frames > 0 else frames.long()
+    recon_logits = logits_cpu
+    recon_targets = frames.long()
 
     T = frames.shape[1]
     frames_cpu = frames[0].cpu()  # (T, H, W)
@@ -468,7 +544,6 @@ def _run_inspection(
     effective_weight, pixel_weight = _build_effective_loss_weight_map(
         frames_cpu.unsqueeze(0),
         class_weight.cpu() if class_weight is not None else None,
-        context_frames=context_frames,
         class_weight_radius=cw_radius,
         class_weight_hardness=cw_hardness,
         class_weight_temporal_ema=cw_temporal_ema,
@@ -476,12 +551,31 @@ def _run_inspection(
     )
     weight_map = None
     if effective_weight is not None:
-        weight_map = np.zeros((T, H, W), dtype=np.float32)
-        weight_map[context_frames:] = effective_weight[0].numpy()
+        weight_map = effective_weight[0].numpy().astype(np.float32, copy=False)
 
     # Latent channel grid per time step
     latent_np = latent_mean.numpy()  # (Z, T_lat, H_lat, W_lat)
     T_lat = latent_np.shape[1]
+
+    activation_data = []
+    latent_channels = int(latent_np.shape[0])
+    for stage_name in activation_stages:
+        activation_np = activation_tensors_cpu[stage_name][0].numpy()
+        display_values = activation_np
+        title = _format_activation_stage_name(stage_name)
+        if stage_name.startswith("encoder_block"):
+            display_values = _group_activation_channels(activation_np, latent_channels)
+            title = f"{title} Code"
+        scale = float(np.nanpercentile(np.abs(display_values), 99.0)) if display_values.size else 0.0
+        activation_data.append(
+            {
+                "name": stage_name,
+                "title": title,
+                "values": display_values,
+                "T": int(display_values.shape[1]),
+                "vmax": max(scale, 1e-6),
+            }
+        )
 
     # KL divergence per spatial position (mean over channels)
     kl_per_pos = 0.5 * (
@@ -503,7 +597,7 @@ def _run_inspection(
             class_weight=class_weight_for_loss,
             pixel_weight=pixel_weight_t,
         ).item()
-        per_frame_loss[context_frames + t] = loss_t
+        per_frame_loss[t] = loss_t
 
     return {
         "target_rgb": target_rgb,
@@ -515,12 +609,12 @@ def _run_inspection(
         "weight_map": weight_map,
         "latent": latent_np,
         "kl_spatial": kl_spatial,
+        "activations": activation_data,
         "T": T,
         "T_lat": T_lat,
         "per_frame_acc": per_frame_acc,
         "per_frame_loss": per_frame_loss,
         "latent_standardized": latent_standardized,
-        "context_frames": context_frames,
         "clip_info": clip_info,
     }
 
@@ -538,6 +632,7 @@ def _show_viewer(
     config: dict,
     device: torch.device,
     args: argparse.Namespace,
+    activation_stages: tuple[str, ...],
 ) -> None:
     rng = np.random.default_rng(args.seed)
     data = _run_inspection(
@@ -551,51 +646,117 @@ def _show_viewer(
         rng,
         chunk_frames=args.chunk_frames,
         chunk_overlap=args.chunk_overlap,
+        activation_stages=activation_stages,
     )
 
     T = data["T"]
-    ctx = data["context_frames"]
 
-    # --- Layout: 2 rows × 3 cols ---
+    # --- Layout: 3 columns, dynamic rows ---
     scale = args.scale
     H, W = data["target_rgb"].shape[1], data["target_rgb"].shape[2]
     panel_w = W * scale / 100
     panel_h = H * scale / 100
-    fig_w = panel_w * 3 + 1.5
-    fig_h = panel_h * 2 + 2.0
+    ncols = 3
+
+    encoder_activations = [
+        activation for activation in data["activations"]
+        if activation["name"].startswith("encoder_block")
+    ]
+    other_activations = [
+        activation for activation in data["activations"]
+        if not activation["name"].startswith("encoder_block")
+    ]
+
+    panel_specs: list[dict[str, object]] = [
+        {"key": "target", "colspan": 1},
+        {"key": "latent", "colspan": 2},
+    ]
+    panel_specs.extend({"key": f"act:{activation['name']}", "colspan": 1} for activation in encoder_activations)
+    panel_specs.extend({"key": f"act:{activation['name']}", "colspan": 1} for activation in other_activations)
+    if args.show_error:
+        panel_specs.append({"key": "error", "colspan": 1})
+    if args.show_confidence:
+        panel_specs.append({"key": "confidence", "colspan": 1})
+    if args.show_loss_weight:
+        panel_specs.append({"key": "loss_weight", "colspan": 1})
+
+    layout_slots: list[tuple[int, int, int, str]] = []
+    row = 0
+    col = 0
+    for spec in panel_specs:
+        colspan = int(spec["colspan"])
+        if col + colspan > ncols:
+            row += 1
+            col = 0
+        layout_slots.append((row, col, colspan, str(spec["key"])))
+        col += colspan
+        if col >= ncols:
+            row += 1
+            col = 0
+
+    nrows = max(2, row if col == 0 else row + 1)
+    fig_w = panel_w * ncols + 1.5
+    fig_h = panel_h * nrows + 2.0
 
     fig = plt.figure(figsize=(fig_w, fig_h))
     gs = fig.add_gridspec(
-        2, 3,
+        nrows, ncols,
         wspace=0.08, hspace=0.15,
         left=0.02, right=0.98, top=0.88, bottom=0.18,
     )
 
-    ax_tgt = fig.add_subplot(gs[0, 0])
-    ax_rec = fig.add_subplot(gs[0, 1])
-    ax_err = fig.add_subplot(gs[0, 2])
-    ax_conf = fig.add_subplot(gs[1, 0])
-    ax_cw = fig.add_subplot(gs[1, 1])
-    ax_lat = fig.add_subplot(gs[1, 2])
+    axes_by_key: dict[str, matplotlib.axes.Axes] = {}
+    for row_idx, col_idx, colspan, key in layout_slots:
+        if colspan == 1:
+            ax = fig.add_subplot(gs[row_idx, col_idx])
+        else:
+            ax = fig.add_subplot(gs[row_idx, col_idx:col_idx + colspan])
+        axes_by_key[key] = ax
 
-    for ax in [ax_tgt, ax_rec, ax_err, ax_conf, ax_cw, ax_lat]:
+    ax_tgt = axes_by_key["target"]
+    ax_err = axes_by_key.get("error")
+    ax_conf = axes_by_key.get("confidence")
+    ax_cw = axes_by_key.get("loss_weight")
+    ax_lat = axes_by_key["latent"]
+    activation_axes = {
+        activation["name"]: axes_by_key[f"act:{activation['name']}"]
+        for activation in data["activations"]
+    }
+
+    for ax in axes_by_key.values():
         ax.set_axis_off()
         style_image_axes(ax)
 
     im_tgt = ax_tgt.imshow(data["target_rgb"][0], interpolation="nearest")
-    im_rec = ax_rec.imshow(data["recon_rgb"][0], interpolation="nearest")
-    im_err = ax_err.imshow(data["error_rgb"][0], interpolation="nearest")
-    im_conf = ax_conf.imshow(data["confidence"][0], interpolation="nearest",
-                             cmap="RdYlGn", vmin=0, vmax=1)
+    im_err = None
+    if ax_err is not None:
+        im_err = ax_err.imshow(data["error_rgb"][0], interpolation="nearest")
 
-    if data["weight_map"] is not None:
-        cw_vmin = data["weight_map"].min()
-        cw_vmax = data["weight_map"].max()
-        im_cw = ax_cw.imshow(data["weight_map"][0], interpolation="nearest",
-                             cmap="inferno", vmin=cw_vmin, vmax=cw_vmax)
-    else:
-        im_cw = ax_cw.imshow(np.zeros((H, W)), interpolation="nearest", cmap="gray")
-        ax_cw.set_title("(no loss weighting)", fontsize=9)
+    im_conf = None
+    if ax_conf is not None:
+        im_conf = ax_conf.imshow(
+            data["confidence"][0],
+            interpolation="nearest",
+            cmap="RdYlGn",
+            vmin=0,
+            vmax=1,
+        )
+
+    im_cw = None
+    if ax_cw is not None:
+        if data["weight_map"] is not None:
+            cw_vmin = data["weight_map"].min()
+            cw_vmax = data["weight_map"].max()
+            im_cw = ax_cw.imshow(
+                data["weight_map"][0],
+                interpolation="nearest",
+                cmap="inferno",
+                vmin=cw_vmin,
+                vmax=cw_vmax,
+            )
+        else:
+            im_cw = ax_cw.imshow(np.zeros((H, W)), interpolation="nearest", cmap="gray")
+            ax_cw.set_title("(no loss weighting)", fontsize=9)
 
     # Latent grid for frame 0
     lat_t0 = _latent_channel_grid(data["latent"][:, 0])
@@ -604,11 +765,26 @@ def _show_viewer(
     im_lat = ax_lat.imshow(lat_t0, interpolation="nearest", cmap=lat_cmap,
                            vmin=-3, vmax=3)
 
+    activation_images: dict[str, matplotlib.image.AxesImage] = {}
+    for activation in data["activations"]:
+        ax = activation_axes[activation["name"]]
+        activation_grid = _latent_channel_grid(activation["values"][:, 0])
+        activation_images[activation["name"]] = ax.imshow(
+            activation_grid,
+            interpolation="nearest",
+            cmap=lat_cmap,
+            vmin=-activation["vmax"],
+            vmax=activation["vmax"],
+        )
+        ax.set_title(activation["title"], fontsize=9)
+
     ax_tgt.set_title("Target", fontsize=9)
-    ax_rec.set_title("Recon", fontsize=9)
-    ax_err.set_title("Error", fontsize=9)
-    ax_conf.set_title("Correct Probability", fontsize=9)
-    ax_cw.set_title("Loss Weight", fontsize=9)
+    if ax_err is not None:
+        ax_err.set_title("Error", fontsize=9)
+    if ax_conf is not None:
+        ax_conf.set_title("Correct Probability", fontsize=9)
+    if ax_cw is not None and data["weight_map"] is not None:
+        ax_cw.set_title("Loss Weight", fontsize=9)
     def _latent_panel_title(d: dict) -> str:
         if d.get("latent_standardized", False):
             return "Standardized Latent μ (z-score)"
@@ -623,11 +799,10 @@ def _show_viewer(
         t = state["frame"]
         acc = d["per_frame_acc"][t]
         loss = d["per_frame_loss"][t]
-        mean_acc = d["per_frame_acc"][ctx:].mean() if ctx < d["T"] else d["per_frame_acc"].mean()
-        ctx_str = "  [CTX]" if t < ctx else ""
+        mean_acc = d["per_frame_acc"].mean()
         loss_str = "n/a" if np.isnan(loss) else f"{loss:.3f}"
         return (
-            f"{d['clip_info']}  |  frame {t+1}/{d['T']}{ctx_str}  |  "
+            f"{d['clip_info']}  |  frame {t+1}/{d['T']}  |  "
             f"acc={acc:.3f}  loss={loss_str}  |  mean_acc={mean_acc:.3f}"
         )
 
@@ -648,27 +823,23 @@ def _show_viewer(
     btn_resample = Button(ax_resample, "Resample")
     style_widget(btn_resample)
 
-    def _map_lat_frame(t: int) -> int:
-        """Map display frame index to latent time index."""
-        d = state["data"]
-        T_lat = d["T_lat"]
-        T_vid = d["T"]
-        if T_lat == T_vid:
-            return t
-        return min(int(t * T_lat / T_vid), T_lat - 1)
-
     def _update_frame(t: int) -> None:
         d = state["data"]
         state["frame"] = t
         im_tgt.set_data(d["target_rgb"][t])
-        im_rec.set_data(d["recon_rgb"][t])
-        im_err.set_data(d["error_rgb"][t])
-        im_conf.set_data(d["confidence"][t])
-        if d["weight_map"] is not None:
+        if im_err is not None:
+            im_err.set_data(d["error_rgb"][t])
+        if im_conf is not None:
+            im_conf.set_data(d["confidence"][t])
+        if im_cw is not None and d["weight_map"] is not None:
             im_cw.set_data(d["weight_map"][t])
-        lt = _map_lat_frame(t)
+        lt = _map_time_index(t, d["T"], d["T_lat"])
         lat_grid = _latent_channel_grid(d["latent"][:, lt])
         im_lat.set_data(lat_grid)
+        for activation in d["activations"]:
+            image = activation_images[activation["name"]]
+            activation_t = _map_time_index(t, d["T"], activation["T"])
+            image.set_data(_latent_channel_grid(activation["values"][:, activation_t]))
         title_text.set_text(_fmt_title())
         fig.canvas.draw_idle()
 
@@ -689,15 +860,22 @@ def _show_viewer(
             rng,
             chunk_frames=args.chunk_frames,
             chunk_overlap=args.chunk_overlap,
+            activation_stages=activation_stages,
         )
         state["data"] = d
         ax_lat.set_title(_latent_panel_title(d), fontsize=9)
+        for activation in d["activations"]:
+            ax = activation_axes[activation["name"]]
+            ax.set_title(activation["title"], fontsize=9)
         # Update slider range if clip length changed (unlikely but safe)
         slider.valmax = d["T"]
         slider.set_val(1)
         # Update class weight colorbar range
-        if d["weight_map"] is not None:
+        if im_cw is not None and d["weight_map"] is not None:
             im_cw.set_clim(d["weight_map"].min(), d["weight_map"].max())
+        for activation in d["activations"]:
+            image = activation_images[activation["name"]]
+            image.set_clim(-activation["vmax"], activation["vmax"])
         _update_frame(0)
 
     def on_play(event):
@@ -761,12 +939,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data-dir", default="data/normalized", help="Dataset directory (default: data/normalized)")
     p.add_argument("--seed", type=int, default=None, help="Random seed (default: random)")
     p.add_argument(
-        "--predicted-frames",
+        "--clip-frames",
         type=int,
         default=None,
         help=(
-            "Number of predicted frames to inspect (default: checkpoint config value). "
-            "Total sampled frames are context_frames + predicted_frames."
+            "Number of frames per sampled clip to inspect (default: checkpoint config value)."
         ),
     )
     p.add_argument(
@@ -783,6 +960,30 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--fps", type=int, default=8, help="Playback FPS (default: 8)")
     p.add_argument("--scale", type=float, default=3.0, help="Display scale multiplier (default: 3.0)")
+    p.add_argument(
+        "--show-error",
+        action="store_true",
+        help="Show the reconstruction error panel (hidden by default)",
+    )
+    p.add_argument(
+        "--show-confidence",
+        action="store_true",
+        help="Show the correct-probability panel (hidden by default)",
+    )
+    p.add_argument(
+        "--show-loss-weight",
+        action="store_true",
+        help="Show the loss-weight panel (hidden by default)",
+    )
+    p.add_argument(
+        "--activation-stages",
+        nargs="*",
+        default=list(DEFAULT_ACTIVATION_STAGES),
+        help=(
+            "Top-level VideoVAE module names to visualize as intermediate activations "
+            f"(default: {' '.join(DEFAULT_ACTIVATION_STAGES)})."
+        ),
+    )
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
                    help="Device (default: auto)")
     return p.parse_args()
@@ -810,6 +1011,22 @@ def main() -> None:
     step = ckpt.get("step", "?")
     print(f"  step={step}  params={sum(p.numel() for p in model.parameters()):,}")
 
+    available_activation_stages = tuple(
+        name for name in model._modules if name.startswith(("encoder_", "decoder_"))
+    )
+    activation_stages = tuple(args.activation_stages)
+    invalid_stages = [name for name in activation_stages if name not in available_activation_stages]
+    if invalid_stages:
+        choices = ", ".join(available_activation_stages)
+        raise SystemExit(
+            "Unknown activation stages: "
+            f"{', '.join(invalid_stages)}. Available stages: {choices}"
+        )
+    if activation_stages:
+        print(f"  activation stages: {', '.join(activation_stages)}")
+    else:
+        print("  activation stages: disabled")
+
     # Palette
     palette = load_palette_tensor(args.data_dir)
     palette_u8 = (palette.clamp(0, 1).numpy() * 255).astype(np.uint8)
@@ -824,22 +1041,19 @@ def main() -> None:
             print(f"  class weights: soften={soften}, range=[{class_weight.min():.3f}, {class_weight.max():.3f}]")
 
     # Lightweight clip sampler (mmap, no full dataset load)
-    context_frames = tcfg.get("context_frames", 0)
-    predicted_frames = int(args.predicted_frames) if args.predicted_frames is not None else int(dcfg["clip_frames"])
-    if predicted_frames <= 0:
-        raise SystemExit("--predicted-frames must be > 0")
+    clip_frames = int(args.clip_frames) if args.clip_frames is not None else int(dcfg["clip_frames"])
+    if clip_frames <= 0:
+        raise SystemExit("--clip-frames must be > 0")
     if args.chunk_frames <= 0:
         raise SystemExit("--chunk-frames must be > 0")
     if args.chunk_overlap < 0:
         raise SystemExit("--chunk-overlap must be >= 0")
     if args.chunk_frames <= 2 * args.chunk_overlap:
         raise SystemExit("--chunk-frames must be greater than 2 * --chunk-overlap")
-    clip_frames = predicted_frames + context_frames
     frame_size = dcfg.get("frame_height", dcfg.get("frame_size", 224))
     print(
         "  Indexing clips: "
-        f"{args.data_dir}, clip_frames={clip_frames} "
-        f"({context_frames} context + {predicted_frames} predicted), frame_size={frame_size}"
+        f"{args.data_dir}, clip_frames={clip_frames}, frame_size={frame_size}"
     )
     sampler = _ClipSampler(args.data_dir, clip_frames=clip_frames, frame_size=frame_size)
     print(f"  {len(sampler._valid_files)} files indexed ({len(sampler.npz_files)} total)")
@@ -848,7 +1062,17 @@ def main() -> None:
     if latent_norm is not None:
         print(f"  latent normalization: loaded {latent_norm.stats_path}")
 
-    _show_viewer(model, sampler, palette_u8, class_weight, latent_norm, config, device, args)
+    _show_viewer(
+        model,
+        sampler,
+        palette_u8,
+        class_weight,
+        latent_norm,
+        config,
+        device,
+        args,
+        activation_stages,
+    )
 
 
 if __name__ == "__main__":

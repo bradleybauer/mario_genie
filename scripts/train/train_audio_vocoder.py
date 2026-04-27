@@ -44,7 +44,9 @@ from src.training.audio_training_helpers import (
     context_waveform_lengths,
     masked_l1_loss,
 )
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -155,7 +157,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.max_steps <= 0:
         parser.error("--max-steps must be a positive integer")
@@ -666,8 +673,22 @@ def main() -> None:
             "dropout": float(args.dropout),
         },
     )
+    mlflow_run = MLflowRun.create(
+        enabled=is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": "audio_vocoder",
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
         console.print(f"Config saved to {output_dir / 'config.json'}")
         console.print(json.dumps(config, indent=2))
 
@@ -804,6 +825,7 @@ def main() -> None:
                 }
                 train_row.update(gpu_stats(device))
                 metrics.append(train_row)
+                mlflow_run.log_metrics(train_row)
 
             if log_due and not use_live_progress and is_main_process:
                 elapsed = time.time() - start_time
@@ -854,6 +876,7 @@ def main() -> None:
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
@@ -936,6 +959,11 @@ def main() -> None:
             final_preview_payload[1],
             sample_rate=args.sample_rate,
         )
+        save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
         console.print(f"[final] Saved final reconstruction artifacts to {output_dir}")
 
 

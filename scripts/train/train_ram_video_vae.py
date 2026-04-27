@@ -43,8 +43,10 @@ from src.models.ram_video_vae_v2 import RAMVideoVAEv2
 from src.system_info import collect_system_info, print_system_info
 from src.training.gan_training import LeCAMEMA, hinge_discriminator_loss, hinge_generator_loss, set_requires_grad
 from src.training.losses import focal_cross_entropy
+from src.training.mlflow_utils import MLflowRun, parse_mlflow_tags
 from src.training.palette_video_vae_training import frames_to_one_hot, save_video_preview
 from src.training.trainer_common import (
+    add_mlflow_args,
     build_trainer_config,
     build_warmup_cosine_scheduler,
     configure_cuda_runtime,
@@ -216,7 +218,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--resume-from", type=str, default=None)
+    add_mlflow_args(parser)
     args = parser.parse_args()
+    try:
+        args.mlflow_tags = parse_mlflow_tags(args.mlflow_tag)
+    except ValueError as exc:
+        parser.error(str(exc))
     if not (0.0 <= args.dropout < 1.0):
         parser.error("--dropout must be in [0, 1)")
     return args
@@ -647,8 +654,22 @@ def main() -> None:
         },
         model=model_config,
     )
+    mlflow_run = MLflowRun.create(
+        enabled=is_main_process and args.mlflow,
+        experiment_name=args.mlflow_experiment,
+        run_name=args.mlflow_run_name or args.run_name or output_dir.name,
+        tracking_uri=args.mlflow_tracking_uri,
+        tags={
+            "model_name": model_name,
+            "script": Path(__file__).name,
+            "output_dir": str(output_dir),
+            **args.mlflow_tags,
+        },
+    )
     if is_main_process:
         save_json(output_dir / "config.json", config, indent=2)
+        mlflow_run.log_params(config)
+        mlflow_run.log_artifact(output_dir / "config.json")
         console.print(f"Training {model_name} on {len(train_dataset)} samples")
         console.print(f"Output directory: {output_dir}")
         console.print(f"Device: {device}")
@@ -791,6 +812,7 @@ def main() -> None:
                         if args.use_lecam:
                             train_row["gan_lecam_reg"] = gan_lecam_reg_value
                     metrics.append(train_row)
+                    mlflow_run.log_metrics(train_row)
 
                     status = (
                         f"loss={loss.item():.5f} video={video_recon_loss.item():.5f} "
@@ -842,6 +864,7 @@ def main() -> None:
                 eval_metrics["lr"] = float(scheduler.get_last_lr()[0])
                 eval_metrics["train_grad_norm"] = grad_norm
                 metrics.append(eval_metrics)
+                mlflow_run.log_metrics(eval_metrics)
                 save_metrics_json(output_dir / "metrics.json", metrics)
 
                 eval_line = (
@@ -945,6 +968,10 @@ def main() -> None:
 
     if is_main_process:
         save_metrics_json(output_dir / "metrics.json", metrics)
+        mlflow_run.log_artifact(output_dir / "metrics.json")
+        if args.mlflow_log_artifacts:
+            mlflow_run.log_artifacts(output_dir)
+        mlflow_run.finish()
         console.print(f"Training complete. Best eval loss: {best_eval:.6f}")
         console.print(f"Output: {output_dir}")
 

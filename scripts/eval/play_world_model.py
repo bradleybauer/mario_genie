@@ -31,6 +31,7 @@ if project_root_str not in sys.path:
     sys.path.insert(0, project_root_str)
 
 from src.models.latent_utils import (
+    FLOW_SAMPLERS,
     LatentNormalization,
     denoise_future_segment,
     is_readable as _is_readable,
@@ -66,6 +67,7 @@ for _i in range(256):
     _PLAYNES_TO_MESEN[_i] = _m
 DEFAULT_SCALE = 3
 DEFAULT_ODE_STEPS = 8
+DEFAULT_ODE_SAMPLER = "heun"
 DEFAULT_RECORD_FPS = 20
 GENERATIVE_FPS = 60
 
@@ -129,6 +131,13 @@ def parse_args() -> argparse.Namespace:
                         help=f"Display scale factor (default: {DEFAULT_SCALE})")
     parser.add_argument("--ode-steps", type=int, default=DEFAULT_ODE_STEPS,
                         help=f"ODE integration steps for denoising (default: {DEFAULT_ODE_STEPS})")
+    parser.add_argument(
+        "--ode-sampler",
+        type=str,
+        choices=FLOW_SAMPLERS,
+        default=DEFAULT_ODE_SAMPLER,
+        help=f"Flow ODE sampler used during denoising (default: {DEFAULT_ODE_SAMPLER})",
+    )
     parser.add_argument(
         "--action-cfg-scale",
         type=float,
@@ -225,11 +234,11 @@ def load_seed_from_episode(
 
     Returns (latents, actions, episode_name) where:
       latents: (1, C, seed_latents, H, W) float32
-      actions: (seed_latents,) int64
+            actions: (seed_latents, action_frame_count) int64
     """
     data = np.load(path)
     all_latents = data["latents"]   # (C, T, H, W)
-    all_actions = data["actions"]   # (T,)
+    all_actions = data["actions"]   # (T, action_frame_count)
     T = all_latents.shape[1]
 
     if start + seed_latents > T:
@@ -263,6 +272,7 @@ class WorldModelPlayer:
         context_latents: int,
         latent_frame_stride: int,
         ode_steps: int,
+        ode_sampler: str,
         action_cfg_scale: float,
         device: torch.device,
         autocast_dtype: torch.dtype,
@@ -276,6 +286,7 @@ class WorldModelPlayer:
         self.context_latents = context_latents
         self.latent_frame_stride = max(1, int(latent_frame_stride))
         self.ode_steps = ode_steps
+        self.ode_sampler = ode_sampler
         self.action_cfg_scale = float(action_cfg_scale)
         self.device = device
         self.autocast_dtype = autocast_dtype
@@ -285,8 +296,9 @@ class WorldModelPlayer:
 
         # Latent history (normalized, on device)
         self._latent_history: torch.Tensor | None = None
-        # Action history (action indices)
-        self._action_history: list[int] = []
+        # Action history (grouped frame action indices)
+        self._action_history: list[list[int]] = []
+        self.action_frame_count = 0
         # Decoded generated frames for the most recent predicted latent.
         self._decoded_future_frames: list[np.ndarray] = []
         # Step counter
@@ -295,7 +307,9 @@ class WorldModelPlayer:
         self.generated_frames = 0
 
     def seed(self, latents: torch.Tensor, actions: torch.Tensor) -> None:
-        """Initialize from pre-encoded latents (1, C, T, H, W) and actions (T,)."""
+        """Initialize from pre-encoded latents (1, C, T, H, W) and actions (T, action_frame_count)."""
+        if actions.ndim != 2:
+            raise ValueError(f"Expected seed actions (T, action_frame_count), got {tuple(actions.shape)}")
         if self.latent_norm is not None:
             latents = self.latent_norm.normalize(latents)
         T = latents.shape[2]
@@ -303,6 +317,7 @@ class WorldModelPlayer:
             latents = latents[:, :, -self.context_latents:]
             actions = actions[-self.context_latents:]
         self._latent_history = latents
+        self.action_frame_count = int(actions.shape[1])
         self._action_history = actions.cpu().tolist()
         self._decoded_future_frames = []
         self.dream_steps = 0
@@ -354,17 +369,12 @@ class WorldModelPlayer:
     def step(self, action_idx: int) -> np.ndarray:
         """Predict (when needed) and return the next generated RGB frame."""
         if not self._decoded_future_frames:
-            # The player's action_idx was pressed while viewing the last
-            # history frame.  In training's causal-shift convention this
-            # action appears at shifted[ctx] (the future position):
-            #   shifted = [default, hist[0], ..., hist[ctx-2], action_idx]
-            # We also overwrite the last history action so that when the
-            # window slides, subsequent steps see the player's real input
-            # rather than the stale seed action.
-            self._action_history[-1] = action_idx
-            hist_actions = list(self._action_history)
-            shifted_actions = [self.default_action_index] + hist_actions
-            actions_t = torch.tensor([shifted_actions], dtype=torch.long, device=self.device)
+            # The player is pressing the action aligned with the next latent
+            # to be predicted, so overwrite the current future slot directly
+            # before denoising.
+            action_group = [int(action_idx)] * self.action_frame_count
+            self._action_history[-1] = action_group
+            actions_t = torch.tensor([self._action_history], dtype=torch.long, device=self.device)
 
             pred = denoise_future_segment(
                 self.dit,
@@ -372,6 +382,7 @@ class WorldModelPlayer:
                 actions=actions_t,
                 future_latents=1,
                 ode_steps=self.ode_steps,
+                ode_sampler=self.ode_sampler,
                 action_cfg_scale=self.action_cfg_scale,
                 autocast_ctx=lambda: torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype),
             )  # (1, C, 1, H', W')
@@ -383,7 +394,7 @@ class WorldModelPlayer:
             # Append a placeholder for the predicted latent's action slot.
             # It will be overwritten with the player's real input on the
             # next call to step().
-            self._action_history.append(self.default_action_index)
+            self._action_history.append([self.default_action_index] * self.action_frame_count)
             self.dream_steps += 1
 
             decoded_frames = self._decode_new_latent_frames(pred)
@@ -705,6 +716,7 @@ def main() -> None:
         context_latents=context_latents,
         latent_frame_stride=latent_frame_stride,
         ode_steps=args.ode_steps,
+        ode_sampler=args.ode_sampler,
         action_cfg_scale=args.action_cfg_scale,
         device=device,
         autocast_dtype=autocast_dtype,
@@ -715,7 +727,10 @@ def main() -> None:
     # Launch
     # ------------------------------------------------------------------
     print(f"\nUsing device: {device}")
-    print(f"ODE steps: {args.ode_steps}, context: {context_latents}, action_cfg_scale: {args.action_cfg_scale}")
+    print(
+        f"ODE steps: {args.ode_steps}, sampler: {args.ode_sampler}, "
+        f"context: {context_latents}, action_cfg_scale: {args.action_cfg_scale}"
+    )
     print("Controls: Arrows/WASD=D-Pad  X/O=A  Z/P=B  Enter/Space=Start  RShift=Select  Esc/Q=Quit")
     if record_gif_path is not None:
         print(

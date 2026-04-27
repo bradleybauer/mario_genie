@@ -178,42 +178,83 @@ def ensure_action_capacity(state: dict[str, np.ndarray], min_size: int) -> None:
 
     new_size = max(min_size, max(1, current * 2))
     for key, array in list(state.items()):
+        if not isinstance(array, np.ndarray):
+            continue
         expanded = np.zeros(new_size, dtype=array.dtype)
         expanded[:current] = array
         state[key] = expanded
 
 
+def canonicalize_action_ids(
+    state: dict[str, Any],
+    action_ids: np.ndarray,
+) -> np.ndarray:
+    action_ids = np.asarray(action_ids, dtype=np.int64)
+    if action_ids.ndim == 1:
+        return action_ids
+    if action_ids.ndim != 2:
+        raise ValueError(f"Expected action IDs with shape (T,) or (T, K), got {tuple(action_ids.shape)}")
+
+    action_key_to_index = state.setdefault("action_key_to_index", {})
+    action_keys = state.setdefault("action_keys", [])
+    compact_ids = np.empty(action_ids.shape[0], dtype=np.int64)
+    for row_index, row in enumerate(action_ids):
+        key = tuple(int(value) for value in row.tolist())
+        compact_index = action_key_to_index.get(key)
+        if compact_index is None:
+            compact_index = len(action_keys)
+            action_key_to_index[key] = compact_index
+            action_keys.append(key)
+        compact_ids[row_index] = compact_index
+    return compact_ids
+
+
+def format_action_key(action_key: int | tuple[int, ...], action_values: list[int] | None) -> tuple[Any, str]:
+    if isinstance(action_key, tuple):
+        original_values = [
+            action_values[index] if action_values is not None and 0 <= index < len(action_values) else index
+            for index in action_key
+        ]
+        label = " -> ".join(action_label(int(value)) for value in original_values)
+        return original_values, label
+
+    original_value = action_values[action_key] if action_values is not None and 0 <= action_key < len(action_values) else action_key
+    return int(original_value), action_label(int(original_value))
+
+
 def update_action_frame_stats(
-    state: dict[str, np.ndarray],
+    state: dict[str, Any],
     action_ids: np.ndarray,
     values: np.ndarray,
 ) -> None:
-    if action_ids.size == 0:
+    compact_ids = canonicalize_action_ids(state, action_ids)
+    if compact_ids.size == 0:
         return
-    ensure_action_capacity(state, int(action_ids.max()) + 1)
-    state["frame_count"] += np.bincount(action_ids, minlength=len(state["frame_count"]))
-    state["frame_sum"] += np.bincount(action_ids, weights=values, minlength=len(state["frame_sum"]))
+    ensure_action_capacity(state, int(compact_ids.max()) + 1)
+    state["frame_count"] += np.bincount(compact_ids, minlength=len(state["frame_count"]))
+    state["frame_sum"] += np.bincount(compact_ids, weights=values, minlength=len(state["frame_sum"]))
     weights = np.square(values.astype(np.float64, copy=False))
     state["frame_sum_sq"] += np.bincount(
-        action_ids,
+        compact_ids,
         weights=weights,
         minlength=len(state["frame_sum_sq"]),
     )
 
 
 def update_action_delta_stats(
-    state: dict[str, np.ndarray],
+    state: dict[str, Any],
     action_ids: np.ndarray,
     values: np.ndarray,
 ) -> None:
-    if action_ids.size == 0:
+    compact_ids = canonicalize_action_ids(state, action_ids)
+    if compact_ids.size == 0:
         return
-    ensure_action_capacity(state, int(action_ids.max()) + 1)
-    state["delta_count"] += np.bincount(action_ids, minlength=len(state["delta_count"]))
-    state["delta_sum"] += np.bincount(action_ids, weights=values, minlength=len(state["delta_sum"]))
+    ensure_action_capacity(state, int(compact_ids.max()) + 1)
+    state["delta_count"] += np.bincount(compact_ids, minlength=len(state["delta_count"]))
+    state["delta_sum"] += np.bincount(compact_ids, weights=values, minlength=len(state["delta_sum"]))
     weights = np.square(values.astype(np.float64, copy=False))
     state["delta_sum_sq"] += np.bincount(
-        action_ids,
+        compact_ids,
         weights=weights,
         minlength=len(state["delta_sum_sq"]),
     )
@@ -226,11 +267,13 @@ def build_action_row(index: int, stats: dict[str, Any], action_values: list[int]
     frame_var = float(stats["frame_sum_sq"][index] / frame_count - frame_mean * frame_mean) if frame_count else 0.0
     delta_mean = float(stats["delta_sum"][index] / delta_count) if delta_count else 0.0
     delta_var = float(stats["delta_sum_sq"][index] / delta_count - delta_mean * delta_mean) if delta_count else 0.0
-    original_value = action_values[index] if action_values is not None and index < len(action_values) else index
+    action_keys = stats.get("action_keys")
+    action_key = action_keys[index] if action_keys is not None and index < len(action_keys) else index
+    original_value, label = format_action_key(action_key, action_values)
     return {
         "index": index,
-        "original_value": int(original_value),
-        "label": action_label(int(original_value)),
+        "original_value": original_value,
+        "label": label,
         "frame_count": frame_count,
         "frame_rms_mean": frame_mean,
         "frame_rms_std": math.sqrt(max(frame_var, 0.0)),

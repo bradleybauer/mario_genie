@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Comprehensive latent-space analysis for a Video VAE checkpoint.
 
-Loads a trained Video VAE, encodes many clips from the dataset, and produces
-a thorough set of diagnostic plots and statistics covering:
+Loads a trained Video VAE and analyzes many clips from latent space. When a
+compatible pre-encoded latent dataset already exists, it reuses those latents
+instead of re-encoding source frames; otherwise it falls back to encoding clips
+from the normalized frame dataset. It produces a thorough set of diagnostic
+plots and statistics covering:
 
   1. **Global statistics** — per-channel mean, std, min, max, kurtosis, skewness
   2. **KL divergence** — per-channel KL, spatial KL heatmap, temporal KL profile
@@ -50,9 +53,10 @@ from src.plot_style import apply_plot_style
 
 apply_plot_style()
 
+from src.data.latent_dataset import LatentSequenceDataset
 from src.data.normalized_dataset import NormalizedSequenceDataset, load_palette_tensor
-from src.data.video_frames import resize_palette_frames
 from src.models.video_vae import VideoVAE
+from src.path_utils import resolve_workspace_path
 from src.training.palette_video_vae_training import frames_to_one_hot
 from src.training.training_utils import load_model_state_dict
 
@@ -88,9 +92,6 @@ def _build_model(config: dict, device: torch.device) -> VideoVAE:
         latent_channels=tcfg["latent_channels"],
         temporal_downsample=tcfg.get("temporal_downsample", 0),
         dropout=0.0,
-        onehot_conv=tcfg.get("onehot_conv", False),
-        global_bottleneck_attn=tcfg.get("global_bottleneck_attn", False),
-        global_bottleneck_attn_heads=tcfg.get("global_bottleneck_attn_heads", 8),
     )
     return model.to(device)
 
@@ -107,6 +108,193 @@ def _save_fig(fig: plt.Figure, output_dir: Path, name: str) -> None:
     fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved {path}")
+
+
+def _load_json(path: Path) -> dict:
+    with path.open() as f:
+        return json.load(f)
+
+
+def _get_clip_frames(config: dict) -> int:
+    return int(config["data"]["clip_frames"])
+
+
+def _get_frame_size(config: dict) -> tuple[int, int]:
+    dcfg = config["data"]
+    frame_height = int(dcfg.get("frame_height", dcfg.get("frame_size", 224)))
+    frame_width = int(dcfg.get("frame_width", frame_height))
+    return frame_height, frame_width
+
+
+def _get_temporal_downsample(config: dict) -> int:
+    model_cfg = config.get("model", {})
+    tcfg = config.get("training", {})
+    return int(model_cfg.get("temporal_downsample", tcfg.get("temporal_downsample", 0)))
+
+
+def _get_latent_channels(config: dict) -> int:
+    model_cfg = config.get("model", {})
+    tcfg = config.get("training", {})
+    return int(model_cfg.get("latent_channels", tcfg.get("latent_channels", 0)))
+
+
+def _get_num_colors(config: dict) -> int:
+    dcfg = config.get("data", {})
+    tcfg = config.get("training", {})
+    return int(dcfg.get("num_colors", tcfg.get("num_colors", 0)))
+
+
+def _get_latent_temporal_stride(config: dict) -> int:
+    return 2 ** _get_temporal_downsample(config)
+
+
+def _get_clip_latents(config: dict) -> int:
+    return math.ceil(_get_clip_frames(config) / _get_latent_temporal_stride(config))
+
+
+def _load_latent_meta(latent_data_dir: Path) -> dict | None:
+    path = latent_data_dir / "latent_config.json"
+    if not path.is_file():
+        return None
+    return _load_json(path)
+
+
+def _default_latent_candidates(config: dict) -> list[Path]:
+    frame_height, _ = _get_frame_size(config)
+    candidates = [
+        PROJECT_ROOT / "data" / "latents",
+        PROJECT_ROOT / f"data/latents_{frame_height}",
+    ]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(resolved)
+    return unique
+
+
+def _describe_latent_compatibility(
+    latent_data_dir: Path,
+    latent_meta: dict | None,
+    *,
+    checkpoint_dir: Path,
+    ckpt_path: Path,
+    config: dict,
+) -> dict:
+    if latent_meta is None:
+        return {
+            "usable": False,
+            "exact_checkpoint_match": False,
+            "message": f"{latent_data_dir} has no latent_config.json",
+        }
+
+    frame_height, frame_width = _get_frame_size(config)
+    checks = {
+        "clip_frames": (
+            int(latent_meta.get("video_vae_config", {}).get("data", {}).get("clip_frames", latent_meta.get("video_vae_config", {}).get("training", {}).get("clip_frames", -1))),
+            _get_clip_frames(config),
+        ),
+        "frame_height": (
+            int(latent_meta.get("frame_height", latent_meta.get("video_vae_config", {}).get("data", {}).get("frame_height", -1))),
+            frame_height,
+        ),
+        "frame_width": (
+            int(latent_meta.get("frame_width", latent_meta.get("video_vae_config", {}).get("data", {}).get("frame_width", frame_width))),
+            frame_width,
+        ),
+        "latent_channels": (
+            int(latent_meta.get("latent_channels", latent_meta.get("video_vae_config", {}).get("model", {}).get("latent_channels", -1))),
+            _get_latent_channels(config),
+        ),
+        "temporal_downsample": (
+            int(latent_meta.get("temporal_downsample", latent_meta.get("video_vae_config", {}).get("model", {}).get("temporal_downsample", -1))),
+            _get_temporal_downsample(config),
+        ),
+        "num_colors": (
+            int(latent_meta.get("num_colors", latent_meta.get("video_vae_config", {}).get("data", {}).get("num_colors", -1))),
+            _get_num_colors(config),
+        ),
+    }
+
+    mismatches = [
+        f"{name}={actual} (expected {expected})"
+        for name, (actual, expected) in checks.items()
+        if actual != expected
+    ]
+    if mismatches:
+        return {
+            "usable": False,
+            "exact_checkpoint_match": False,
+            "message": f"{latent_data_dir} is incompatible: " + ", ".join(mismatches),
+        }
+
+    config_path = resolve_workspace_path(
+        latent_meta.get("video_vae_config_path"),
+        project_root=PROJECT_ROOT,
+        config_dir=latent_data_dir,
+    )
+    ckpt_meta_path = resolve_workspace_path(
+        latent_meta.get("video_vae_checkpoint"),
+        project_root=PROJECT_ROOT,
+        config_dir=latent_data_dir,
+    )
+    expected_config_path = (checkpoint_dir / "config.json").resolve()
+    exact_checkpoint_match = ckpt_meta_path is not None and ckpt_meta_path.resolve() == ckpt_path.resolve()
+    config_match = config_path is not None and config_path.resolve() == expected_config_path
+
+    if exact_checkpoint_match:
+        message = f"Reusing latents from {latent_data_dir} (exact checkpoint match)"
+    elif config_match:
+        message = (
+            f"Reusing latents from {latent_data_dir} (matching config, encoded with "
+            f"{ckpt_meta_path if ckpt_meta_path is not None else 'an unknown checkpoint'})"
+        )
+    else:
+        message = f"Reusing compatible latents from {latent_data_dir}"
+
+    return {
+        "usable": True,
+        "exact_checkpoint_match": exact_checkpoint_match,
+        "message": message,
+        "checkpoint_path": str(ckpt_meta_path) if ckpt_meta_path is not None else None,
+        "config_match": config_match,
+    }
+
+
+def _find_reusable_latent_dataset(
+    *,
+    latent_data_dir: str | None,
+    checkpoint_dir: Path,
+    ckpt_path: Path,
+    config: dict,
+) -> tuple[Path | None, dict | None, dict | None]:
+    candidates: list[Path] = []
+    if latent_data_dir is not None:
+        candidates.append(Path(latent_data_dir).resolve())
+    else:
+        candidates.extend(_default_latent_candidates(config))
+
+    failures: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_dir():
+            failures.append(f"{candidate} does not exist")
+            continue
+        latent_meta = _load_latent_meta(candidate)
+        compatibility = _describe_latent_compatibility(
+            candidate,
+            latent_meta,
+            checkpoint_dir=checkpoint_dir,
+            ckpt_path=ckpt_path,
+            config=config,
+        )
+        if compatibility["usable"]:
+            return candidate, latent_meta, compatibility
+        failures.append(compatibility["message"])
+
+    message = failures[0] if failures else "No reusable latent dataset found"
+    return None, None, {"usable": False, "message": message, "exact_checkpoint_match": False}
 
 
 def _to_serializable(obj):
@@ -149,7 +337,6 @@ def collect_latent_stats(
     indices = np.sort(indices)
 
     tcfg = config["training"]
-    context_frames = tcfg.get("context_frames", 0)
 
     # Accumulators
     all_means: list[np.ndarray] = []       # (Z, T_lat, H_lat, W_lat)
@@ -206,14 +393,10 @@ def collect_latent_stats(
                 else nullcontext()
             )
             with amp_ctx:
-                use_onehot_conv = tcfg.get("onehot_conv", False)
-                if use_onehot_conv:
-                    model_input = frames.byte()
-                else:
-                    dcfg = config["data"]
-                    onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
-                    oh_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(onehot_dtype_name, torch.float32)
-                    model_input = frames_to_one_hot(frames.long(), dcfg["num_colors"], dtype=oh_dtype)
+                dcfg = config["data"]
+                onehot_dtype_name = tcfg.get("onehot_dtype", "float32")
+                oh_dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}.get(onehot_dtype_name, torch.float32)
+                model_input = frames_to_one_hot(frames.long(), dcfg["num_colors"], dtype=oh_dtype)
                 outputs = model(model_input, sample_posterior=True)
                 logits = outputs.logits             # (B, C, T, H, W)
                 mean = outputs.posterior_mean       # (B, Z, T_lat, H_lat, W_lat)
@@ -223,9 +406,9 @@ def collect_latent_stats(
                 # Per-element KL: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
                 kl = 0.5 * (mean.square() + logvar.exp() - 1.0 - logvar)
 
-            # Reconstruction accuracy & loss (skip context frames)
-            target = frames[:, context_frames:].long()
-            pred_logits = logits[:, :, context_frames:]
+            # Reconstruction accuracy & loss over the full clip.
+            target = frames.long()
+            pred_logits = logits
             pred_classes = pred_logits.argmax(dim=1)
             for b in range(B):
                 acc = (pred_classes[b] == target[b]).float().mean().item()
@@ -302,6 +485,74 @@ def collect_latent_stats(
         "file_idxs": np.array(all_file_idxs),
         "num_clips": n_processed,
         "latent_shape": all_means_arr.shape[1:],  # (Z, T, H, W)
+        "source_kind": "reencoded_frames",
+        "posterior_available": True,
+        "reconstruction_available": True,
+    }
+
+
+def collect_existing_latent_stats(
+    dataset: LatentSequenceDataset,
+    *,
+    num_clips: int,
+    batch_size: int,
+    seed: int,
+) -> dict:
+    """Load sampled latent windows from an existing latent dataset."""
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(dataset), size=min(num_clips, len(dataset)), replace=False)
+    indices = np.sort(indices)
+
+    all_latents: list[np.ndarray] = []
+    all_pooled: list[np.ndarray] = []
+    all_latent_norms: list[float] = []
+    all_file_idxs: list[int] = []
+
+    n_processed = 0
+    t_start = time.time()
+
+    for batch_start in range(0, len(indices), batch_size):
+        batch_indices = indices[batch_start:batch_start + batch_size]
+        batch_latents = []
+        batch_file_idxs = []
+        for idx in batch_indices:
+            sample = dataset[int(idx)]
+            batch_latents.append(sample["latents"])
+            batch_file_idxs.append(sample.get("file_idx", -1))
+
+        latents_np = torch.stack(batch_latents, dim=0).cpu().float().numpy()
+        for batch_idx in range(latents_np.shape[0]):
+            latent = latents_np[batch_idx]
+            all_latents.append(latent)
+            all_pooled.append(latent.mean(axis=(1, 2, 3)))
+            all_latent_norms.append(float(np.linalg.norm(latent)))
+            all_file_idxs.append(batch_file_idxs[batch_idx])
+
+        n_processed += latents_np.shape[0]
+        elapsed = time.time() - t_start
+        rate = n_processed / elapsed if elapsed > 0 else 0
+        print(f"\r  Loaded {n_processed}/{len(indices)} latent clips ({rate:.1f} clips/s)", end="", flush=True)
+
+    print()
+
+    all_latents_arr = np.stack(all_latents)
+    all_pooled_arr = np.stack(all_pooled)
+
+    return {
+        "means": None,
+        "logvars": None,
+        "latents": all_latents_arr,
+        "kl": None,
+        "pooled": all_pooled_arr,
+        "accuracies": np.zeros(0, dtype=np.float32),
+        "losses": np.zeros(0, dtype=np.float32),
+        "latent_norms": np.array(all_latent_norms, dtype=np.float32),
+        "file_idxs": np.array(all_file_idxs),
+        "num_clips": n_processed,
+        "latent_shape": all_latents_arr.shape[1:],
+        "source_kind": "latent_dataset",
+        "posterior_available": False,
+        "reconstruction_available": False,
     }
 
 
@@ -312,25 +563,22 @@ def collect_latent_stats(
 def analyze_global_stats(stats: dict) -> dict:
     """Compute per-channel global statistics from collected latents."""
     latents = stats["latents"]  # (N, Z, T, H, W)
-    means = stats["means"]
-    logvars = stats["logvars"]
+    means = stats.get("means")
+    logvars = stats.get("logvars")
     N, Z = latents.shape[0], latents.shape[1]
 
     # Flatten spatial+temporal for per-channel stats
     flat = latents.reshape(N, Z, -1)  # (N, Z, THW)
     all_flat = flat.reshape(N * flat.shape[2], Z).T  # (Z, N*THW)
 
-    # For means & logvars too
-    mean_flat = means.reshape(N, Z, -1)
-    logvar_flat = logvars.reshape(N, Z, -1)
+    mean_flat = means.reshape(N, Z, -1) if means is not None else None
+    logvar_flat = logvars.reshape(N, Z, -1) if logvars is not None else None
 
     channel_stats = {}
     for ch in range(Z):
         vals = all_flat[ch]
-        mu_vals = mean_flat[:, ch].ravel()
-        lv_vals = logvar_flat[:, ch].ravel()
         std_val = vals.std()
-        channel_stats[ch] = {
+        entry = {
             "mean": float(vals.mean()),
             "std": float(std_val),
             "min": float(vals.min()),
@@ -338,13 +586,23 @@ def analyze_global_stats(stats: dict) -> dict:
             "abs_mean": float(np.abs(vals).mean()),
             "kurtosis": float(_kurtosis(vals)),
             "skewness": float(_skewness(vals)),
-            "posterior_mean_avg": float(mu_vals.mean()),
-            "posterior_mean_std": float(mu_vals.std()),
-            "posterior_logvar_avg": float(lv_vals.mean()),
-            "posterior_std_avg": float(np.exp(0.5 * lv_vals).mean()),
         }
+        if mean_flat is not None and logvar_flat is not None:
+            mu_vals = mean_flat[:, ch].ravel()
+            lv_vals = logvar_flat[:, ch].ravel()
+            entry.update(
+                posterior_mean_avg=float(mu_vals.mean()),
+                posterior_mean_std=float(mu_vals.std()),
+                posterior_logvar_avg=float(lv_vals.mean()),
+                posterior_std_avg=float(np.exp(0.5 * lv_vals).mean()),
+            )
+        channel_stats[ch] = entry
 
-    return {"channel_stats": channel_stats, "num_channels": Z}
+    return {
+        "channel_stats": channel_stats,
+        "num_channels": Z,
+        "posterior_available": bool(stats.get("posterior_available", False)),
+    }
 
 
 def _kurtosis(x: np.ndarray) -> float:
@@ -385,23 +643,31 @@ def plot_global_stats(analysis: dict, output_dir: Path | None) -> None:
 
     # Posterior mean std (how much the posterior mean varies across data)
     ax = axes[0, 1]
-    pm_stds = [cs[c]["posterior_mean_std"] for c in channels]
-    ax.bar(channels, pm_stds, alpha=0.7, color="C1")
-    ax.set_xlabel("Channel")
-    ax.set_ylabel("Std of posterior mean")
-    ax.set_title("Posterior Mean Variation\n(higher = more informative)")
-    ax.grid(True, alpha=0.3)
+    if analysis["posterior_available"]:
+        pm_stds = [cs[c]["posterior_mean_std"] for c in channels]
+        ax.bar(channels, pm_stds, alpha=0.7, color="C1")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Std of posterior mean")
+        ax.set_title("Posterior Mean Variation\n(higher = more informative)")
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "Unavailable for\npre-encoded latent dataset", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
 
     # Average posterior std (how uncertain the encoder is)
     ax = axes[0, 2]
-    p_stds = [cs[c]["posterior_std_avg"] for c in channels]
-    ax.bar(channels, p_stds, alpha=0.7, color="C2")
-    ax.axhline(1.0, color="red", linestyle="--", alpha=0.7, label="Prior std=1")
-    ax.set_xlabel("Channel")
-    ax.set_ylabel("Avg posterior std")
-    ax.set_title("Posterior Uncertainty\n(≈1 → collapsed to prior)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    if analysis["posterior_available"]:
+        p_stds = [cs[c]["posterior_std_avg"] for c in channels]
+        ax.bar(channels, p_stds, alpha=0.7, color="C2")
+        ax.axhline(1.0, color="red", linestyle="--", alpha=0.7, label="Prior std=1")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Avg posterior std")
+        ax.set_title("Posterior Uncertainty\n(≈1 → collapsed to prior)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, "Unavailable for\npre-encoded latent dataset", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
 
     # Kurtosis
     ax = axes[1, 0]
@@ -450,6 +716,8 @@ def plot_global_stats(analysis: dict, output_dir: Path | None) -> None:
 
 def analyze_kl(stats: dict) -> dict:
     kl = stats["kl"]  # (N, Z, T, H, W)
+    if kl is None:
+        return {"available": False}
     N, Z, T, H, W = kl.shape
 
     # Per-channel total KL (averaged over spatial/temporal, summed across clips)
@@ -469,6 +737,7 @@ def analyze_kl(stats: dict) -> dict:
     kl_fraction = kl_per_channel / (total_kl + 1e-12)
 
     return {
+        "available": True,
         "kl_per_channel": kl_per_channel,
         "kl_spatial": kl_spatial,
         "kl_temporal": kl_temporal,
@@ -480,6 +749,18 @@ def analyze_kl(stats: dict) -> dict:
 
 def plot_kl(analysis: dict, output_dir: Path | None) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    if not analysis.get("available", False):
+        fig.suptitle("KL Divergence Analysis (Unavailable)", fontweight="bold")
+        for ax in axes.ravel():
+            ax.text(0.5, 0.5, "KL requires encoder\nposterior statistics", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+        plt.tight_layout()
+        if output_dir:
+            _save_fig(fig, output_dir, "02_kl_divergence")
+        else:
+            plt.show()
+        return
+
     fig.suptitle("KL Divergence Analysis", fontweight="bold")
 
     # Per-channel KL
@@ -539,6 +820,8 @@ def plot_kl(analysis: dict, output_dir: Path | None) -> None:
 def analyze_posterior_collapse(stats: dict) -> dict:
     means = stats["means"]      # (N, Z, T, H, W)
     logvars = stats["logvars"]  # (N, Z, T, H, W)
+    if means is None or logvars is None:
+        return {"available": False}
     N, Z = means.shape[0], means.shape[1]
 
     # A channel is "collapsed" if its posterior ≈ prior N(0,1):
@@ -560,6 +843,7 @@ def analyze_posterior_collapse(stats: dict) -> dict:
     mi_lower_bound = 0.5 * np.log(1 + au_variance)  # per channel
 
     return {
+        "available": True,
         "au_variance": au_variance,
         "active_units": active_units,
         "num_active": int(active_units.sum()),
@@ -571,6 +855,18 @@ def analyze_posterior_collapse(stats: dict) -> dict:
 
 
 def plot_posterior_collapse(analysis: dict, output_dir: Path | None) -> None:
+    if not analysis.get("available", False):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        fig.suptitle("Posterior Collapse Detection (Unavailable)", fontweight="bold")
+        ax.text(0.5, 0.5, "Posterior collapse metrics require\nposterior mean/logvar tensors", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        plt.tight_layout()
+        if output_dir:
+            _save_fig(fig, output_dir, "03_posterior_collapse")
+        else:
+            plt.show()
+        return
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
         f"Posterior Collapse Detection — {analysis['num_active']}/{analysis['num_total']} active units",
@@ -858,6 +1154,18 @@ def plot_temporal(analysis: dict, output_dir: Path | None) -> None:
 # ---------------------------------------------------------------------------
 
 def plot_reconstruction_vs_latent(stats: dict, output_dir: Path | None) -> None:
+    if not stats.get("reconstruction_available", False):
+        fig, ax = plt.subplots(figsize=(8, 4))
+        fig.suptitle("Reconstruction Quality vs. Latent Properties (Unavailable)", fontweight="bold")
+        ax.text(0.5, 0.5, "Reconstruction metrics require source-frame\ncomparison, which is skipped when reusing latents", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        plt.tight_layout()
+        if output_dir:
+            _save_fig(fig, output_dir, "07_recon_vs_latent")
+        else:
+            plt.show()
+        return
+
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle("Reconstruction Quality vs. Latent Properties", fontweight="bold")
 
@@ -1060,11 +1368,9 @@ def plot_traversals(
     top_channels = np.argsort(channel_var)[::-1][:top_k]
 
     # Use the mean latent as the base point
-    mean_latent = stats["means"].mean(axis=0)  # (Z, T, H, W)
+    latent_source = stats["means"] if stats.get("means") is not None else stats["latents"]
+    mean_latent = latent_source.mean(axis=0)  # (Z, T, H, W)
     base = torch.from_numpy(mean_latent).unsqueeze(0).to(device)  # (1, Z, T, H, W)
-
-    tcfg = config["training"]
-    context_frames = tcfg.get("context_frames", 0)
 
     n_steps = 7
     alphas = np.linspace(-3, 3, n_steps)
@@ -1110,26 +1416,33 @@ def build_summary(
     dim_analysis: dict,
     elapsed: float,
 ) -> dict:
+    reconstruction_available = bool(stats.get("reconstruction_available", False))
+    kl_available = bool(kl_analysis.get("available", False))
+    posterior_available = bool(collapse_analysis.get("available", False))
     return {
         "timestamp": datetime.now().isoformat(),
         "model_name": config.get("model_name", "unknown"),
+        "data_source": stats.get("source_kind", "unknown"),
         "latent_shape": list(stats["latent_shape"]),
         "num_clips_analyzed": stats["num_clips"],
         "elapsed_seconds": round(elapsed, 1),
         "reconstruction": {
-            "mean_accuracy": float(stats["accuracies"].mean()),
-            "median_accuracy": float(np.median(stats["accuracies"])),
-            "std_accuracy": float(stats["accuracies"].std()),
-            "mean_loss": float(stats["losses"].mean()),
+            "available": reconstruction_available,
+            "mean_accuracy": float(stats["accuracies"].mean()) if reconstruction_available else None,
+            "median_accuracy": float(np.median(stats["accuracies"])) if reconstruction_available else None,
+            "std_accuracy": float(stats["accuracies"].std()) if reconstruction_available else None,
+            "mean_loss": float(stats["losses"].mean()) if reconstruction_available else None,
         },
         "kl": {
-            "total_kl_mean": kl_analysis["total_kl_mean"],
-            "kl_per_channel": kl_analysis["kl_per_channel"].tolist(),
+            "available": kl_available,
+            "total_kl_mean": kl_analysis["total_kl_mean"] if kl_available else None,
+            "kl_per_channel": kl_analysis["kl_per_channel"].tolist() if kl_available else None,
         },
         "posterior_collapse": {
-            "active_units": collapse_analysis["num_active"],
-            "total_units": collapse_analysis["num_total"],
-            "au_threshold": collapse_analysis["au_threshold"],
+            "available": posterior_available,
+            "active_units": collapse_analysis["num_active"] if posterior_available else None,
+            "total_units": collapse_analysis["num_total"] if posterior_available else None,
+            "au_threshold": collapse_analysis["au_threshold"] if posterior_available else None,
             "participation_ratio": dim_analysis["participation_ratio"],
         },
         "dimensionality": {
@@ -1159,7 +1472,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("checkpoint", help="Checkpoint directory (must contain config.json + latest.pt or best.pt)")
     p.add_argument("--best", action="store_true", help="Load best.pt instead of latest.pt")
     p.add_argument("--data-dir", default=None, help="Dataset directory (default: from config)")
-    p.add_argument("--num-clips", type=int, default=256, help="Number of clips to encode (default: 256)")
+    p.add_argument(
+        "--latent-data-dir",
+        default=None,
+        help="Reuse latents from this directory when compatible (default: auto-detect data/latents)",
+    )
+    p.add_argument(
+        "--force-reencode",
+        action="store_true",
+        help="Ignore any reusable latent dataset and re-encode clips from source frames.",
+    )
+    p.add_argument("--num-clips", type=int, default=256, help="Number of clips to analyze (default: 256)")
     p.add_argument("--batch-size", type=int, default=16, help="Batch size for encoding (default: 16)")
     p.add_argument("--min-batch-size", type=int, default=1,
                    help="Minimum batch size when auto-shrinking after CUDA OOM (default: 1)")
@@ -1192,6 +1515,21 @@ def main() -> None:
     if not ckpt_path.is_file():
         raise SystemExit(f"Checkpoint not found: {ckpt_path}")
 
+    latent_data_dir = None
+    latent_meta = None
+    latent_compatibility = None
+    if not args.force_reencode:
+        latent_data_dir, latent_meta, latent_compatibility = _find_reusable_latent_dataset(
+            latent_data_dir=args.latent_data_dir,
+            checkpoint_dir=ckpt_dir,
+            ckpt_path=ckpt_path,
+            config=config,
+        )
+        if latent_data_dir is not None:
+            print(latent_compatibility["message"])
+        elif args.latent_data_dir is not None:
+            print(f"  Requested latent dataset not reusable: {latent_compatibility['message']}")
+
     # --- Load model ---
     print(f"Loading {ckpt_path} …")
     model = _build_model(config, device)
@@ -1202,22 +1540,40 @@ def main() -> None:
 
     # --- Load palette ---
     data_dir = args.data_dir or tcfg.get("data_dir", "data/normalized")
-    palette = load_palette_tensor(data_dir)
+    palette_dir = latent_data_dir if latent_data_dir is not None else Path(data_dir)
+    palette = load_palette_tensor(palette_dir)
     palette_u8 = (palette.clamp(0, 1).numpy() * 255).astype(np.uint8)
 
-    # --- Build dataset ---
     clip_frames = dcfg["clip_frames"]
-    frame_size = dcfg.get("frame_height", dcfg.get("frame_size", 224))
-    context_frames = tcfg.get("context_frames", 0)
+    frame_height, frame_width = _get_frame_size(config)
 
-    print(f"  Loading dataset from {data_dir} (clip_frames={clip_frames}, frame_size={frame_size})")
-    dataset = NormalizedSequenceDataset(
-        data_dir=data_dir,
-        clip_frames=clip_frames,
-        frame_size=frame_size,
-        stride=clip_frames,  # Non-overlapping for diverse samples
-    )
-    print(f"  Dataset: {len(dataset)} clips from {len(dataset.data_files)} files")
+    # --- Build dataset ---
+    dataset = None
+    if latent_data_dir is not None:
+        clip_latents = _get_clip_latents(config)
+        print(
+            f"  Loading latent dataset from {latent_data_dir} "
+            f"(clip_latents={clip_latents}, latent_stride={_get_latent_temporal_stride(config)})"
+        )
+        dataset = LatentSequenceDataset(
+            data_dir=latent_data_dir,
+            clip_latents=clip_latents,
+            include_actions=False,
+            stride=clip_latents,
+        )
+        print(f"  Latent dataset: {len(dataset)} clips from {len(dataset.data_files)} files")
+    else:
+        print(
+            f"  Loading source dataset from {data_dir} "
+            f"(clip_frames={clip_frames}, frame_size={frame_height}x{frame_width})"
+        )
+        dataset = NormalizedSequenceDataset(
+            data_dir=data_dir,
+            clip_frames=clip_frames,
+            frame_size=frame_height,
+            stride=clip_frames,  # Non-overlapping for diverse samples
+        )
+        print(f"  Dataset: {len(dataset)} clips from {len(dataset.data_files)} files")
 
     # --- Output directory ---
     output_dir = None
@@ -1227,27 +1583,38 @@ def main() -> None:
         print(f"  Output directory: {output_dir}")
 
     # --- Collect latent statistics ---
-    print(f"\nEncoding {args.num_clips} clips …")
-    if device.type == "cuda":
+    action_label = "Loading" if latent_data_dir is not None else "Encoding"
+    print(f"\n{action_label} {args.num_clips} clips …")
+    if device.type == "cuda" and latent_data_dir is None:
         print(
             "  CUDA encode settings: "
             f"batch_size={args.batch_size}, min_batch_size={args.min_batch_size}, "
             f"amp={args.amp}, auto_batch_shrink={not args.no_auto_batch_shrink}"
         )
     t0 = time.time()
-    stats = collect_latent_stats(
-        model, dataset, config, device,
-        num_clips=args.num_clips,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        use_amp=args.amp,
-        auto_batch_shrink=not args.no_auto_batch_shrink,
-        min_batch_size=args.min_batch_size,
-    )
+    if latent_data_dir is not None:
+        stats = collect_existing_latent_stats(
+            dataset,
+            num_clips=args.num_clips,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+    else:
+        stats = collect_latent_stats(
+            model, dataset, config, device,
+            num_clips=args.num_clips,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            use_amp=args.amp,
+            auto_batch_shrink=not args.no_auto_batch_shrink,
+            min_batch_size=args.min_batch_size,
+        )
     encode_time = time.time() - t0
     Z, T_lat, H_lat, W_lat = stats["latent_shape"]
     print(f"  Latent shape: ({Z}, {T_lat}, {H_lat}, {W_lat})")
-    print(f"  Encoding took {encode_time:.1f}s")
+    print(f"  {action_label} took {encode_time:.1f}s")
+    if latent_data_dir is not None and not latent_compatibility.get("exact_checkpoint_match", False):
+        print("  Note: decode-based analyses are skipped because the latent dataset was not encoded by this exact checkpoint.")
 
     # --- Run analyses ---
     print("\nAnalyzing …")
@@ -1287,9 +1654,12 @@ def main() -> None:
     plot_latent_distributions(stats, top_k=args.top_k, output_dir=output_dir)
 
     # --- Traversals (optional, requires decode) ---
-    if not args.no_traversals:
+    decode_compatible = latent_data_dir is None or latent_compatibility.get("exact_checkpoint_match", False)
+    if not args.no_traversals and decode_compatible:
         print("\n  [Bonus] Latent traversals")
         plot_traversals(model, stats, config, palette_u8, device, top_k=min(args.top_k, 6), output_dir=output_dir)
+    elif not args.no_traversals:
+        print("\n  [Bonus] Skipping latent traversals because the reusable latents were encoded by a different checkpoint.")
 
     # --- Summary ---
     total_elapsed = time.time() - t0
@@ -1301,11 +1671,22 @@ def main() -> None:
 
     print(f"\n{'='*60}")
     print(f"  Clips analyzed:       {stats['num_clips']}")
+    print(f"  Data source:          {stats.get('source_kind', 'unknown')}")
     print(f"  Latent shape:         ({Z}, {T_lat}, {H_lat}, {W_lat})")
-    print(f"  Mean accuracy:        {stats['accuracies'].mean():.4f}")
-    print(f"  Mean loss:            {stats['losses'].mean():.4f}")
-    print(f"  Total KL (mean):      {kl_analysis['total_kl_mean']:.4f}")
-    print(f"  Active units:         {collapse_analysis['num_active']}/{collapse_analysis['num_total']}")
+    if stats.get("reconstruction_available", False):
+        print(f"  Mean accuracy:        {stats['accuracies'].mean():.4f}")
+        print(f"  Mean loss:            {stats['losses'].mean():.4f}")
+    else:
+        print("  Mean accuracy:        n/a (reused latents)")
+        print("  Mean loss:            n/a (reused latents)")
+    if kl_analysis.get("available", False):
+        print(f"  Total KL (mean):      {kl_analysis['total_kl_mean']:.4f}")
+    else:
+        print("  Total KL (mean):      n/a (posterior stats unavailable)")
+    if collapse_analysis.get("available", False):
+        print(f"  Active units:         {collapse_analysis['num_active']}/{collapse_analysis['num_total']}")
+    else:
+        print("  Active units:         n/a (posterior stats unavailable)")
     print(f"  Eff. dim (95%):       {dim_analysis['dim_95']}")
     print(f"  Participation ratio:  {dim_analysis['participation_ratio']:.1f}")
     print(f"  Avg |correlation|:    {corr_analysis['avg_abs_correlation']:.4f}")
